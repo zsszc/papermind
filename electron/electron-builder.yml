@@ -1,0 +1,56 @@
+appId: com.papermind.app
+productName: PaperMind
+copyright: Copyright © 2026 PaperMind
+directories:
+  output: ../frontend/out
+  buildResources: build
+files:
+  - main.js
+  - preload.js
+extraResources:
+  - from: ../frontend/dist
+    to: frontend/dist
+  - from: ../backend
+    to: backend
+    filter:
+      - "**/*"
+      - "!__pycache__"
+      - "!*.pyc"
+      - "!.DS_Store"
+  - from: ../config.yaml
+    to: config.yaml
+  - from: ../config.yaml.example
+    to: config.yaml.example
+  - from: ../data
+    to: data
+    filter:
+      - "!.DS_Store"
+  - from: ../papers
+    to: papers
+    filter:
+      - "!.DS_Store"
+  - from: ../notes
+    to: notes
+    filter:
+      - "!.DS_Store"
+  - from: ../my-thesis
+    to: my-thesis
+    filter:
+      - "!.DS_Store"
+  - from: ../vector_db
+    to: vector_db
+    filter:
+      - "!.DS_Store"
+mac:
+  category: public.app-category.productivity
+  target:
+    - dmg
+    - zip
+win:
+  target:
+    - nsis
+    - zip
+linux:
+  target:
+    - AppImage
+    - deb

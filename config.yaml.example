@@ -1,0 +1,44 @@
+app:
+  name: "PaperMind"
+  version: "1.0.0"
+  data_dir: "./data"
+
+llm:
+  provider: "moonshot"
+  api_key: "sk-xxxxxxxx"          # 请替换为您的 Kimi API Key
+  base_url: "https://api.moonshot.cn/v1"
+  model: "kimi-k2-7"
+  max_tokens: 4096
+  temperature: 0.3
+
+embedding:
+  provider: "local"
+  local_model: "BAAI/bge-m3"
+  device: "auto"                  # auto / cpu / cuda / mps
+  chunk_size: 512
+  chunk_overlap: 50
+
+retrieval:
+  top_k: 10
+  rerank: false                   # MVP 阶段可关闭，减少依赖
+  rerank_model: "BAAI/bge-reranker-large"
+  hybrid_weight: 0.7
+
+memory:
+  enabled: true
+  session_limit: 50
+  summary_interval: 5
+  max_short_term: 10
+
+skills:
+  auto_load: true
+  skills_dir: "./skills"
+
+ui:
+  theme: "light"
+  language: "zh-CN"
+  page_size: 20
+  default_view: "list"
+
+export:
+  citation_format: "GB/T 7714"
