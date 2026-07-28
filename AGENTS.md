@@ -24,7 +24,7 @@
 ### 后端（`backend/requirements.txt`）
 
 - Python 3.12（`backend/venv` 中为 3.12.2）
-- FastAPI 0.110 + Uvicorn 0.27 + SQLAlchemy 2.0 + Pydantic 2.6
+- FastAPI 0.110 + Uvicorn 0.27 + SQLAlchemy 2.0 + Pydantic 2.7
 - ChromaDB 0.4.24（本地向量库，`vector_db/`）
 - sentence-transformers 2.3 + transformers 4.39.3 + torch 2.2.2（本地跑 BGE-M3 Embedding）
 - pdfplumber 0.10（PDF 文本提取）、python-docx 1.1（Word 解析）、PyPDF2（备用）
@@ -197,6 +197,7 @@ cd ../electron && npm run build    # 产物在 frontend/out/（dmg/zip/exe）
 
 ## 10. 已知问题与注意事项
 
+- **mcp/langgraph 版本锁定**：`mcp` 必须锁 1.3.0、`sse-starlette` 锁 1.8.2——更高版本的 mcp 依赖 `starlette>=0.49`/`pydantic>=2.11`，与 FastAPI 0.110（starlette<0.37）硬冲突；同理 `sse-starlette` 必须 <2。为此 `pydantic` 从 2.6.0 升到 2.7.4、`pydantic-settings` 锁 2.5.2（langgraph 1.2.9 要求 pydantic>=2.7.4）。升级 mcp/langgraph 前必须跑 `pip check` 验证零冲突。
 - **httpx 版本**：`openai==1.12.0` 与 `httpx>=0.28` 不兼容，已固定 `httpx==0.27.2`，升级 openai 前必须验证。
 - **transformers/torch**：当前 macOS x86_64 + Python 3.12 环境下 torch 最高可用 2.2.2，故 `transformers` 固定 4.39.3。
 - **BGE-M3 首次下载**：约 2GB，走 HuggingFace 镜像（`hf-mirror.com`），需网络畅通；Embedding 模型在后台线程加载，`available()` 为假时检索会降级。
