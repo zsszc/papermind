@@ -14,6 +14,7 @@ from app.models import ensure_papers_fts
 from app.services.llm import llm_service
 from app.services.backup import auto_backup, cleanup_old_backups
 from app.routers import papers, search, chat, thesis, memory, export, settings
+from app.core.settings import apply_env_overrides, validate_startup_config
 
 
 def _schedule_daily_backup():
@@ -41,6 +42,10 @@ def _schedule_daily_backup():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # 分层配置：环境变量覆盖 + 启动校验
+    apply_env_overrides(config)
+    validate_startup_config(config)
+
     Base.metadata.create_all(bind=engine)
     ensure_schema()
     ensure_papers_fts(engine)
