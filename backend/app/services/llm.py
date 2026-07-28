@@ -1,8 +1,9 @@
 import asyncio
 import json
+import time
 from typing import AsyncIterator, List, Dict, Any, Optional
 
-from openai import AsyncOpenAI, APIError, APITimeoutError
+from openai import AsyncOpenAI, OpenAI, APIError, APITimeoutError
 
 from app.core.config import config
 from app.core.logger import logger
@@ -11,6 +12,13 @@ from app.core.logger import logger
 class LLMService:
     def __init__(self):
         self.client = AsyncOpenAI(
+            api_key=config.get("llm.api_key"),
+            base_url=config.get("llm.base_url", "https://api.moonshot.cn/v1"),
+            max_retries=1,
+            timeout=120,
+        )
+        # 同步 client：供后台线程（无事件循环）使用，配置与 async client 保持一致
+        self.sync_client = OpenAI(
             api_key=config.get("llm.api_key"),
             base_url=config.get("llm.base_url", "https://api.moonshot.cn/v1"),
             max_retries=1,
@@ -152,6 +160,66 @@ class LLMService:
 
         try:
             response = await self._async_retry(_complete, max_retries=3)
+            return response.choices[0].message.content or ""
+        except Exception as e:
+            error_msg = self._format_error(e)
+            logger.error(f"[LLM] 同步调用最终失败: {error_msg}")
+            return f"[调用 LLM 出错: {error_msg}]"
+
+    def _sync_retry(
+        self,
+        func_factory,
+        max_retries: int = 3,
+        base_delay: float = 1.0,
+        max_delay: float = 10.0,
+    ):
+        """指数退避重试包装器（同步版），逻辑与 _async_retry 对齐。"""
+        last_exception = None
+        for attempt in range(max_retries):
+            try:
+                return func_factory()
+            except (APIError, APITimeoutError, TimeoutError) as e:
+                last_exception = e
+                if attempt < max_retries - 1:
+                    delay = min(base_delay * (2 ** attempt), max_delay)
+                    logger.warning(f"[LLM] 同步调用失败，第 {attempt + 1} 次重试，等待 {delay}s: {e}")
+                    time.sleep(delay)
+                else:
+                    logger.error(f"[LLM] 同步调用失败，已达最大重试次数: {e}")
+            except Exception as e:
+                logger.error(f"[LLM] 同步调用非预期错误: {e}")
+                raise
+        assert last_exception is not None
+        raise last_exception
+
+    def chat_completion_sync(
+        self,
+        messages: List[Dict[str, str]],
+        json_mode: bool = False,
+        timeout: Optional[int] = None,
+    ) -> str:
+        """chat_completion 的同步入口：供后台线程（无事件循环）使用。
+
+        参数与异步版对齐，复用相同的消息截断、temperature 特殊处理、
+        重试与错误格式化逻辑，底层走 openai 同步 OpenAI client。
+        """
+        messages = self._truncate_messages(messages)
+        call_timeout = timeout or 120
+
+        def _complete():
+            kwargs = {
+                "model": self.model,
+                "messages": messages,
+                "max_tokens": self.max_tokens,
+                "temperature": self._get_temperature(),
+                "timeout": call_timeout,
+            }
+            if json_mode:
+                kwargs["response_format"] = {"type": "json_object"}
+            return self.sync_client.chat.completions.create(**kwargs)
+
+        try:
+            response = self._sync_retry(_complete, max_retries=3)
             return response.choices[0].message.content or ""
         except Exception as e:
             error_msg = self._format_error(e)

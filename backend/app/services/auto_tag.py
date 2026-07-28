@@ -1,6 +1,6 @@
 import re
 import random
-from typing import List
+from typing import Dict, List, Optional
 
 from app.models import Paper, Tag
 from app.services.llm import llm_service
@@ -123,8 +123,8 @@ class AutoTagService:
         name = "".join(ch for ch in name if ch.isprintable() or ch in " \t")
         return name.strip()
 
-    async def _llm_tags(self, paper: Paper) -> List[str]:
-        """使用 LLM 从标题和摘要中提取领域标签。"""
+    def _build_llm_messages(self, paper: Paper) -> Optional[List[Dict[str, str]]]:
+        """构造 LLM 标签抽取的消息；上下文为空时返回 None。"""
         context = "\n".join(
             filter(
                 None,
@@ -137,7 +137,7 @@ class AutoTagService:
             )
         )
         if not context.strip():
-            return []
+            return None
 
         prompt = f"""请根据以下学术论文信息，从给定标签池中选出最相关的 3-5 个中文或英文标签。只返回标签名列表，不要解释，不要编号。
 
@@ -151,26 +151,47 @@ class AutoTagService:
 
 请按相关性从高到低输出，每行一个标签名，只输出标签："""
 
-        messages = [
+        return [
             {"role": "system", "content": "你是专业的学术文献分类助手，只输出标签名列表。"},
             {"role": "user", "content": prompt},
         ]
+
+    def _parse_llm_tags_result(self, result: str) -> List[str]:
+        """解析 LLM 输出为标签名列表（每行一个，最多 5 个）。"""
+        tags = []
+        for line in result.splitlines():
+            line = self._clean_tag_name(line)
+            if line:
+                tags.append(line)
+        return tags[:5]
+
+    async def _llm_tags(self, paper: Paper) -> List[str]:
+        """使用 LLM 从标题和摘要中提取领域标签（异步版）。"""
+        messages = self._build_llm_messages(paper)
+        if not messages:
+            return []
         try:
             result = await llm_service.chat_completion(messages)
-            tags = []
-            for line in result.splitlines():
-                line = self._clean_tag_name(line)
-                if line:
-                    tags.append(line)
-            return tags[:5]
+            return self._parse_llm_tags_result(result)
         except Exception:
             logger.warning("[AutoTag] LLM 生成标签失败", exc_info=True)
             return []
 
-    async def generate_tags(self, paper: Paper, db) -> List[Tag]:
-        """为论文生成标签，返回已关联到 db 的 Tag 对象列表（未 commit）。"""
+    def _llm_tags_sync(self, paper: Paper, timeout: Optional[int] = None) -> List[str]:
+        """使用 LLM 从标题和摘要中提取领域标签（同步版，供后台线程使用）。"""
+        messages = self._build_llm_messages(paper)
+        if not messages:
+            return []
+        try:
+            result = llm_service.chat_completion_sync(messages, timeout=timeout)
+            return self._parse_llm_tags_result(result)
+        except Exception:
+            logger.warning("[AutoTag] LLM 生成标签失败（同步）", exc_info=True)
+            return []
+
+    def _collect_tags(self, paper: Paper, llm_tags: List[str], db) -> List[Tag]:
+        """合并规则标签与 LLM 标签并落库，返回 Tag 对象列表（未 commit）。"""
         rule_tags = self._rule_based_tags(paper)
-        llm_tags = await self._llm_tags(paper)
 
         # 合并去重，LLM 标签优先级高于规则标签
         ordered = []
@@ -202,6 +223,16 @@ class AutoTagService:
                 tags.append(tag)
 
         return tags
+
+    async def generate_tags(self, paper: Paper, db) -> List[Tag]:
+        """为论文生成标签，返回已关联到 db 的 Tag 对象列表（未 commit）。"""
+        llm_tags = await self._llm_tags(paper)
+        return self._collect_tags(paper, llm_tags, db)
+
+    def generate_tags_sync(self, paper: Paper, db, timeout: Optional[int] = None) -> List[Tag]:
+        """generate_tags 的同步入口：供后台线程（无事件循环）使用，内部走 chat_completion_sync。"""
+        llm_tags = self._llm_tags_sync(paper, timeout=timeout)
+        return self._collect_tags(paper, llm_tags, db)
 
 
 auto_tag_service = AutoTagService()

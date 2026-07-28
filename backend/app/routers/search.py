@@ -1,3 +1,4 @@
+import re
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, Depends
@@ -11,10 +12,35 @@ from app.services.retrieval import get_vector_store
 
 router = APIRouter()
 
+# FTS5 MATCH 语法中的特殊字符（引号、*、:、^、括号、- 等），
+# 统一替换为空格，既剥离特殊字符又充当分词边界，避免语法错误与注入
+_FTS_SPECIAL_CHARS = re.compile(r'["*^:()@~<>$\\|+=\[\]{}!?,.;#%&/\-]')
+
+
+def _sanitize_fts_query(query: str) -> str:
+    """将用户输入清洗为 FTS5 安全的 MATCH 查询串。
+
+    处理规则：
+    - 剥离 FTS5 特殊字符（替换为空格），杜绝语法错误与 MATCH 注入；
+    - 按空白分词，每个 token 包装为双引号短语（literal 匹配，不再是语法符）；
+    - token 内部若仍残留双引号，按 FTS5 规则转义为两个双引号（防御性处理）；
+    - token 之间用空格连接，表示 AND 语义；
+    - 空输入或清洗后无有效 token 时返回空串，调用方应跳过关键词检索。
+    """
+    if not query:
+        return ""
+    cleaned = _FTS_SPECIAL_CHARS.sub(" ", query)
+    tokens = cleaned.split()
+    if not tokens:
+        return ""
+    return " ".join('"' + token.replace('"', '""') + '"' for token in tokens)
+
 
 def _keyword_search(db: Session, query: str, limit: int = 20) -> List[Dict[str, Any]]:
     """基于 SQLite FTS5 的关键词检索，返回论文级别结果。"""
-    if not query or not query.strip():
+    safe_query = _sanitize_fts_query(query)
+    if not safe_query:
+        # 清洗后无有效检索词（空输入或纯特殊字符），跳过关键词检索
         return []
     try:
         rows = db.execute(
@@ -26,7 +52,7 @@ def _keyword_search(db: Session, query: str, limit: int = 20) -> List[Dict[str, 
                 ORDER BY rank
                 LIMIT :limit
             """),
-            {"query": query.strip(), "limit": limit},
+            {"query": safe_query, "limit": limit},
         ).fetchall()
         return [
             {

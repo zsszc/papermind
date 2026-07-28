@@ -1,10 +1,11 @@
+import json
 import os
-import shutil
 import threading
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
+import aiofiles
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
@@ -35,6 +36,98 @@ from app.services.auto_tag import auto_tag_service
 from app.services.retrieval import get_vector_store
 
 router = APIRouter()
+
+# 上传限制：单文件 50MB，分块读取大小 1MB
+MAX_UPLOAD_SIZE = 50 * 1024 * 1024
+_UPLOAD_CHUNK_SIZE = 1024 * 1024
+
+
+async def _save_upload_file(file: UploadFile, target_path: Path, max_size: Optional[int] = None) -> int:
+    """分块异步写入上传文件，避免在事件循环中同步写盘阻塞。
+
+    按实际读取字节数做大小校验，超限（或写入失败）时清理残留文件并抛错。
+    """
+    limit = max_size if max_size is not None else MAX_UPLOAD_SIZE
+    total = 0
+    try:
+        async with aiofiles.open(target_path, "wb") as f:
+            while True:
+                chunk = await file.read(_UPLOAD_CHUNK_SIZE)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > limit:
+                    raise HTTPException(
+                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        detail=f"文件超过大小限制（最大 {limit // (1024 * 1024)}MB）",
+                    )
+                await f.write(chunk)
+    except Exception:
+        # 清理不完整文件，避免留下损坏的 PDF
+        try:
+            target_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    return total
+
+
+def _enhance_metadata_with_llm_sync(pdf_path: str) -> Dict[str, Any]:
+    """PDFParser.enhance_metadata_with_llm 的同步镜像版。
+
+    后台线程没有事件循环，不能复用 async LLM client，这里改用同步入口
+    chat_completion_sync。prompt 与结果解析逻辑需与异步版保持一致。
+    """
+    path = Path(pdf_path)
+    front_text = PDFParser()._extract_front_text(path, max_pages=3)
+    if not front_text.strip():
+        return {}
+
+    prompt = f"""请从以下学术论文的前几页文本中提取元数据，并以 JSON 格式返回。
+
+请提取以下字段：
+- title: 论文标题（字符串，完整标题，去除页眉页脚和 arXiv 水印）
+- authors: 作者列表（字符串，用逗号分隔）
+- year: 发表年份（整数，如 2024）
+- journal: 期刊或会议名称（字符串）
+- abstract: 摘要（字符串，尽量完整）
+- doi: DOI（字符串，没有则留空）
+- authors_list: 作者列表（数组，每个元素一个作者姓名）
+- confidence: 对象，包含 title/authors/year/journal/abstract/doi 的置信度，1-5 分
+- source_lines: 对象，包含 title/authors/year/journal/abstract/doi 的原始来源文本片段
+
+注意：
+1. 只返回 JSON，不要有任何其他解释文字。
+2. 如果某个字段无法确定，使用空字符串或 null。
+3. 标题和作者必须准确，不要包含页眉页脚或噪声。
+4. 作者名不要包含邮箱地址、机构名或 "and" 等连接词。
+
+文本内容：
+{front_text[:4000]}
+
+JSON 输出："""
+
+    messages = [
+        {"role": "system", "content": "你是专业的学术论文元数据提取助手，只输出 JSON。"},
+        {"role": "user", "content": prompt},
+    ]
+    result = llm_service.chat_completion_sync(messages, json_mode=True)
+    try:
+        data = json.loads(result)
+        return {
+            "title": data.get("title") or None,
+            "authors": data.get("authors") or None,
+            "year": int(data["year"]) if data.get("year") else None,
+            "journal": data.get("journal") or None,
+            "abstract": data.get("abstract") or None,
+            "doi": data.get("doi") or None,
+            "authors_list": data.get("authors_list") or None,
+            "confidence": data.get("confidence") or {},
+            "source_lines": data.get("source_lines") or {},
+        }
+    except Exception as e:
+        logger.warning(f"[PDFParser] LLM 增强元数据解析失败（同步）: {e}", exc_info=True)
+        return {}
 
 # 按 paper_id 的细粒度锁，避免不同 PDF 互相阻塞
 _paper_locks: Dict[int, threading.Lock] = {}
@@ -73,8 +166,9 @@ def _enhance_paper_metadata(paper_id: int):
     """独立后台任务：使用 LLM 补全元数据并自动生成标签。
 
     该任务与核心向量化流程解耦，失败不会影响 paper.processed 状态。
+    在独立线程中运行，全程使用同步 LLM 入口，避免线程内 asyncio.run()
+    复用 async client 造成跨事件循环问题。
     """
-    import asyncio
     from app.database import SessionLocal
 
     with SessionLocal() as db:
@@ -84,9 +178,8 @@ def _enhance_paper_metadata(paper_id: int):
             return
 
         try:
-            parser = PDFParser()
             pdf_path = str(Path(__file__).resolve().parents[3] / paper.file_path)
-            enhanced = asyncio.run(parser.enhance_metadata_with_llm(pdf_path))
+            enhanced = _enhance_metadata_with_llm_sync(pdf_path)
             if enhanced.get("title"):
                 paper.title = enhanced["title"]
             if enhanced.get("authors"):
@@ -106,18 +199,14 @@ def _enhance_paper_metadata(paper_id: int):
             logger.error(f"[background] enhance metadata paper {paper_id} failed: {e}")
             return
 
-        # 自动生成标签（限制 60 秒）
+        # 自动生成标签（LLM 调用限时 60 秒）
         try:
-            generated_tags = asyncio.run(
-                asyncio.wait_for(auto_tag_service.generate_tags(paper, db), timeout=60.0)
-            )
+            generated_tags = auto_tag_service.generate_tags_sync(paper, db, timeout=60)
             for tag in generated_tags:
                 if tag not in paper.tags:
                     paper.tags.append(tag)
             db.commit()
             logger.info(f"[background] paper {paper_id} 自动标签完成: {[t.name for t in generated_tags]}")
-        except asyncio.TimeoutError:
-            logger.warning(f"[background] auto tag paper {paper_id} 超时，跳过")
         except Exception as e:
             logger.error(f"[background] auto tag paper {paper_id} failed: {e}")
 
@@ -187,8 +276,16 @@ async def import_papers(
     imported = []
 
     for file in files:
+        # 扩展名白名单：仅允许 PDF
         if not file.filename or not file.filename.lower().endswith(".pdf"):
-            continue
+            raise HTTPException(status_code=400, detail=f"只支持 .pdf 文件: {file.filename or '未命名文件'}")
+
+        # 单文件大小上限：先按声明大小快速拦截，写盘时再按实际字节数兜底
+        if file.size is not None and file.size > MAX_UPLOAD_SIZE:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"文件超过大小限制（最大 {MAX_UPLOAD_SIZE // (1024 * 1024)}MB）: {file.filename}",
+            )
 
         safe_name = Path(file.filename).name
         target_path = papers_dir / safe_name
@@ -201,8 +298,8 @@ async def import_papers(
             target_path = papers_dir / f"{stem}_{counter}{suffix}"
             counter += 1
 
-        with open(target_path, "wb") as f:
-            shutil.copyfileobj(file.file, f)
+        # 分块异步写盘，避免同步写阻塞事件循环
+        await _save_upload_file(file, target_path)
 
         try:
             metadata = await run_in_threadpool(parser.parse_metadata, str(target_path))
@@ -227,10 +324,11 @@ async def import_papers(
         db.add(paper)
         db.flush()
 
-        # 创建对应的空笔记文件
+        # 创建对应的空笔记文件（放线程池，避免同步写盘阻塞事件循环）
         notes_dir = get_notes_dir()
         note_path = notes_dir / f"{paper.id}.md"
-        note_path.write_text(f"# {paper.title or paper.filename}\n\n", encoding="utf-8")
+        note_content = f"# {paper.title or paper.filename}\n\n"
+        await run_in_threadpool(note_path.write_text, note_content, "utf-8")
 
         # 后台自动处理
         if background_tasks:

@@ -4,8 +4,6 @@ from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
-from pathlib import Path
 
 from app.database import engine, Base, ensure_schema
 from app.core.config import config
@@ -13,7 +11,7 @@ from app.core.logger import logger
 from app.models import ensure_papers_fts
 from app.services.llm import llm_service
 from app.services.backup import auto_backup, cleanup_old_backups
-from app.routers import papers, search, chat, thesis, memory, export, settings
+from app.routers import papers, search, chat, thesis, memory, export, settings, static
 from app.core.settings import apply_env_overrides, validate_startup_config
 
 
@@ -72,11 +70,13 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# CORS 严格化：仅放行本地前端开发源，不携带凭证。
+# "null" 是 Electron 生产包以 file:// 加载前端时 fetch 携带的 Origin，必须显式放行。
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "null"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -88,19 +88,18 @@ app.include_router(memory.router, prefix="/api/memory", tags=["memory"])
 app.include_router(export.router, prefix="/api/export", tags=["export"])
 app.include_router(settings.router, prefix="/api/settings", tags=["settings"])
 
-# 静态文件服务：用于访问 PDF 等本地资源
-project_root = Path(__file__).resolve().parents[2]
-app.mount("/static", StaticFiles(directory=project_root), name="static")
+# 受限静态文件服务：仅放行白名单目录，防止路径穿越（见 routers/static.py）
+app.include_router(static.router, tags=["static"])
 
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    """捕获所有未处理异常，返回统一错误响应。"""
+    """捕获所有未处理异常：详情（含堆栈）只写日志，响应不泄露内部信息。"""
     logger.exception(f"[api] 未处理异常: {request.method} {request.url.path}")
     return JSONResponse(
         status_code=500,
         content={
-            "detail": str(exc) or "服务器内部错误",
+            "detail": "服务器内部错误，请稍后重试",
             "error_code": "internal_error",
             "path": request.url.path,
         },

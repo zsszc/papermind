@@ -1,11 +1,12 @@
 import os
-import shutil
 import re
 from pathlib import Path
 from typing import List, Optional
 
+import aiofiles
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from app.database import get_db
 from app.models import ThesisFile, ThesisCitation, Paper
@@ -24,6 +25,41 @@ from app.services.llm import llm_service
 from app.core.logger import logger
 
 router = APIRouter()
+
+# 上传限制：单文件 50MB，分块读取大小 1MB
+MAX_UPLOAD_SIZE = 50 * 1024 * 1024
+_UPLOAD_CHUNK_SIZE = 1024 * 1024
+
+
+async def _save_upload_file(file: UploadFile, target_path: Path, max_size: Optional[int] = None) -> int:
+    """分块异步写入上传文件，避免在事件循环中同步写盘阻塞。
+
+    按实际读取字节数做大小校验，超限（或写入失败）时清理残留文件并抛错。
+    与 papers 路由中的同名 helper 保持一致（两处独立，避免路由间互相依赖）。
+    """
+    limit = max_size if max_size is not None else MAX_UPLOAD_SIZE
+    total = 0
+    try:
+        async with aiofiles.open(target_path, "wb") as f:
+            while True:
+                chunk = await file.read(_UPLOAD_CHUNK_SIZE)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > limit:
+                    raise HTTPException(
+                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        detail=f"文件超过大小限制（最大 {limit // (1024 * 1024)}MB）",
+                    )
+                await f.write(chunk)
+    except Exception:
+        # 清理不完整文件
+        try:
+            target_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    return total
 
 
 def get_thesis_dir() -> Path:
@@ -80,8 +116,16 @@ async def upload_thesis(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
+    # 扩展名白名单：仅允许 .docx
     if not file.filename or not file.filename.lower().endswith(".docx"):
         raise HTTPException(status_code=400, detail="只支持 .docx 文件")
+
+    # 单文件大小上限：先按声明大小快速拦截，写盘时再按实际字节数兜底
+    if file.size is not None and file.size > MAX_UPLOAD_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"文件超过大小限制（最大 {MAX_UPLOAD_SIZE // (1024 * 1024)}MB）: {file.filename}",
+        )
 
     thesis_dir = get_thesis_dir()
     safe_name = Path(file.filename).name
@@ -94,11 +138,12 @@ async def upload_thesis(
         target_path = thesis_dir / f"{stem}_{counter}{suffix}"
         counter += 1
 
-    with open(target_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+    # 分块异步写盘，避免同步写阻塞事件循环
+    await _save_upload_file(file, target_path)
 
+    # docx 解析为同步 CPU/IO 操作，放线程池执行
     parser = DocxParser()
-    parsed = parser.parse(str(target_path))
+    parsed = await run_in_threadpool(parser.parse, str(target_path))
 
     thesis = ThesisFile(
         title=parsed.get("title") or target_path.stem,
