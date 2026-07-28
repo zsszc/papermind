@@ -23,6 +23,7 @@ notes/
 vector_db/
 logs/
 cache/
+backend/eval/reports/
 
 # 模型缓存
 *.bin
