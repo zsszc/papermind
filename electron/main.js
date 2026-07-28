@@ -26,6 +26,10 @@ const isDev = process.env.NODE_ENV === 'development'
 
 let mainWindow
 let backendProcess = null
+// 是否为主动 kill（退出应用时置 true，避免触发自动重启）
+let intentionalKill = false
+// 上一次自动重启的时间戳，用于限制 30 秒内最多重启 1 次
+let lastRestartAt = 0
 
 function getProjectPaths() {
   if (app.isPackaged) {
@@ -63,7 +67,7 @@ function createWindow() {
     mainWindow.webContents.openDevTools()
   } else {
     // 生产模式：先检查后端是否已运行，未运行则自动启动，然后加载 dist
-    mainWindow.webContents.openDevTools()
+    // 注意：生产模式不打开 DevTools，避免打包版自带开发者工具
     loadProductionApp()
   }
 }
@@ -114,16 +118,20 @@ async function startBackend() {
   logToFile('[electron] 数据目录检查完成，开始 spawn 后端进程')
 
   try {
+    // 净化环境：PYTHONPATH/PYTHONHOME 会污染 backend/venv 的解释器，
+    // 曾导致加载到其他 venv 的 fastapi/pydantic_core 使后端无法启动
+    const env = { ...process.env }
+    delete env.PYTHONPATH
+    delete env.PYTHONHOME
+    env.PAPERMIND_DATA_DIR = dataDir
+
     backendProcess = spawn(
       venvPython,
       ['-m', 'uvicorn', 'app.main:app', '--host', '127.0.0.1', '--port', '8000', '--workers', '1'],
       {
         cwd: backendCwd,
         stdio: 'pipe',
-        env: {
-          ...process.env,
-          PAPERMIND_DATA_DIR: dataDir,
-        },
+        env,
       }
     )
   } catch (spawnErr) {
@@ -146,6 +154,30 @@ async function startBackend() {
 
   backendProcess.on('exit', (code, signal) => {
     errToFile(`[electron] 后端进程退出，code=${code}, signal=${signal}`)
+    // 进程已退出，释放引用，避免后续 kill 操作打到已退出的对象上
+    backendProcess = null
+
+    // 主动 kill（退出应用）时不重启；窗口已销毁时也不重启
+    if (intentionalKill) return
+    if (!mainWindow || mainWindow.isDestroyed()) return
+
+    // 30 秒内最多自动重启 1 次，避免崩溃循环
+    const now = Date.now()
+    if (now - lastRestartAt < 30000) {
+      errToFile('[electron] 后端 30 秒内再次退出，放弃自动重启，请查看日志排查')
+      return
+    }
+    lastRestartAt = now
+    logToFile('[electron] 后端意外退出且窗口仍存活，尝试一次自动重启...')
+    startBackend().then((ok) => {
+      if (!ok) {
+        errToFile('[electron] 后端自动重启失败，不再重试')
+      } else {
+        logToFile('[electron] 后端自动重启成功')
+      }
+    }).catch((err) => {
+      errToFile('[electron] 后端自动重启抛出异常，不再重试:', err)
+    })
   })
 
   const alive = await waitForBackend(15000)
@@ -188,10 +220,29 @@ function waitForBackend(timeoutMs) {
 }
 
 function killBackend() {
-  if (backendProcess && !backendProcess.killed) {
-    backendProcess.kill()
-    backendProcess = null
+  const proc = backendProcess
+  if (!proc || proc.killed) return
+
+  // 标记为主动 kill，exit 回调中不会触发自动重启
+  intentionalKill = true
+
+  // 先 SIGTERM 优雅退出；3 秒后仍未退出则 SIGKILL 兜底（uvicorn 偶发卡死）
+  try {
+    proc.kill('SIGTERM')
+  } catch (err) {
+    errToFile('[electron] SIGTERM 后端进程失败:', err)
   }
+  setTimeout(() => {
+    // exitCode/signalCode 均为 null 表示进程仍未退出（此时引用可能已被 exit 回调置 null，故用局部变量 proc）
+    if (proc.exitCode === null && proc.signalCode === null) {
+      errToFile('[electron] 后端进程 3 秒内未退出，发送 SIGKILL')
+      try {
+        proc.kill('SIGKILL')
+      } catch (err) {
+        errToFile('[electron] SIGKILL 后端进程失败:', err)
+      }
+    }
+  }, 3000)
 }
 
 app.whenReady().then(createWindow)

@@ -40,11 +40,14 @@ const statusMap = {
 
 function PaperList({ onSelectPaper, onRefresh }) {
   const [papers, setPapers] = useState([])
+  const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(false)
   const [allTags, setAllTags] = useState([])
   const [params, setParams] = useState({ skip: 0, limit: 20, q: '', status: undefined, tag: undefined })
   const [selectedRowKeys, setSelectedRowKeys] = useState([])
   const pollingRef = useRef(null)
+  // 保存最新的 fetchPapers，避免轮询定时器闭包捕获过期的查询参数
+  const fetchPapersRef = useRef(null)
 
   const fetchPapers = async () => {
     setLoading(true)
@@ -58,13 +61,14 @@ function PaperList({ onSelectPaper, onRefresh }) {
       const res = await listPapers(reqParams)
       const items = res.data.items || []
       setPapers(items)
+      setTotal(res.data.total || 0)
 
       // 如果存在处理中的论文，启动轮询刷新
       const hasProcessing = items.some(
         (p) => p.processed === 'pending' || p.processed === 'processing'
       )
       if (hasProcessing && !pollingRef.current) {
-        pollingRef.current = setInterval(() => fetchPapers(), 2000)
+        pollingRef.current = setInterval(() => fetchPapersRef.current?.(), 2000)
       } else if (!hasProcessing && pollingRef.current) {
         clearInterval(pollingRef.current)
         pollingRef.current = null
@@ -73,6 +77,7 @@ function PaperList({ onSelectPaper, onRefresh }) {
       setLoading(false)
     }
   }
+  fetchPapersRef.current = fetchPapers
 
   useEffect(() => {
     fetchPapers()
@@ -96,7 +101,12 @@ function PaperList({ onSelectPaper, onRefresh }) {
   const handleDelete = async (id) => {
     await deletePaper(id)
     message.success('已删除')
-    fetchPapers()
+    // 若删除的是当前页最后一条且不在第一页，自动回退一页，避免停留在空页
+    if (papers.length === 1 && params.skip > 0) {
+      setParams((p) => ({ ...p, skip: Math.max(0, p.skip - p.limit) }))
+    } else {
+      fetchPapers()
+    }
     onRefresh?.()
   }
 
@@ -112,7 +122,12 @@ function PaperList({ onSelectPaper, onRefresh }) {
           await batchDeletePapers(selectedRowKeys)
           message.success('批量删除成功')
           setSelectedRowKeys([])
-          fetchPapers()
+          // 批量删除可能清空当前页，非第一页时回到第一页重新加载
+          if (params.skip > 0) {
+            setParams((p) => ({ ...p, skip: 0 }))
+          } else {
+            fetchPapers()
+          }
           onRefresh?.()
         } catch (err) {
           // 全局拦截器已处理错误
@@ -376,6 +391,8 @@ function PaperList({ onSelectPaper, onRefresh }) {
           pagination={{
             pageSize: params.limit,
             current: Math.floor(params.skip / params.limit) + 1,
+            total,
+            showTotal: (t) => `共 ${t} 篇`,
             showSizeChanger: true,
             pageSizeOptions: ['10', '20', '50', '100'],
             onChange: (page, pageSize) =>

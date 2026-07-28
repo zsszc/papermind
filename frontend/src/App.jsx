@@ -15,6 +15,7 @@ import {
 } from '@ant-design/icons'
 import ChatPanel from './components/ChatPanel'
 import SettingsModal from './components/SettingsModal'
+import ErrorBoundary from './components/ErrorBoundary'
 import { importPapers } from './api'
 import { colors, componentStyles } from './theme'
 
@@ -151,7 +152,9 @@ function App() {
   const siderWidth = collapsed ? SIDER_COLLAPSED_WIDTH : SIDER_WIDTH
 
   return (
-    <Layout style={{ minHeight: '100vh', background: colors.pageBg }}>
+    // 错误边界包在最外层，不破坏内部 React.lazy 的 Suspense 结构
+    <ErrorBoundary>
+      <Layout style={{ minHeight: '100vh', background: colors.pageBg }}>
       <AppHeader onUploadSuccess={handleRefresh} onOpenSettings={() => setSettingsOpen(true)} />
       <Layout style={{ background: colors.pageBg }}>
         <Sider
@@ -284,7 +287,8 @@ function App() {
         />
       )}
       <SettingsModal open={settingsOpen} onClose={() => setSettingsOpen(false)} />
-    </Layout>
+      </Layout>
+    </ErrorBoundary>
   )
 }
 

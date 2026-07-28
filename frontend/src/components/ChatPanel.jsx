@@ -25,7 +25,6 @@ import {
   ReloadOutlined,
   PauseCircleOutlined,
   GlobalOutlined,
-  FileSearchOutlined,
   TranslationOutlined,
   CheckCircleOutlined,
   DiffOutlined,
@@ -242,39 +241,82 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
     [currentId]
   )
 
-  const readSSEStream = useCallback(async (response, onDelta, onFinish) => {
+  // SSE 流式解析（健壮版）：
+  // - 维护字符串 buffer，跨 TCP chunk 拼接，按 '\n\n' 切分事件，残缺片段留到下一轮
+  // - 事件内逐行收集 'data:' 行（兼容无空格/有空格），多行 data 按规范用 '\n' 拼接
+  // - 支持 {delta} / {finished, citations} / {error} 三种消息；error 经 onError 回调通知调用方
+  // - JSON 解析失败不静默吞：console.warn 保留原始片段，但不中断整个流
+  // - AbortController 中断时 cancel reader 并重新抛出 AbortError（调用方已统一处理）
+  const readSSEStream = useCallback(async (response, onDelta, onFinish, onError) => {
     const reader = response.body.getReader()
     const decoder = new TextDecoder('utf-8')
+    let buffer = ''
     let finished = false
     let lastCitations = []
 
-    while (!finished) {
-      const { done, value } = await reader.read()
-      if (done) {
-        finished = true
-        break
-      }
-      const chunk = decoder.decode(value, { stream: true })
-      const lines = chunk.split('\n\n')
-      for (const line of lines) {
-        if (!line.trim() || !line.startsWith('data: ')) continue
-        try {
-          const data = JSON.parse(line.slice(6))
-          if (data.delta) {
-            onDelta(data.delta)
-          }
-          if (data.finished) {
-            finished = true
-            if (data.citations) {
-              lastCitations = data.citations
-            }
-          }
-        } catch (e) {
-          // ignore
+    // 处理单个 SSE 事件块（不含结尾空行）
+    const handleEvent = (eventText) => {
+      const dataLines = []
+      for (const rawLine of eventText.split('\n')) {
+        const line = rawLine.replace(/\r$/, '')
+        if (line.startsWith('data:')) {
+          // 规范：'data:' 后可有一个可选空格
+          dataLines.push(line.startsWith('data: ') ? line.slice(6) : line.slice(5))
         }
       }
+      if (!dataLines.length) return
+      // 多行 data 按 SSE 规范用 '\n' 拼接后再解析
+      const payload = dataLines.join('\n')
+      try {
+        const data = JSON.parse(payload)
+        if (data.delta) {
+          onDelta(data.delta)
+        }
+        if (data.error) {
+          finished = true
+          onError?.(data.error)
+        }
+        if (data.finished) {
+          finished = true
+          if (data.citations) {
+            lastCitations = data.citations
+          }
+        }
+      } catch (e) {
+        // 残缺/非法 JSON 不中断整个流，但保留原始片段便于排查
+        console.warn('[SSE] JSON 解析失败，已跳过该事件：', e, payload)
+      }
     }
-    onFinish(lastCitations)
+
+    try {
+      while (!finished) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        // 按空行切分事件；最后一段可能不完整，留在 buffer 等下一轮
+        const events = buffer.split('\n\n')
+        buffer = events.pop()
+        for (const evt of events) {
+          handleEvent(evt)
+          if (finished) break
+        }
+      }
+      // 流结束时 buffer 里若还有完整事件，补处理掉
+      if (!finished && buffer.trim()) {
+        handleEvent(buffer)
+      }
+      onFinish(lastCitations)
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        // 中断：优雅取消 reader，重新抛出由调用方统一处理（标记"已停止"等）
+        try {
+          await reader.cancel()
+        } catch {
+          // 忽略 cancel 异常
+        }
+      }
+      throw err
+    }
   }, [])
 
   const handleSend = useCallback(async () => {
@@ -327,7 +369,20 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
               return next
             })
           },
-          () => {}
+          () => {},
+          // 后端通过 SSE 下发的 error 事件：提示并结束 loading（finally 中统一收尾）
+          (errorMsg) => {
+            message.error('图片分析失败：' + errorMsg)
+            setMessages((prev) => {
+              const last = prev[prev.length - 1]
+              if (last && last.role === 'assistant') {
+                const next = [...prev]
+                next[next.length - 1] = { ...last, content: last.content || '[图片分析失败，请稍后重试]' }
+                return next
+              }
+              return prev
+            })
+          }
         )
       } catch (err) {
         if (err.name !== 'AbortError') {
@@ -388,6 +443,19 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
             if (finalCitations?.length) {
               setCitations(finalCitations)
             }
+          },
+          // 后端通过 SSE 下发的 error 事件：提示并结束 loading（finally 中统一收尾），不触发重试
+          (errorMsg) => {
+            message.error('对话失败：' + errorMsg)
+            setMessages((prev) => {
+              const last = prev[prev.length - 1]
+              if (last && last.role === 'assistant') {
+                const next = [...prev]
+                next[next.length - 1] = { ...last, content: last.content || '[请求失败，请稍后重试]' }
+                return next
+              }
+              return prev
+            })
           }
         )
 
@@ -481,6 +549,10 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
             if (finalCitations?.length) {
               setCitations(finalCitations)
             }
+          },
+          // 后端通过 SSE 下发的 error 事件：提示即可，loading 由 finally 收尾
+          (errorMsg) => {
+            message.error('重新生成失败：' + errorMsg)
           }
         )
         fetchConversations()
