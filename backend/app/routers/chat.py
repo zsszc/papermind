@@ -13,50 +13,15 @@ from app.core.logger import logger
 from app.services.llm import llm_service
 from app.services.retrieval import get_vector_store
 from app.services.memory_manager import MemoryManager
-from app.services.web_search import web_search_service
 from app.services.image_analyzer import image_analyzer_service
-from app.services.skills import build_skill_prompt, list_skills
+from app.services.skills import list_skills
+from app.services.agent_graph import (
+    SYSTEM_PROMPT,
+    build_rag_prompt as _build_rag_prompt,
+    run_pre_orchestration,
+)
 
 router = APIRouter()
-
-
-SYSTEM_PROMPT = """你是 PaperMind，一位专业的学术文献助手。你正在帮助用户管理结直肠癌 T 分期预测相关的文献、笔记与毕业论文写作。
-
-请遵循以下规则：
-1. 基于提供的参考文献片段回答，若片段不足以回答，请明确说明。
-2. 回答需专业、简洁，优先使用中文。
-3. 若引用文献片段，请在回答末尾以 [^1^] [^2^] 形式标注，并列出引用来源。
-4. 若用户问题与当前文献无关，可作为一般学术讨论回答。
-"""
-
-
-def _build_rag_prompt(query: str, retrieved: List[dict]) -> str:
-    context_parts = []
-    for i, item in enumerate(retrieved, start=1):
-        title = item.get("title") or "未知文献"
-        authors = item.get("authors") or ""
-        year = item.get("year") or ""
-        page = item.get("page_number")
-        content = item.get("content", "")
-        header = f"[{i}] {title}"
-        if authors:
-            header += f" - {authors}"
-        if year:
-            header += f" ({year})"
-        if page:
-            header += f" 第{page}页"
-        context_parts.append(f"{header}\n{content}\n")
-
-    context = "\n---\n".join(context_parts)
-    return f"""以下是可能相关的文献片段（每个片段开头 [i] 为引用编号，请在回答中需要引用时标注 [^i^]）：
-
-{context}
-
----
-
-用户问题：{query}
-
-请基于以上片段回答，并在需要时标注引用来源 [^i^]。回答末尾请列出引用文献的标题与页码。"""
 
 
 async def _stream_response(messages: List[dict]) -> AsyncIterator[str]:
@@ -286,19 +251,6 @@ async def chat(request: ChatRequest, db: Session = Depends(get_db)):
         db.add(conv)
         db.flush()
 
-    # 检索相关文献片段（Embedding 不可用时自动回退到纯 LLM 对话）
-    retrieved = []
-    filters = {}
-    if request.paper_id:
-        filters["paper_id"] = request.paper_id
-    if request.message:
-        try:
-            store = get_vector_store()
-            if store.available():
-                retrieved = store.search(query=request.message, top_k=5, filters=filters)
-        except Exception as e:
-            logger.error(f"[chat] 检索失败: {e}")
-
     # 保存用户消息
     user_msg = Message(
         conversation_id=conv.id,
@@ -316,42 +268,21 @@ async def chat(request: ChatRequest, db: Session = Depends(get_db)):
     except Exception as e:
         logger.error(f"[chat] 记忆更新失败: {e}")
 
-    # 组装历史消息
-    history = (
-        db.query(Message)
-        .filter(Message.conversation_id == conv.id)
-        .order_by(Message.created_at.asc())
-        .all()
+    # LangGraph 前置编排：load_memory → retrieve → build_messages
+    # 产出 messages / 检索片段（引用）/ 联网开关，流式生成与 SSE 发送逻辑维持不变
+    state = run_pre_orchestration(
+        db=db,
+        conversation_id=conv.id,
+        user_message=request.message,
+        skill=request.skill,
+        paper_id=request.paper_id,
+        enable_web_search=bool(request.enable_web_search),
     )
-    # 构建 system prompt：基础设定 + 记忆 + RAG
-    memory_context = memory_mgr.build_memory_context()
-    system_content = SYSTEM_PROMPT
-    if memory_context:
-        system_content += f"\n\n以下是关于用户的背景记忆，请在回答时参考：\n\n{memory_context}"
+    messages = state["messages"]
+    retrieved = state["context_chunks"]
+    enable_web_search = state["web_search_enabled"]
 
-    messages = [{"role": "system", "content": system_content}]
-    for m in history[-10:]:
-        messages.append({"role": m.role, "content": m.content})
-
-    # 将检索结果作为 system 上下文追加到最后（history 中已包含当前 user 消息）
-    if retrieved:
-        rag_context = _build_rag_prompt(request.message, retrieved)
-        messages.append({"role": "system", "content": rag_context})
-
-    # 判断是否启用联网搜索
-    enable_web_search = request.enable_web_search or web_search_service.should_search_online(request.message)
-    if enable_web_search:
-        messages.append({
-            "role": "system",
-            "content": "用户问题可能涉及最新信息。如果现有文献片段不足以回答，请调用联网搜索工具获取最新资料并标注来源。",
-        })
-
-    # 注入 Skill 角色设定
-    skill_prompt = build_skill_prompt(request.skill, request.message)
-    if skill_prompt:
-        messages.append({"role": "system", "content": skill_prompt})
-
-    conv.message_count = len(history) + 1
+    conv.message_count = state["history_total"] + 1
     db.commit()
 
     if request.stream is False:

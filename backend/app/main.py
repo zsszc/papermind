@@ -88,6 +88,12 @@ app.include_router(memory.router, prefix="/api/memory", tags=["memory"])
 app.include_router(export.router, prefix="/api/export", tags=["export"])
 app.include_router(settings.router, prefix="/api/settings", tags=["settings"])
 
+# MCP Server：将文献库只读能力暴露为 MCP 工具（SSE 传输）。
+# 子应用路由为 /mcp/sse（长连接）与 /mcp/messages/（消息回传）；
+# 必须挂在 /static 白名单路由之前，避免被静态路由抢先匹配。
+from app.services.mcp_server import get_mcp_app
+app.mount("/mcp", get_mcp_app())
+
 # 受限静态文件服务：仅放行白名单目录，防止路径穿越（见 routers/static.py）
 app.include_router(static.router, tags=["static"])
 
