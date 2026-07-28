@@ -29,6 +29,7 @@
 - sentence-transformers 2.3 + transformers 4.39.3 + torch 2.2.2（本地跑 BGE-M3 Embedding）
 - pdfplumber 0.10（PDF 文本提取）、python-docx 1.1（Word 解析）、PyPDF2（备用）
 - openai 1.12（调用 Kimi API，OpenAI 兼容协议）+ httpx 0.27.2（**已固定版本，见「已知问题」**）
+- langgraph 1.2.9（对话编排 Agent 图）+ mcp 1.3.0（MCP Server，**版本锁定原因见「已知问题」**）
 - pandas / openpyxl（导出 Excel）、tiktoken（token 计数）
 
 ### 前端（`frontend/package.json`）
@@ -53,10 +54,13 @@
         │  HTTP (/api, /static)   SSE 流式对话
         ▼
 FastAPI 后端 (:8000, 单 worker)
-  ├─ routers/   papers / search / chat / thesis / memory / export / settings
+  ├─ routers/   papers / search / chat / thesis / memory / export / settings / static
   ├─ services/  pdf_parser, docx_parser, embedding, retrieval, llm,
   │             skills, memory_manager, web_search, image_analyzer,
-  │             auto_tag, backup, cache, processor
+  │             auto_tag, backup, cache, processor,
+  │             agent_graph（LangGraph 对话编排）, mcp_server（MCP 工具）
+  ├─ eval/      RAG 评测（dataset / metrics / run，详见「测试与评测」）
+  ├─ /mcp       MCP Server（SSE 传输，FastMCP 子应用挂载）
   └─ SQLite (data/papers.db, WAL) + ChromaDB (vector_db/) + 本地文件
         ▼
 Kimi API (kimi-k2.6) —— 对话 / 概括 / 联网搜索 / 图片分析
@@ -65,11 +69,12 @@ Kimi API (kimi-k2.6) —— 对话 / 概括 / 联网搜索 / 图片分析
 关键机制：
 
 - **启动流程**（`backend/app/main.py` lifespan）：`Base.metadata.create_all` → `ensure_schema()` 轻量迁移 → `ensure_papers_fts()` 建 FTS5 虚拟表与触发器 → LLM 健康检查（结果存 `app.state.llm_ready`，暴露在 `/api/health`）→ 启动每日凌晨 3 点自动备份线程。
-- **静态服务**：整个项目根目录挂载在 `/static`，前端通过它访问 PDF 等本地资源。
-- **配置加载**（`backend/app/core/config.py`，单例 `Config`）：优先读项目根 `config.yaml`，缺失时回退 `config.yaml.example`；若设了 `PAPERMIND_DATA_DIR`（Electron 生产包），则从该目录读/复制配置，并自动检测占位符 API Key。
+- **静态服务**：`/static` 为白名单静态路由（`routers/static.py`），仅放行 `papers/`、`notes/`、`my-thesis/`、`summaries/` 四个目录，`resolve()` 防 `../` 穿越与软链接逃逸；项目根不再整体暴露。
+- **配置加载**（`backend/app/core/config.py`，单例 `Config`）：优先读项目根 `config.yaml`，缺失时回退 `config.yaml.example`；若设了 `PAPERMIND_DATA_DIR`（Electron 生产包），则从该目录读/复制配置，并自动检测占位符 API Key。`core/settings.py` 提供 `PAPERMIND_*` 环境变量覆盖与启动校验（lifespan 中执行）。
 - **检索**（`backend/app/routers/search.py`）：语义检索（ChromaDB cosine，Embedding 用 BGE-M3）与关键词检索（SQLite FTS5 `papers_fts` 表）可独立开关，同时开启时用 RRF（Reciprocal Rank Fusion）融合；语义检索结果有 60 秒内存缓存（`services/cache.py`）。`config.yaml` 里 `retrieval.rerank` 默认为 `false`，BGE-Reranker 相关代码是预留。
-- **Skill 系统**（`backend/app/services/skills.py`）：**不是** YAML 插件注册表，而是轻量 Prompt 路由——前端传 `skill` 字段，后端往 system prompt 里注入角色设定。现有 6 个：translator、proofreader、method_comparator、outline_generator、data_analyst、writing_assistant。根目录 `skills/` 目录为空，属预留。
-- **对话**（`routers/chat.py`）：`POST /api/chat` 为 SSE 流式；另有会话 CRUD、消息删除/重新生成、`/analyze-image`（多模态）、`/skills` 列表。
+- **Skill 系统**（`backend/app/services/skills.py`）：`SkillRegistry` 可注册注册表（Skill-as-Tool 基础），`Skill` dataclass 预留 `tools` 字段供后续工具化；模块级 `build_skill_prompt()` / `list_skills()` 保持原签名。现有 6 个默认 Skill：translator、proofreader、method_comparator、outline_generator、data_analyst、writing_assistant。根目录 `skills/` 目录为空，属预留。
+- **对话**（`routers/chat.py`）：`POST /api/chat` 为 SSE 流式。LLM 调用前的编排（记忆加载 → 向量检索 → 消息组装）由 `services/agent_graph.py` 的 LangGraph StateGraph 完成；流式生成与 SSE 事件格式（`{delta}` / `{finished, citations}` / `{error}`）由路由层保持。另有会话 CRUD、消息删除/重新生成、`/analyze-image`（多模态）、`/skills` 列表。
+- **MCP Server**（`services/mcp_server.py`）：挂载于 `/mcp`（SSE 握手 `/mcp/sse`），暴露 4 个只读工具 `search_papers` / `list_papers` / `get_paper` / `get_library_stats`，供任意 MCP 客户端连接使用。
 - **备份**（`services/backup.py`）：每日凌晨 3 点自动备份到 `backups/`，保留最近 10 份；也可经 `POST /api/export/backup` 手动触发。
 
 ---
@@ -80,15 +85,21 @@ Kimi API (kimi-k2.6) —— 对话 / 概括 / 联网搜索 / 图片分析
 个人知识库/（项目根，即 PaperMind）
 ├── backend/
 │   ├── app/
-│   │   ├── core/           # config.py（YAML 配置单例）、logger.py
-│   │   ├── routers/        # papers/search/chat/thesis/memory/export/settings
-│   │   ├── services/       # 见上文运行时架构
+│   │   ├── core/           # config.py（YAML 配置单例）、settings.py（环境变量覆盖/启动校验）、logger.py
+│   │   ├── routers/        # papers/search/chat/thesis/memory/export/settings/static
+│   │   ├── services/       # 见上文运行时架构（含 agent_graph、mcp_server）
 │   │   ├── database.py     # SQLAlchemy 引擎 + ensure_schema() 轻量迁移
 │   │   ├── models.py       # ORM 模型 + FTS5 虚拟表 DDL
 │   │   ├── schemas.py      # Pydantic 请求/响应模型
-│   │   └── main.py         # FastAPI 入口（lifespan、CORS、/static 挂载）
+│   │   └── main.py         # FastAPI 入口（lifespan、CORS、/mcp 挂载、/static 白名单）
+│   ├── eval/               # RAG 评测：dataset/（种子 QA）、metrics.py、run.py
+│   ├── tests/              # pytest 套件（154 用例，内存 SQLite + TestClient）
 │   ├── venv/               # Python 3.12 虚拟环境（会被 electron-builder 打包）
-│   └── requirements.txt
+│   ├── pyproject.toml      # 依赖声明 + pytest/ruff 配置
+│   └── requirements.txt    # 锁定依赖（与 pyproject 保持一致）
+├── .github/workflows/      # ci.yml（pytest+lint+build）、eval.yml（手动评测）
+├── Dockerfile / docker-compose.yml / .dockerignore   # 一键部署（见 docs/DEPLOY.md）
+├── docs/                   # DEPLOY.md 等运维文档
 ├── frontend/
 │   ├── src/
 │   │   ├── pages/          # PaperList, PaperDetail, SearchPage, ThesisList,
@@ -179,21 +190,45 @@ cd ../electron && npm run build    # 产物在 frontend/out/（dmg/zip/exe）
 - LLM 调用统一走 `services/llm.py`（`llm_service`），内含重试、消息截断、错误格式化，不要绕过它直接调 openai。
 - 日志统一写 `logs/app.log`（`core/logger.py`），排查问题先看这里；Electron 主进程日志在数据目录 `logs/electron-main.log`。
 
-## 8. 测试
+## 8. 测试与评测
 
-**当前没有任何测试代码**（无 pytest、无前端测试）。验证方式为手动跑通：导入 PDF → 检索 → 对话 → 生成概括。改动后至少应：
+### 单元/集成测试（pytest，154 个用例）
 
-1. 后端能启动且 `curl http://127.0.0.1:8000/api/health` 返回 `status: ok`、`llm_ready: true`；
-2. 前端 `npm run build` 通过；
+```bash
+cd backend
+env -u PYTHONPATH venv/bin/python -m pytest tests/ -v   # 注意必须 env -u PYTHONPATH
+```
+
+测试栈：内存 SQLite + FastAPI TestClient（不触发 lifespan，离线快速）。覆盖：health/settings、安全（静态穿越/CORS/异常脱敏）、FTS5 清洗、上传限制、Skill 注册表、Memory 统一 API、评测数据集、指标计算、Agent 图编排、MCP 工具。约定：不触发真实 LLM/embedding 调用（mock），后台线程 mock 掉。
+
+### RAG 评测（backend/eval/）
+
+```bash
+cd backend
+env -u PYTHONPATH venv/bin/python -m eval.run                 # 检索评测（默认关键词降级也可用）
+env -u PYTHONPATH venv/bin/python -m eval.run --with-llm      # 含生成侧（真实调用 Kimi，慎用）
+```
+
+- `eval/dataset/qa_seed.jsonl`：25 条种子 QA（含 3 条幻觉负例），schema 见 `eval/dataset/README.md`
+- `eval/metrics.py`：recall@k / MRR / NDCG@k / citation_coverage / keyword_hit_rate
+- 报告写入 `eval/reports/`（已 gitignore）；recall@5 低于阈值（默认 0.5）退出码非 0，供 CI 门禁
+- **当前基线**（仅 1 篇示例论文）：keyword-only recall@5=0.447，hybrid recall@5=0.477/MRR=0.557——导入更多真实论文后需重新定标
+
+### 改动后至少应验证
+
+1. 后端 pytest 全绿，且能启动、`curl http://127.0.0.1:8000/api/health` 返回 `status: ok`、`llm_ready: true`；
+2. 前端 `npm run lint` 零警告 + `npm run build` 通过；
 3. 涉及接口改动时用 curl 或前端实际点一遍。
 
 ## 9. 安全与隐私
 
 - `config.yaml` 含 Kimi API Key，**已加入 `.gitignore`，严禁提交**；同样被忽略的还有 `data/`、`papers/`、`notes/`、`vector_db/`、`logs/`、`cache/`、模型缓存与 venv。
 - `config.py` 会识别占位符 Key（`sk-xxxx` / `your-` 开头）， Electron 打包时只有填了真实 Key 的 `config.yaml` 才会被采用。
-- CORS 当前 `allow_origins=["*"]`——仅限本机单用户场景，不要将此后端暴露到公网。
-- `/static` 挂载整个项目根目录，注意新增敏感文件时不要放到会被静态服务暴露的位置（本机使用场景下风险可控，但要有意识）。
-- 数据库操作全部走 SQLAlchemy ORM / 参数化查询（FTS 检索用 `MATCH :query` 绑定参数），不要拼接 SQL。
+- CORS 已严格化：显式 origin 白名单（`http://localhost:5173`、`http://127.0.0.1:5173`、Electron `file://` 的 `"null"`），`allow_credentials=False`——仍不要将后端暴露到公网。
+- `/static` 为白名单静态路由（仅 papers/notes/my-thesis/summaries），`resolve()` 防路径穿越与软链接逃逸；新增敏感文件不要放进这四个目录。
+- 全局异常处理不向前端返回异常原文（仅通用文案 + error_code），详情只写 `logs/app.log`。
+- 上传限制：PDF 单文件 50MB 上限（413），扩展名白名单（400）。
+- 数据库操作全部走 SQLAlchemy ORM / 参数化查询（FTS 检索用 `MATCH :query` 绑定参数，且查询串先经 `_sanitize_fts_query()` 清洗），不要拼接 SQL。
 
 ## 10. 已知问题与注意事项
 
@@ -211,11 +246,11 @@ cd ../electron && npm run build    # 产物在 frontend/out/（dmg/zip/exe）
 1. 改动前先读相关 router/service，本项目规模不大（后端约 5000 行），直接读代码比查文档可靠。
 2. 保持最小改动：这是单用户本地应用，不要引入 auth、多租户、消息队列等无用复杂度。
 3. 新增数据库字段：改 `models.py` + 在 `database.py` 的 `ensure_schema()` 加对应迁移分支 + 同步 `schemas.py`。
-4. 新增 Skill：在 `services/skills.py` 的 `SKILL_PROMPTS` 和 `list_skills()` 里各加一项即可，前端会自动列出。
-5. 新增 API：在对应 router 文件中加端点并更新 `schemas.py`；前端在 `api.js` 加封装。
+4. 新增 Skill：在 `services/skills.py` 的默认注册区（`_register_default_skills`）加一项 `Skill(...)` 即可，前端会自动列出；`tools` 字段留给后续 Agent 工具化。
+5. 新增 API：在对应 router 文件中加端点并更新 `schemas.py`；前端在 `api.js` 加封装。新增后跑 `env -u PYTHONPATH venv/bin/python -m pytest tests/ -q` 确认全绿。
 6. 不要提交 `config.yaml` 和任何数据目录；不要把项目根的用户个人文件当作代码资产处理。
 7. 修改了本文档涉及的命令、结构或约定时，同步更新本文件。
 
 ---
 
-> 最后更新：2026-07-20，基于实际代码探查重写（替代原规划摘要版）。
+> 最后更新：2026-07-28，P0–P5 工程化/安全/Agent 2.0/评测升级完成后同步（替代 2026-07-20 版）。
