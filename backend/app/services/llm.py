@@ -228,6 +228,13 @@ class LLMService:
 
     def _format_error(self, e: Exception) -> str:
         msg = str(e)
+        # 配额/冻结类错误必须优先于笼统的 429 判断，否则误报为「负载过高」误导排障
+        if (
+            "exceeded_current_quota" in msg
+            or "insufficient balance" in msg
+            or ("suspended" in msg and "account" in msg)
+        ):
+            return "Kimi 账户额度不足或已被冻结，请登录 Moonshot 控制台检查账单与额度。"
         if "429" in msg or "overloaded" in msg.lower():
             return "Kimi API 当前负载过高或请求频繁，请稍后再试。"
         if "401" in msg or "Authentication" in msg:
