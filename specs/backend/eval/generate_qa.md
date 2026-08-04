@@ -184,7 +184,7 @@ RAG 评测种子集（`eval/dataset/qa_seed.jsonl`，25 条）全部基于 1 篇
   - `generate_cross_paper` 两例：两篇均可定位才保留、非 comparison 过滤（AC5）；
   - `generate_all` 两例：内存库端到端（逐行合法 JSON、id=999 跳过不算失败、汇总正确）、单篇失败不阻塞（AC6）。
 - **盲区**：
-  - **`--resume` 断点续跑零测试**：跳过已完成论文、`done_cross` 判定、追加模式、续跑后 `total` 只计新增、全部已完成时 `total=0` → 退出码 1——新功能无任何用例 —— **高**。
+  - ~~**`--resume` 断点续跑零测试**~~ **已补测（2026-08-04）**：`tests/test_generate_qa.py::TestResume` 4 用例固化——跳过已完成论文并追加、`done_cross` 跳过跨论文题、全部完成时 total=0 且不调用 LLM、不带 resume 时整文件覆盖。属先实现后补测的 TDD 违规补救（教训已记入复盘文档）。退出码路径（total=0→1）仍无直接用例——**低**。
   - 逐篇落盘 flush 语义（崩溃不丢已完成论文）未用故障注入验证 —— 中。
   - `main` 层未测：`total==0 → 退出码 1`、`--dry-run` 路径、审稿提示输出 —— 中。
   - `build_material` 预算截断（超预算停止追加、空 chunk 跳过、abstract 拼接）未直接测 —— 中。

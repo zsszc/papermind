@@ -379,3 +379,102 @@ def test_generate_all_single_failure_does_not_block(db, tmp_path):
     assert summary["total"] == 1
     fail = [s for s in summary["per_paper"] if not s["ok"]]
     assert fail[0]["paper_id"] == 4
+
+
+class TestResume:
+    """--resume 断点续跑契约（该功能先于测试实现，按宪法第 5 条补救特征化测试）。"""
+
+    @staticmethod
+    def _seed_two_papers(db):
+        for pid in (4, 5):
+            db.add(Paper(id=pid, title=f"P{pid}", abstract=None,
+                         file_path=f"p{pid}.pdf", filename=f"p{pid}.pdf",
+                         processed="done"))
+            db.add(Chunk(paper_id=pid, chunk_index=0, content=PAPER_TEXT))
+        db.commit()
+
+    @staticmethod
+    def _existing_line(pid: int) -> str:
+        return json.dumps({
+            "qa_id": f"gen-p{pid:02d}-001", "question": "旧题", "ground_truth": "g",
+            "relevant_chunks": [{"paper_id": pid, "keywords": ["x"]}],
+            "question_type": "factoid", "source": "llm_generated",
+            "has_answer": True, "reviewed": False,
+        }, ensure_ascii=False)
+
+    def test_skips_completed_papers_and_appends(self, db, tmp_path):
+        """已完成论文跳过生成；旧行原样保留在文件头部（追加模式）。"""
+        self._seed_two_papers(db)
+        out = tmp_path / "out.jsonl"
+        out.write_text(self._existing_line(4) + "\n", encoding="utf-8")
+
+        summary = generate_qa.generate_all(
+            db, paper_ids=[4, 5], per_paper=2, output_path=out,
+            include_cross=False, call_llm=lambda m: _valid_payload(), resume=True)
+
+        lines = out.read_text(encoding="utf-8").strip().splitlines()
+        assert lines[0] == self._existing_line(4)
+        new_items = [json.loads(l) for l in lines[1:]]
+        assert all(it["qa_id"].startswith("gen-p05-") for it in new_items)
+        assert summary["total"] == len(new_items) == 2
+
+    def test_skips_completed_cross(self, db, tmp_path):
+        """已有 comparison 条目时跨论文题不再生成（qa_id 为 gen-cross- 前缀）。"""
+        self._seed_two_papers(db)
+        out = tmp_path / "out.jsonl"
+        cross_line = json.dumps({
+            "qa_id": "gen-cross-001", "question": "旧跨论文题", "ground_truth": "g",
+            "relevant_chunks": [{"paper_id": 4, "keywords": ["x"]},
+                                {"paper_id": 5, "keywords": ["y"]}],
+            "question_type": "comparison", "source": "llm_generated",
+            "has_answer": True, "reviewed": False,
+        }, ensure_ascii=False)
+        out.write_text(cross_line + "\n", encoding="utf-8")
+
+        def spy_llm(messages):
+            if "paper_id=" in messages[-1]["content"]:  # 跨论文 prompt 特征
+                raise AssertionError("跨论文题已完成，不应再次调用 LLM")
+            return _valid_payload()
+
+        summary = generate_qa.generate_all(
+            db, paper_ids=[4, 5], per_paper=1, output_path=out,
+            include_cross=True, call_llm=spy_llm, resume=True)
+
+        lines = out.read_text(encoding="utf-8").strip().splitlines()
+        assert lines[0] == cross_line
+        assert summary["type_counts"].get("comparison", 0) == 0
+
+    def test_all_done_produces_zero_and_no_llm_call(self, db, tmp_path):
+        """全部完成时 total=0、不调用 LLM、文件不被截断。"""
+        self._seed_two_papers(db)
+        out = tmp_path / "out.jsonl"
+        out.write_text(
+            self._existing_line(4) + "\n" + self._existing_line(5) + "\n",
+            encoding="utf-8")
+
+        calls = []
+        summary = generate_qa.generate_all(
+            db, paper_ids=[4, 5], per_paper=2, output_path=out,
+            include_cross=False,
+            call_llm=lambda m: calls.append(1) or _valid_payload(),
+            resume=True)
+
+        assert summary["total"] == 0
+        assert summary["n_ok"] == 0
+        assert not calls
+        assert len(out.read_text(encoding="utf-8").strip().splitlines()) == 2
+
+    def test_no_resume_overwrites(self, db, tmp_path):
+        """不带 resume 时整文件重写（旧行被覆盖）。"""
+        self._seed_two_papers(db)
+        out = tmp_path / "out.jsonl"
+        out.write_text(self._existing_line(4) + "\n", encoding="utf-8")
+
+        generate_qa.generate_all(
+            db, paper_ids=[4], per_paper=2, output_path=out,
+            include_cross=False, call_llm=lambda m: _valid_payload(), resume=False)
+
+        questions = [json.loads(l)["question"]
+                     for l in out.read_text(encoding="utf-8").strip().splitlines()]
+        assert "旧题" not in questions
+        assert len(questions) == 2
