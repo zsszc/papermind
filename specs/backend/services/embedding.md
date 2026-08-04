@@ -117,7 +117,7 @@ PaperMind 的语义检索依赖本地向量模型，本模块承担两件基础�
 - **输入**：待编码文本列表
 - **输出**：与 3.9 相同的归一化向量列表；`texts` 为空时直接返回 `[]`（不进队列）
 - **行为**：构造 `Future`，把 `(texts, future)` 投入类级任务队列，**无超时阻塞**等待 worker 结果；worker 抛出的异常经 `future.result()` 原样传播给调用方
-- **已知契约缺陷**：形参 `batch_size` **被静默丢弃**——worker 调用 `_sync_embed(texts)` 时未透传，实际批次大小恒为 `_sync_embed` 默认值 8
+- ~~**已知契约缺陷**：形参 `batch_size` **被静默丢弃**~~ **已修复（Batch7-F5, fd84873）**：队列项改为 `(texts, batch_size, future)` 三元组，worker 透传至 `_sync_embed`
 - **串行保证**：单 worker 线程 ⇒ 所有 encode 任务严格按入队顺序逐个执行，无并发推理
 
 ### 3.11 `EmbeddingService.embed_query(self, query: str) -> List[float]`
@@ -191,4 +191,4 @@ PaperMind 的语义检索依赖本地向量模型，本模块承担两件基础�
 - **`available()` 即触发加载**：降级探测与真实加载合为一体，语义上「问一下就加载」。首调会阻塞调用线程数秒到数分钟（取决于是否需下载），调用方需自行接受这一延迟；AGENTS.md 所述「后台线程加载」仅对 `embed()` 路径成立。
 - **查询加 BGE 指令前缀、文档不加**：`embed_query` 沿用 BGE v1 风格的 instruction 前缀以拉近查询-文档分布；BGE-M3 官方已不再强制此前缀，但改动会破坏与存量 ChromaDB 向量的可比性，故保留。
 - **字符数当 token 数**：分块阈值与 `token_count` 均按 `len()` 字符计，实现简单、跨语言一致，代价是与模型真实 token 上限（BGE-M3 8192）不严格对应——因此另有 512 空白词截断兜底英文，中文则依赖模型自身上限。
-- **`embedding.chunk_size/chunk_overlap` 配置项存在但不读取**：TextChunker 默认值硬编码 512/50，`config.yaml` 中的同名键当前是死配置；规格以代码为准记录此现状，如需让配置生效应属行为变更，须按 TDD 先行补测。
+- ~~**`embedding.chunk_size/chunk_overlap` 配置项存在但不读取**~~ **已修复（Batch7-F6, fd84873）**：TextChunker 默认参数改从 config 读取（显式传参优先，非法值回退 512/50），`tests/test_embedding.py::TestChunkerConfig` 4 用例固化

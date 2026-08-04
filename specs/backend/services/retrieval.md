@@ -212,7 +212,7 @@ PaperMind 的检索子系统解决「在个人文献库中快速定位相关内�
 - **盲区**（按严重程度标注）：
   - **高**：`VectorStore` 本体完全无测试——`search()` 的超量取回与截断、`score = 1 - distance` 换算、60 秒缓存命中/过期/键构成（含 filters 参与键）、空结果也缓存，均无覆盖
   - **高**：`_reciprocal_rank_fusion` 无直接单测——RRF 计分公式、paper_id 去重、同论文多 chunk 分数累计、载体选择优先级（语义优先）均未验证；现有「混合降级」用例只走了单路非空的融合路径
-  - **高**：`_build_where` 组合过滤缺陷（3.5，已对 ChromaDB 0.4.24 实证：`year_gte+year_lte` 或 `year_*+paper_id` 必抛 `ValueError`，`/api/search` 路径直接 500）无任何测试暴露
+  - ~~**高**：`_build_where` 组合过滤缺陷~~ **已修复（Batch7-F1, 6cec40c）**：多条件包装 `$and` + `_query_with_fallback` 降级兜底，`tests/test_search.py::TestBuildWhere` 4 用例固化
   - **中**：`add_chunks` 的 id 生成、metadata 条件写入（title/authors/year/page_number 为 None 时不写）、空 chunks 短路、重复 id 不幂等，无测试
   - **中**：`delete_by_paper_id` 的按 metadata 过滤删除与吞异常行为，无测试
   - **中**：`get_vector_store()` 单例与并发双重检查锁，无测试

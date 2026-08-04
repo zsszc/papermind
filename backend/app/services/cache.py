@@ -27,7 +27,7 @@ class SimpleCache:
 
     def set(self, key: str, value: Any, ttl: Optional[int] = None):
         if len(self._store) >= self.max_size:
-            # 简单 LRU：删除最早过期的项
+            # 容量驱逐：优先清已过期项；无过期项则驱逐「最早过期」的项（非 LRU）
             now = time.time()
             expired_keys = [k for k, v in self._store.items() if v["expires"] < now]
             if expired_keys:

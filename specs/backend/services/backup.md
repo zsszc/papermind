@@ -43,7 +43,7 @@ PaperMind 是本地优先应用（宪法第 1 条）：SQLite 数据库、PDF、
 - **打包规则**：
   - 清单中不存在的目录**静默跳过**；
   - 递归收集各目录下全部文件（`rglob("*")` + `is_file()`），zip 内路径（arcname）为相对项目根的路径，如 `data/papers.db`；
-  - **`config.yaml` 原样打入 zip 根**（若存在）。源码注释自称「去掉 API Key」，但**实际未做任何脱敏**——API Key 明文随包输出（以代码为准，安全含义见第 4、8 节）。
+  - **`config.yaml` 脱敏后打入 zip 根**（若存在）：`llm.api_key` 被 `_redacted_config_bytes()` 替换为 `[REDACTED]`，其余配置原样（Batch7-F3 修复，b68c9f4）；脱敏失败则跳过该文件不中断备份。
 - **异常**：无任何 try/except——磁盘满、权限错误、文件读取中被占用等异常**原样抛出**给调用方
 - **副作用**：读全量数据文件；峰值内存 ≈ 压缩后 zip 体积（`vector_db` 大时显著）
 
@@ -136,7 +136,7 @@ PaperMind 是本地优先应用（宪法第 1 条）：SQLite 数据库、PDF、
 
 - **已覆盖**：**零**——`backend/tests/` 15 个测试文件中无任何对本模块、两个备份端点或调度函数的引用；conftest 明确不触发 lifespan，调度线程在测试环境从不启动
 - **盲区**：
-  - `config.yaml` 明文入包与注释声称的「去掉 API Key」不符——无测试也无安全断言固化现状（**高**，密钥随备份文件扩散的风险）
+  - `config.yaml` ~~明文入包与注释声称的「去掉 API Key」不符~~ **已修复（Batch7-F3, b68c9f4）**：入包前脱敏为 `[REDACTED]`，`tests/test_backup.py` 3 用例固化
   - 调度时间计算（3 点前 / 后 / 跨天、恰 3 点边界）无测试（**高**，核心契约）
   - `cleanup_old_backups` 的保留 10 份、mtime 排序、单文件失败容错、`keep=0` 语义均无测试（**高**）
   - 备份内容清单（默认目录集、`include_vector` 开关、不存在目录跳过）无测试（**高**）

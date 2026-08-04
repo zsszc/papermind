@@ -136,6 +136,7 @@
 
 | 匹配条件（按序） | 返回文案 |
 |------------------|----------|
+| 含 `exceeded_current_quota` / `insufficient balance` / `suspended`+`account`（优先于 429 判断） | `Kimi 账户额度不足或已被冻结，请登录 Moonshot 控制台检查账单与额度。`（Batch7-F2 新增，99a64bf） |
 | 含 `"429"`，或 lower 后含 `"overloaded"` | `Kimi API 当前负载过高或请求频繁，请稍后再试。` |
 | 含 `"401"` 或含 `"Authentication"`（区分大小写） | `API Key 无效或已过期，请检查 config.yaml 中的 llm.api_key。` |
 | lower 后含 `"timeout"` 或 `"timed out"` | `Kimi API 响应超时，请稍后重试。` |
