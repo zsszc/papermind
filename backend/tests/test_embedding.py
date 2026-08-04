@@ -1,0 +1,65 @@
+"""EmbeddingService / TextChunker 契约测试（Batch 7 / F5+F6）。
+
+- F5：embed(texts, batch_size=N) 的 N 必须透传到 worker 的 encode
+- F6：TextChunker 默认参数从 config 的 embedding.chunk_size/chunk_overlap 读取，
+      显式传参优先，非法配置回退 512/50
+"""
+
+import numpy as np
+import pytest
+
+from app.core.config import config
+from app.services.embedding import EmbeddingService, TextChunker
+
+
+class _FakeModel:
+    """记录 encode 收到的 batch_size，返回固定形状向量。"""
+
+    last_batch_size = None
+
+    def encode(self, texts, normalize_embeddings, convert_to_numpy, show_progress_bar, batch_size):
+        _FakeModel.last_batch_size = batch_size
+        return np.zeros((len(texts), 4))
+
+
+class TestEmbedBatchSize:
+    def test_batch_size_passed_through(self, monkeypatch):
+        svc = EmbeddingService()  # 单例；worker 线程随首次实例化启动（daemon）
+        monkeypatch.setattr(svc, "_load_model", lambda: _FakeModel())
+        svc.embed(["alpha", "beta"], batch_size=3)
+        assert _FakeModel.last_batch_size == 3
+
+    def test_default_batch_size_unchanged(self, monkeypatch):
+        svc = EmbeddingService()
+        monkeypatch.setattr(svc, "_load_model", lambda: _FakeModel())
+        svc.embed(["alpha"])
+        assert _FakeModel.last_batch_size == 16  # embed 默认值
+
+
+class TestChunkerConfig:
+    def test_reads_config_values(self, monkeypatch):
+        monkeypatch.setattr(
+            config, "_config", {"embedding": {"chunk_size": 100, "chunk_overlap": 10}}
+        )
+        c = TextChunker()
+        assert c.chunk_size == 100
+        assert c.chunk_overlap == 10
+
+    def test_explicit_args_win_over_config(self, monkeypatch):
+        monkeypatch.setattr(config, "_config", {"embedding": {"chunk_size": 100}})
+        c = TextChunker(chunk_size=300, chunk_overlap=30)
+        assert c.chunk_size == 300
+        assert c.chunk_overlap == 30
+
+    def test_invalid_config_falls_back(self, monkeypatch):
+        monkeypatch.setattr(
+            config, "_config", {"embedding": {"chunk_size": "abc", "chunk_overlap": -1}}
+        )
+        c = TextChunker()
+        assert c.chunk_size == 512
+        assert c.chunk_overlap == 50
+
+    def test_missing_config_uses_defaults(self, monkeypatch):
+        monkeypatch.setattr(config, "_config", {})
+        c = TextChunker()
+        assert (c.chunk_size, c.chunk_overlap) == (512, 50)

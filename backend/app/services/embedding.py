@@ -25,9 +25,26 @@ class TextChunker:
         "conclusion": ["conclusion", "conclusions", "结论"],
     }
 
-    def __init__(self, chunk_size: int = 512, chunk_overlap: int = 50):
-        self.chunk_size = chunk_size
-        self.chunk_overlap = chunk_overlap
+    def __init__(self, chunk_size: Optional[int] = None, chunk_overlap: Optional[int] = None):
+        # 默认参数读取 config 的 embedding.chunk_size/chunk_overlap，非法值回退硬编码默认
+        self.chunk_size = (
+            chunk_size
+            if chunk_size is not None
+            else self._cfg_int("embedding.chunk_size", 512)
+        )
+        self.chunk_overlap = (
+            chunk_overlap
+            if chunk_overlap is not None
+            else self._cfg_int("embedding.chunk_overlap", 50)
+        )
+
+    @staticmethod
+    def _cfg_int(key: str, default: int) -> int:
+        try:
+            val = int(config.get(key, default))
+            return val if val > 0 else default
+        except (TypeError, ValueError):
+            return default
 
     def chunk_pages(self, pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """将按页文本列表分块。"""
@@ -125,9 +142,9 @@ class EmbeddingService:
             task = EmbeddingService._task_queue.get()
             if task is None:
                 break
-            texts, future = task
+            texts, batch_size, future = task
             try:
-                result = self._sync_embed(texts)
+                result = self._sync_embed(texts, batch_size=batch_size)
                 future.set_result(result)
             except Exception as e:
                 logger.error(f"[EmbeddingService] encode 失败: {e}")
@@ -183,7 +200,7 @@ class EmbeddingService:
         if not texts:
             return []
         future = Future()
-        EmbeddingService._task_queue.put((texts, future))
+        EmbeddingService._task_queue.put((texts, batch_size, future))
         return future.result()
 
     def embed_query(self, query: str) -> List[float]:
