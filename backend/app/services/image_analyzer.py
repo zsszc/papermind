@@ -76,7 +76,7 @@ class ImageAnalyzerService:
             return response.choices[0].message.content or ""
         except Exception as e:
             logger.error(f"[image_analyzer] 图片分析失败: {e}", exc_info=True)
-            return f"[图片分析失败: {e}]"
+            return "[图片分析失败，请稍后再试]"
 
     async def analyze_stream(
         self,
@@ -119,7 +119,7 @@ class ImageAnalyzerService:
                     yield content
         except Exception as e:
             logger.error(f"[image_analyzer_stream] 图片分析流式失败: {e}", exc_info=True)
-            yield f"\n[图片分析失败: {e}]"
+            yield "\n[图片分析失败，请稍后再试]"
 
 
 image_analyzer_service = ImageAnalyzerService()

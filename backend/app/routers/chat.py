@@ -215,6 +215,9 @@ async def analyze_image(
     image_bytes = await file.read()
     if not image_bytes:
         raise HTTPException(status_code=400, detail="图片内容为空")
+    # 图片经 base64 内联进 prompt，必须限制体积防内存/费用放大（宪法第 13 条）
+    if len(image_bytes) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="图片大小超过 10MB 上限")
 
     filename = file.filename or "image.jpg"
 
