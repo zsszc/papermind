@@ -161,3 +161,66 @@ class TestSearchApi:
         results = resp.json()["results"]
         assert len(results) == 1
         assert results[0]["paper_id"] == paper.id
+
+
+# ---------- _build_where 组合过滤契约（Batch 7 / F1） ----------
+# ChromaDB 0.4.24 的 where 只接受「单字段单操作符」或「$and/$or 组合」，
+# 多条件必须包装为 $and，否则 query 抛 ValueError → /api/search 500。
+
+class TestBuildWhere:
+    @staticmethod
+    def _chroma_collection():
+        import chromadb
+
+        client = chromadb.EphemeralClient()
+        coll = client.get_or_create_collection("t_where")
+        coll.add(
+            ids=["a", "b", "c"],
+            documents=["x", "y", "z"],
+            metadatas=[
+                {"year": 2019, "paper_id": 1},
+                {"year": 2021, "paper_id": 2},
+                {"year": 2025, "paper_id": 2},
+            ],
+            embeddings=[[1.0, 0.0], [0.9, 0.1], [0.0, 1.0]],
+        )
+        return coll
+
+    def test_year_range_filter_accepted(self):
+        """year_gte+year_lte 组合过滤可被 ChromaDB 接受且过滤正确。"""
+        from app.services.retrieval import VectorStore
+
+        where = VectorStore._build_where({"year_gte": 2020, "year_lte": 2024})
+        res = self._chroma_collection().query(
+            query_embeddings=[[1.0, 0.0]], n_results=3, where=where
+        )
+        years = sorted(m["year"] for m in res["metadatas"][0])
+        assert years == [2021]
+
+    def test_multi_field_filter_accepted(self):
+        """year_gte+paper_id 多字段组合过滤可被接受且过滤正确。"""
+        from app.services.retrieval import VectorStore
+
+        where = VectorStore._build_where({"year_gte": 2020, "paper_id": 2})
+        res = self._chroma_collection().query(
+            query_embeddings=[[1.0, 0.0]], n_results=3, where=where
+        )
+        rows = sorted((m["year"], m["paper_id"]) for m in res["metadatas"][0])
+        assert rows == [(2021, 2), (2025, 2)]
+
+    def test_single_condition_kept_flat(self):
+        """单条件保持扁平形式（不包 $and），空过滤返回 None。"""
+        from app.services.retrieval import VectorStore
+
+        assert VectorStore._build_where(None) is None
+        assert VectorStore._build_where({}) is None
+        assert VectorStore._build_where({"paper_id": 7}) == {"paper_id": 7}
+
+    def test_query_degrades_on_invalid_where(self):
+        """非法 where 不向上抛异常（防 500），降级为无过滤查询并返回结果。"""
+        from app.services.retrieval import VectorStore
+
+        coll = self._chroma_collection()
+        bad_where = {"year": {"$gte": 2020, "$lte": 2024}}  # 修复前的非法形状
+        res = VectorStore._query_with_fallback(coll, [1.0, 0.0], 3, bad_where)
+        assert len(res["ids"][0]) == 3  # 降级为无过滤，返回全部

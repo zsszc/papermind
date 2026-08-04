@@ -91,11 +91,8 @@ class VectorStore:
         n_results = max(top_k * 2, 20)
 
         where = self._build_where(filters)
-        results = self.collection.query(
-            query_embeddings=[query_embedding],
-            n_results=n_results,
-            where=where,
-            include=["documents", "metadatas", "distances"],
+        results = self._query_with_fallback(
+            self.collection, query_embedding, n_results, where
         )
 
         output = []
@@ -129,19 +126,44 @@ class VectorStore:
         except Exception:
             logger.warning(f"[VectorStore] 删除 paper {paper_id} 向量失败", exc_info=True)
 
-    def _build_where(self, filters: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    @staticmethod
+    def _query_with_fallback(collection, query_embedding, n_results, where):
+        """带兜底的向量查询：where 子句被 ChromaDB 拒绝时降级为无过滤检索。
+
+        防 500 契约：过滤条件异常不得冒泡为接口错误，退化为无过滤结果并记日志。
+        """
+        kwargs = dict(
+            query_embeddings=[query_embedding],
+            n_results=n_results,
+            include=["documents", "metadatas", "distances"],
+        )
+        try:
+            return collection.query(where=where, **kwargs)
+        except ValueError:
+            logger.warning(f"[VectorStore] where 子句被拒绝，降级为无过滤检索: {where}")
+            return collection.query(where=None, **kwargs)
+
+    @staticmethod
+    def _build_where(filters: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """把业务过滤条件翻译为 ChromaDB where 子句。
+
+        ChromaDB 0.4.24 只接受「单字段单操作符」或「$and/$or 组合」：
+        多条件必须包装为 $and，否则 query 抛 ValueError。
+        """
         if not filters:
             return None
-        conditions = {}
+        conditions = []
         if "year_gte" in filters:
-            conditions["year"] = conditions.get("year", {})
-            conditions["year"]["$gte"] = filters["year_gte"]
+            conditions.append({"year": {"$gte": filters["year_gte"]}})
         if "year_lte" in filters:
-            conditions["year"] = conditions.get("year", {})
-            conditions["year"]["$lte"] = filters["year_lte"]
+            conditions.append({"year": {"$lte": filters["year_lte"]}})
         if "paper_id" in filters:
-            conditions["paper_id"] = filters["paper_id"]
-        return conditions if conditions else None
+            conditions.append({"paper_id": filters["paper_id"]})
+        if not conditions:
+            return None
+        if len(conditions) == 1:
+            return conditions[0]
+        return {"$and": conditions}
 
 
 _vector_store_instance: Optional[VectorStore] = None
