@@ -21,7 +21,7 @@
 
 - `POST /api/chat`：SSE 流式与非流式双分支、会话自动创建、用户消息落库时序、记忆更新时序、`message_count` 计数语义、assistant 消息落库条件与 citations 组装、SSE 事件序列与客户端取消语义
 - 会话 CRUD：`GET/POST /api/chat/conversations`、`GET /api/chat/conversations/{id}/history`、`DELETE /api/chat/conversations/{id}`
-- 消息操作：`DELETE .../messages/{message_id}`（自该消息起截断删除）、`POST .../messages/{message_id}/regenerate`（含 **NameError 已知缺陷**的规约）
+- 消息操作：`DELETE .../messages/{message_id}`（自该消息起截断删除）、`POST .../messages/{message_id}/regenerate`（NameError 缺陷已于 2026-08-04 修复）
 - `POST /api/chat/analyze-image`：multipart 上传 + SSE 流式分析
 - `GET /api/chat/skills`：Skill 列表透传
 - 模块级死代码与死导入的规约（`_stream_response`、`Paper`、`ImageAnalysisRequest`）
@@ -99,7 +99,7 @@
   2. 记忆：`MemoryManager(db).build_memory_context()` 非空时拼到 `SYSTEM_PROMPT` 尾部（格式与 agent_graph 的 load_memory 一致）；
   3. 消息组装：`[system(含记忆)] + 目标之前的全部历史消息 + [RAG system（retrieved 非空时，build_rag_prompt）]`；
   4. 与 `POST /api/chat` 的差异：**无 `HISTORY_LIMIT=10` 截断（全量历史注入）、无 skill 注入、无 paper_id 过滤、无联网搜索提示注入、不触发 `update_short_term_memory`、不动 `message_count`**。
-- **已知缺陷（严重程度高，端点实际不可用）**：`event_stream` 闭包内 `llm_service.chat_stream(messages, enable_web_search=enable_web_search)` 引用的 `enable_web_search` 在 `regenerate_message` 函数作用域与模块级**均未赋值**（AST 实证；自初始提交 `cfbc1b2` 起即如此，P3.2 LangGraph 重构未触及）。后果：通过全部前置校验后，流式迭代**首次求值即抛 `NameError`**——SSE 响应头已发出、连接中断，客户端收不到任何帧，目标消息内容**不被修改**；异常不经全局 500 脱敏（响应已开始），仅由服务器日志记录。修复前应将该端点视为不可用；修复（如补 `enable_web_search=False`）属行为变更，须先改本规格并补 RED 测试（宪法第 5 条）。
+- **~~已知缺陷~~已修复（2026-08-04）**：`event_stream` 闭包内原引用未赋值的 `enable_web_search`（自初始提交 `cfbc1b2` 起存在，首帧即 `NameError`，端点完全不可用）。修复：显式传 `enable_web_search=False`（regenerate 无请求体、无联网开关，取确定性重生成语义），`tests/test_chat.py::TestRegenerate` 3 用例固化（流式替换 + 404 两分支）。
 - **成功路径后置条件（缺陷修复后的预期契约）**：用**新 `SessionLocal`** 把 `full_content` 写回目标消息 `content`，`citations` 覆写为 `[{"source": r["source"], "paper_id": r["paper_id"]} for r in retrieved]`（**比 3.8 落库更裁剪**，仅 2 键）；随后发 finished 尾帧（`citations` 为原始 `retrieved`）。
 - **取消语义**：`asyncio.CancelledError`（客户端断开）→ 记 info 日志并 return，**原消息内容保留不变**。
 
@@ -185,10 +185,10 @@
 | LLM 返回全空/纯空白 | 流式：assistant 不落库，仍发 finished 帧 |
 | 删除会话 | 消息级联删除；`memory_summaries` 短期记忆残留（不级联） |
 | 删除消息（from 语义） | 目标及其后全部删除；`message_count` 不回溯（缺陷） |
-| regenerate 通过前置校验 | **当前必因 NameError 失败**（3.6 缺陷）；修复后：原地替换内容与 citations |
+| regenerate 通过前置校验 | 原地替换内容与 citations（2026-08-04 修复前必因 NameError 失败） |
 | regenerate 目标为 user 消息 / 首条消息 / 前条非 user | 404 / 400 / 400 |
 | analyze-image 空文件 | 400 `"图片内容为空"` |
-| analyze-image 任意大小/格式 | 路由层不拦截；行为由服务层与 Kimi 决定 |
+| analyze-image 超 10MB | 413 `"图片大小超过 10MB 上限"`（Batch7-F4 新增）；≤10MB 不拦格式，MIME 按后缀推断 |
 | 并发同一会话发两条 chat | 无锁；两请求各自落库用户消息，`message_count` 后写覆盖先写（单用户场景未规约） |
 
 ## 5. 依赖

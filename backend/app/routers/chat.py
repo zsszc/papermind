@@ -171,7 +171,8 @@ async def regenerate_message(
     async def event_stream():
         full_content = ""
         try:
-            async for delta in llm_service.chat_stream(messages, enable_web_search=enable_web_search):
+            # regenerate 无请求体、不含联网开关，固定关闭（确定性重生成，见 specs/backend/routers/chat.md 3.6）
+            async for delta in llm_service.chat_stream(messages, enable_web_search=False):
                 full_content += delta
                 yield f"data: {json.dumps({'delta': delta, 'finished': False, 'conversation_id': conversation_id}, ensure_ascii=False)}\n\n"
                 # 让出控制权，使客户端断开后能触发 CancelledError
