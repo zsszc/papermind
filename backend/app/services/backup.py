@@ -5,12 +5,25 @@ from datetime import datetime
 from pathlib import Path
 from typing import List
 
+import yaml
+
 from app.core.config import config
 from app.core.logger import logger
 
 
 def get_project_root() -> Path:
     return Path(__file__).resolve().parents[3]
+
+
+def _redacted_config_bytes(config_path: Path) -> bytes:
+    """读取 config.yaml 并剥离 llm.api_key，返回脱敏后的序列化字节。
+
+    仅用于备份入包；磁盘上的真实 config.yaml 不做任何修改。
+    """
+    cfg = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    if isinstance(cfg.get("llm"), dict) and cfg["llm"].get("api_key"):
+        cfg["llm"]["api_key"] = "[REDACTED]"
+    return yaml.safe_dump(cfg, allow_unicode=True).encode("utf-8")
 
 
 def create_backup(
@@ -39,7 +52,10 @@ def create_backup(
         # 同时备份配置文件（去掉 API Key）
         config_path = project_root / "config.yaml"
         if config_path.exists():
-            zf.write(config_path, "config.yaml")
+            try:
+                zf.writestr("config.yaml", _redacted_config_bytes(config_path))
+            except Exception:
+                logger.warning("[backup] config.yaml 脱敏失败，跳过该文件", exc_info=True)
 
     buffer.seek(0)
     return buffer.read()
