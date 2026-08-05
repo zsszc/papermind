@@ -168,6 +168,12 @@ class ChatStreamChunk(BaseModel):
     image_analysis: Optional[bool] = False
 
 
+class DeepReviewRequest(BaseModel):
+    """深度综述长任务请求（Phase F F2）：topic 必填，conversation_id 可选（缺省自动建会话）。"""
+    topic: str
+    conversation_id: Optional[int] = None
+
+
 class ImageAnalysisRequest(BaseModel):
     question: Optional[str] = "请描述这张图片的内容，并解释其在学术论文中可能的含义。"
 
