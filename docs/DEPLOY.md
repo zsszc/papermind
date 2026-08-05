@@ -16,7 +16,7 @@
 | Job | 环境 | 步骤 |
 |-----|------|------|
 | **backend** | Python 3.12 | `pip install -r backend/requirements.txt` + `pytest`、`pydantic-settings` → 在 `backend/` 目录下运行 `python -m pytest tests/ -q`（PYTHONPATH 置空） |
-| **frontend** | Node 20 | `npm ci`（严格按 `frontend/package-lock.json`）→ `npm run lint`（零警告）→ `npm run build` |
+| **frontend** | Node 20.19+ 或 22.12+ | `npm ci`（严格按 `frontend/package-lock.json`）→ `npm run lint`（零警告）→ `npm run build` |
 
 pip 与 npm 均开启依赖缓存，第二次起构建明显加速。
 

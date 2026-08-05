@@ -19,11 +19,19 @@ export default defineConfig({
     chunkSizeWarningLimit: 600,
     rollupOptions: {
       output: {
-        manualChunks: {
-          vendor: ['react', 'react-dom', 'react-router-dom'],
-          ui: ['antd', '@ant-design/icons'],
-          pdf: ['react-pdf'],
-          markdown: ['react-markdown', 'remark-gfm'],
+        manualChunks(id) {
+          if (id.includes('/node_modules/react-pdf/') || id.includes('/node_modules/pdfjs-dist/')) {
+            return 'pdf'
+          }
+          if (id.includes('/node_modules/antd/') || id.includes('/node_modules/@ant-design/')) {
+            return 'ui'
+          }
+          if (id.includes('/node_modules/react-markdown/') || id.includes('/node_modules/remark-gfm/')) {
+            return 'markdown'
+          }
+          if (id.includes('/node_modules/react/') || id.includes('/node_modules/react-dom/')) {
+            return 'vendor'
+          }
         },
       },
     },

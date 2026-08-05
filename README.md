@@ -101,6 +101,7 @@ uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 
 ```bash
 cd frontend
+# Vite 8 要求 Node 20.19+ 或 22.12+
 npm install
 npm run dev
 ```

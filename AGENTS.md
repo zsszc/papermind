@@ -34,11 +34,11 @@
 
 ### 前端（`frontend/package.json`）
 
-- React 18 + Vite 5 + Ant Design 5 + @ant-design/icons
-- react-pdf 7（PDF 预览）、react-markdown 9 + remark-gfm（Markdown 渲染）
+- React 18 + Vite 8 + Ant Design 5 + @ant-design/icons（Vite 8 要求 Node `^20.19.0 || >=22.12.0`）
+- react-pdf 10（PDF 预览，worker 从当前 pdfjs-dist 同源打包）、react-markdown 9 + remark-gfm（Markdown 渲染）
 - ECharts 6 + echarts-for-react（统计可视化）
 - zustand 4（客户端状态）、react-window（虚拟列表）、axios、dayjs
-- **注意**：没有使用 React Query、TypeScript、react-virtualized（旧设计文档中的规划，实际未采用）。路由用的是 `App.jsx` 内部 view 状态切换，react-router-dom 已安装但主界面未走 URL 路由。
+- **注意**：没有使用 React Query、TypeScript、react-virtualized（旧设计文档中的规划，实际未采用）。路由用的是 `App.jsx` 内部 view 状态切换；未使用的 react-router-dom 已移除。
 
 ### 桌面端（`electron/`）
 

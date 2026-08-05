@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect } from 'react'
 import { Document, Page, pdfjs } from 'react-pdf'
-import 'react-pdf/dist/esm/Page/AnnotationLayer.css'
-import 'react-pdf/dist/esm/Page/TextLayer.css'
+import 'react-pdf/dist/Page/AnnotationLayer.css'
+import 'react-pdf/dist/Page/TextLayer.css'
 import {
   Spin,
   Button,
@@ -31,7 +31,10 @@ import {
 } from '../api'
 import { colors } from '../theme'
 
-pdfjs.GlobalWorkerOptions.workerSrc = './pdf.worker.min.js'
+pdfjs.GlobalWorkerOptions.workerSrc = new URL(
+  'pdfjs-dist/build/pdf.worker.min.mjs',
+  import.meta.url,
+).toString()
 
 // 忽略 PDF.js worker 在组件卸载时被终止的正常错误
 if (typeof window !== 'undefined') {
