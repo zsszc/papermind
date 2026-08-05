@@ -25,6 +25,7 @@
 ### 3.1 D1：部署形态
 
 - `docker-compose.yml` 新增独立 `langfuse` profile（`docker compose --profile langfuse up` 才拉起），默认 `docker compose up` 不启动
+- 服务清单（Langfuse v3 实证修正）：langfuse-web + langfuse-worker + postgres + clickhouse + **redis + minio 共 6 个**（v3 架构必需，初稿写 4 个低估了）
 - 数据卷本地化（postgres + clickhouse 各一 volume）；端口默认 3001（避开 3000/8000）
 - `.env.example` 列出 `LANGFUSE_SECRET_KEY` / `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_HOST` 等占位符；真实值 `.env` 已 gitignore
 

@@ -117,7 +117,61 @@ docker run -d --name papermind -p 8000:8000 \
 
 ---
 
-## 5. 常见问题
+## 5. Langfuse 可观测性（可选）
+
+PaperMind 支持把 LLM 调用追踪（prompt / 延迟 / token 用量）上报到**自托管 Langfuse v3**。该栈是开发辅助而非运行时依赖：位于 `docker-compose.yml` 的独立 `langfuse` profile 中，默认 `docker compose up` **不会**启动；未配置密钥时后端零侵入跳过观测，Langfuse 宕机也不影响对话主链路。
+
+栈组成：`langfuse-web`（控制台）、`langfuse-worker`（异步写入）、`postgres`、`clickhouse`，外加 v3 运行必需的 `redis`（事件队列）与 `minio`（原始事件对象存储）。除 web 外均不暴露宿主机端口。
+
+### 5.1 启动 Langfuse 栈
+
+```bash
+# 1. 准备环境变量（.env 已在 .gitignore 中，真实密钥绝不提交）
+cp .env.example .env
+# 编辑 .env，至少生成三项服务端密钥：
+#   openssl rand -base64 32   → LANGFUSE_NEXTAUTH_SECRET
+#   openssl rand -base64 32   → LANGFUSE_SALT
+#   openssl rand -hex 32      → LANGFUSE_ENCRYPTION_KEY（必须 64 位十六进制）
+
+# 2. 拉起 Langfuse 栈（6 个容器）
+docker compose --profile langfuse up -d
+
+# 3. 查看初始化日志（首次启动自动执行数据库迁移）
+docker compose --profile langfuse logs -f langfuse-web langfuse-worker
+```
+
+Web 控制台：<http://localhost:3001>（宿主端口默认 3001，避开 3000/8000；改端口请调整 `docker-compose.yml` 中 `langfuse-web` 的 `ports` 左侧并同步 `LANGFUSE_NEXTAUTH_URL`）。
+
+### 5.2 初始化账号、项目与密钥对
+
+方式一（推荐，可复现）：在 `.env` 中整组填写 `LANGFUSE_INIT_*` 播种变量（见 `.env.example` 注释），首次启动自动创建组织 / 项目 / 管理员账号 / API 密钥对；其中 `LANGFUSE_INIT_PROJECT_PUBLIC_KEY` / `LANGFUSE_INIT_PROJECT_SECRET_KEY` 即后端要用的密钥对。对已初始化的数据库重复播种会自动跳过，可安全保留。
+
+方式二（手工）：浏览器打开 <http://localhost:3001> → 注册首个账号 → 创建组织与项目 → **Project Settings → API Keys → Create new API keys**，得到 `pk-lf-...` / `sk-lf-...` 密钥对（Secret Key 仅完整显示一次，请立即记录）。
+
+### 5.3 对接 PaperMind 后端
+
+后端读取三个环境变量（**两个密钥缺一即视为未配置，零侵入跳过**）：
+
+| 变量 | 含义 | 取值 |
+|------|------|------|
+| `PAPERMIND_LANGFUSE_PUBLIC_KEY` | 项目公钥 | 5.2 节得到的 `pk-lf-...` |
+| `PAPERMIND_LANGFUSE_SECRET_KEY` | 项目私钥 | 5.2 节得到的 `sk-lf-...` |
+| `PAPERMIND_LANGFUSE_HOST` | Langfuse 地址 | 宿主机直跑后端：`http://localhost:3001`；后端跑在 compose：`http://langfuse-web:3000`（compose 内网，为 compose 默认值可不设） |
+
+- **宿主机直跑后端**：`export` 上述三个变量后启动 uvicorn。
+- **compose 部署后端**：在 `.env` 填入 `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY`（或直接填 `PAPERMIND_LANGFUSE_*`，优先级更高），`docker-compose.yml` 会自动透传给 backend 容器。
+
+配置后重启后端，在 Langfuse 控制台「Traces」中即可看到每次对话的 prompt、延迟与 token 统计；trace metadata 关联 conversation_id / skill / 检索 chunk 数。
+
+### 5.4 数据与隐私
+
+- trace 会记录**完整 prompt 与消息内容**，这是设计行为——栈完全自托管，所有数据保存在本机 Docker 命名卷（`papermind-langfuse-postgres-data` / `papermind-langfuse-clickhouse-data` / `papermind-langfuse-minio-data`），**不出本机**；compose 中已设 `TELEMETRY_ENABLED=false` 关闭官方遥测。
+- `.env` 留空时 compose 使用占位默认值（如 `mysecret` / `miniosecret`），仅供本机开发；**任何共享或暴露网络的场景务必先生成并填写真实密钥**。
+- 停止栈：`docker compose --profile langfuse down`（数据保留）；连数据卷一起删除：加 `-v`。
+
+---
+
+## 6. 常见问题
 
 **Q：镜像里没有 config.yaml 会怎样？**
 A：后端配置加载会自动回退到 `config.yaml.example`（已拷贝进镜像），服务可正常启动，但 LLM 相关功能（对话/概括）不可用，`/api/health` 中 `llm_ready` 为 `false`。挂载真实 `config.yaml` 后恢复。
