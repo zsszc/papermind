@@ -84,7 +84,9 @@ class TestGraphStructure:
         }
         assert (START, "load_memory") in edges
         assert ("load_memory", "retrieve") in edges
-        assert ("retrieve", "build_messages") in edges
+        # Phase E E2：retrieve 与 build_messages 之间插入 external_tools 节点
+        assert ("retrieve", "external_tools") in edges
+        assert ("external_tools", "build_messages") in edges
         assert ("build_messages", END) in edges
 
     def test_node_execution_order(self, db, conversation, monkeypatch):
