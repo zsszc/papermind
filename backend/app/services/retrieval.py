@@ -10,6 +10,10 @@ from app.core.config import config
 from app.core.logger import logger
 from app.services.embedding import EmbeddingService
 from app.services.cache import cache
+from app.services.reranker import RerankerService
+
+# 重排候选池大小：RRF/语义召回的前 N 个候选进入 Reranker 精排（spec §3.1）
+_RERANK_POOL_SIZE = 20
 
 
 class VectorStore:
@@ -49,7 +53,7 @@ class VectorStore:
         documents = []
         metadatas = []
         for i, chunk in enumerate(chunks):
-            cid = f"p{paper_id}_c{i}"
+            cid = chunk.get("id") or f"p{paper_id}_c{i}"
             ids.append(cid)
             documents.append(chunk["content"])
             meta = {
@@ -116,9 +120,54 @@ class VectorStore:
                 "source": "semantic",
             })
 
+        # B1：rerank 开启时对前 _RERANK_POOL_SIZE 个候选精排；reranker 不可用/打分失败
+        # 时降级为原始排序（不抛异常），详见 _apply_rerank
+        if self._rerank_enabled():
+            output = self._apply_rerank(query, output)
+
         output = output[:top_k]
         cache.set(cache_key, output, ttl=60)
         return output
+
+    @staticmethod
+    def _rerank_enabled() -> bool:
+        """retrieval.rerank 开关（默认 false）：每次调用时读取，配置重载即生效。"""
+        return bool(config.get("retrieval.rerank", False))
+
+    @staticmethod
+    def _apply_rerank(query: str, output: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """对前 _RERANK_POOL_SIZE 个候选计算 (query, chunk) 相关性分数并重排。
+
+        降级契约（不抛异常、不 500）：
+        - 无候选：直接返回；
+        - reranker 模型不可用：记 [reranker] warning，返回原始排序；
+        - 打分异常或分数数与候选数不一致：记 [reranker] warning，返回原始排序。
+        池外候选（第 21 个起）保持原始顺序追加在重排池之后。
+        """
+        if not output:
+            return output
+        reranker = RerankerService()
+        if not reranker.available():
+            logger.warning("[reranker] 模型不可用，跳过重排，返回原始排序")
+            return output
+        pool = output[:_RERANK_POOL_SIZE]
+        pairs = [(query, item["content"]) for item in pool]
+        try:
+            scores = reranker._score(pairs)
+        except Exception as e:
+            logger.warning(f"[reranker] 重排打分失败，返回原始排序: {e}")
+            return output
+        if len(scores) != len(pool):
+            logger.warning(
+                f"[reranker] 重排分数数({len(scores)})与候选数({len(pool)})不一致，返回原始排序"
+            )
+            return output
+        # sorted 稳定：同分候选保持原始相对顺序
+        reranked = [
+            item
+            for _, item in sorted(zip(scores, pool), key=lambda x: x[0], reverse=True)
+        ]
+        return reranked + output[_RERANK_POOL_SIZE:]
 
     def delete_by_paper_id(self, paper_id: int):
         try:

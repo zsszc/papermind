@@ -20,8 +20,8 @@ embedding:
 
 retrieval:
   top_k: 10
-  rerank: false                   # MVP 阶段可关闭，减少依赖
-  rerank_model: "BAAI/bge-reranker-large"
+  rerank: false                   # 默认关闭，开启后召回 top-20 经 BGE-Reranker 精排
+  rerank_model: "BAAI/bge-reranker-v2-m3"
   hybrid_weight: 0.7
 
 memory:
