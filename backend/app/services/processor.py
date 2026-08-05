@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 from sqlalchemy.orm import Session
 
@@ -47,6 +47,20 @@ class PaperProcessor:
             db.add(chunk)
             db_chunks.append(cd)
 
+        # 4b. 摘要级 chunk（abstract 字段或首页启发式；无法生成则跳过）
+        abstract_cd = self._build_abstract_chunk(paper, pages)
+        if abstract_cd is not None:
+            db.add(Chunk(
+                paper_id=paper.id,
+                content=abstract_cd["content"],
+                page_number=abstract_cd.get("page_number"),
+                chunk_index=-1,
+                section_title=None,
+                chunk_type="abstract",
+                token_count=None,
+            ))
+            db_chunks.append(abstract_cd)
+
         db.commit()
 
         # 5. 向量化并写入 ChromaDB
@@ -61,4 +75,24 @@ class PaperProcessor:
             "status": "ok",
             "pages": len(pages),
             "chunks": len(db_chunks),
+        }
+
+    @staticmethod
+    def _build_abstract_chunk(paper: Paper, pages: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """生成摘要级 chunk：abstract 字段非空时优先使用；否则取首页文本前 1500 字符；两者皆空返回 None。"""
+        content = (paper.abstract or "").strip()
+        page_number = None
+        if not content:
+            if not pages:
+                return None
+            first_text = (pages[0].get("text") or "").strip()
+            if not first_text:
+                return None
+            content = first_text[:1500]
+            page_number = pages[0].get("page_number")
+        return {
+            "id": f"p{paper.id}_abstract",
+            "content": content,
+            "page_number": page_number,
+            "chunk_type": "abstract",
         }
