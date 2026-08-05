@@ -42,7 +42,7 @@ class TestStaticWhitelist:
         papers.mkdir()
         (papers / "ok.txt").write_text("白名单内容", encoding="utf-8")
         (tmp_path / "secret.yaml").write_text("top-secret", encoding="utf-8")
-        monkeypatch.setattr("app.routers.static.PROJECT_ROOT", tmp_path)
+        monkeypatch.setenv("PAPERMIND_DATA_DIR", str(tmp_path))
         return tmp_path
 
     def test_whitelisted_file_ok(self, client, fake_root):

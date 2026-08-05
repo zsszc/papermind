@@ -31,6 +31,7 @@ from app.schemas import (
     PaperStatsResponse,
 )
 from app.core.logger import logger
+from app.core.config import config
 from app.services.pdf_parser import PDFParser
 from app.services.processor import PaperProcessor
 from app.services.llm import llm_service
@@ -144,22 +145,19 @@ def _get_paper_lock(paper_id: int) -> threading.Lock:
 
 
 def get_papers_dir() -> Path:
-    project_root = Path(__file__).resolve().parents[3]
-    papers_dir = project_root / "papers"
+    papers_dir = config.runtime_root / "papers"
     papers_dir.mkdir(parents=True, exist_ok=True)
     return papers_dir
 
 
 def get_notes_dir() -> Path:
-    project_root = Path(__file__).resolve().parents[3]
-    notes_dir = project_root / "notes"
+    notes_dir = config.runtime_root / "notes"
     notes_dir.mkdir(parents=True, exist_ok=True)
     return notes_dir
 
 
 def get_summaries_dir() -> Path:
-    project_root = Path(__file__).resolve().parents[3]
-    summaries_dir = project_root / "summaries"
+    summaries_dir = config.runtime_root / "summaries"
     summaries_dir.mkdir(parents=True, exist_ok=True)
     return summaries_dir
 
@@ -180,7 +178,7 @@ def _enhance_paper_metadata(paper_id: int):
             return
 
         try:
-            pdf_path = str(Path(__file__).resolve().parents[3] / paper.file_path)
+            pdf_path = str(config.runtime_root / paper.file_path)
             enhanced = _enhance_metadata_with_llm_sync(pdf_path)
             if enhanced.get("title"):
                 paper.title = enhanced["title"]
@@ -322,7 +320,7 @@ async def import_papers(
                 abstract=metadata.get("abstract"),
                 doi=metadata.get("doi"),
                 pages=metadata.get("pages"),
-                file_path=str(target_path.relative_to(Path(__file__).resolve().parents[3])),
+                file_path=str(target_path.relative_to(config.runtime_root)),
                 filename=target_path.name,
                 status="unread",
                 source="local",
@@ -538,7 +536,7 @@ def delete_paper(paper_id: int, db: Session = Depends(get_db)):
     if not paper:
         raise HTTPException(status_code=404, detail="Paper not found")
 
-    project_root = Path(__file__).resolve().parents[3]
+    project_root = config.runtime_root
 
     # 清理向量数据
     try:
@@ -682,7 +680,7 @@ def get_pdf_file(paper_id: int, db: Session = Depends(get_db)):
     if not paper:
         raise HTTPException(status_code=404, detail="Paper not found")
 
-    project_root = Path(__file__).resolve().parents[3]
+    project_root = config.runtime_root
     pdf_path = project_root / paper.file_path
     if not pdf_path.exists():
         raise HTTPException(status_code=404, detail="PDF file not found")
@@ -757,7 +755,8 @@ def process_paper(paper_id: int, db: Session = Depends(get_db)):
     except Exception as e:
         paper.processed = "error"
         db.commit()
-        raise HTTPException(status_code=500, detail=f"处理失败: {e}")
+        logger.exception(f"[process] paper_id={paper_id} 处理失败")
+        raise HTTPException(status_code=500, detail="文献处理失败，请稍后再试") from e
 
 
 @router.post("/{paper_id}/summarize")
@@ -906,7 +905,7 @@ async def extract_metadata(paper_id: int, db: Session = Depends(get_db)):
     if not paper:
         raise HTTPException(status_code=404, detail="Paper not found")
 
-    project_root = Path(__file__).resolve().parents[3]
+    project_root = config.runtime_root
     pdf_path = project_root / paper.file_path
     if not pdf_path.exists():
         raise HTTPException(status_code=404, detail="PDF file not found")

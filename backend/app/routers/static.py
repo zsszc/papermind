@@ -9,10 +9,9 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 
-router = APIRouter()
+from app.core.config import config
 
-# 项目根目录（backend/app/routers/static.py 上三级）
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+router = APIRouter()
 
 # 允许通过 /static 访问的一级子目录（与前端实际使用保持一致）
 ALLOWED_DIRS = ("papers", "notes", "my-thesis", "summaries")
@@ -28,7 +27,7 @@ def _resolve_static_path(file_path: str) -> Path:
     parts = Path(file_path).parts
     if not parts or parts[0] not in ALLOWED_DIRS:
         raise HTTPException(status_code=403, detail="禁止访问该路径")
-    allowed_root = (PROJECT_ROOT / parts[0]).resolve()
+    allowed_root = (config.runtime_root / parts[0]).resolve()
     target = (allowed_root.joinpath(*parts[1:])).resolve() if len(parts) > 1 else allowed_root
     if target != allowed_root and allowed_root not in target.parents:
         raise HTTPException(status_code=403, detail="禁止访问该路径")

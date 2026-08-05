@@ -1,6 +1,4 @@
-import os
 import threading
-from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 import chromadb
@@ -18,8 +16,7 @@ _RERANK_POOL_SIZE = 20
 
 class VectorStore:
     def __init__(self):
-        project_root = Path(__file__).resolve().parents[3]
-        self.vector_dir = project_root / "vector_db"
+        self.vector_dir = config.runtime_root / "vector_db"
         self.vector_dir.mkdir(parents=True, exist_ok=True)
 
         self.client = chromadb.PersistentClient(

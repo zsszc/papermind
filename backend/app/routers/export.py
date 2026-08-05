@@ -149,8 +149,8 @@ def export_papers_bib(format: str = "GB/T 7714", db: Session = Depends(get_db)):
 @router.post("/backup")
 def export_backup():
     """打包全量数据为 zip 备份。"""
-    project_root = Path(__file__).resolve().parents[3]
-    dirs_to_backup = ["data", "papers", "notes", "my-thesis", "vector_db", "skills", "logs"]
+    project_root = config.runtime_root
+    dirs_to_backup = ["data", "papers", "notes", "summaries", "my-thesis", "vector_db", "skills", "logs"]
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"papermind_backup_{timestamp}.zip"

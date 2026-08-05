@@ -70,7 +70,7 @@ Kimi API (kimi-k2.6) —— 对话 / 概括 / 联网搜索 / 图片分析
 
 - **启动流程**（`backend/app/main.py` lifespan）：`Base.metadata.create_all` → `ensure_schema()` 轻量迁移 → `ensure_papers_fts()` 建 FTS5 虚拟表与触发器 → LLM 健康检查（结果存 `app.state.llm_ready`，暴露在 `/api/health`）→ 启动每日凌晨 3 点自动备份线程。
 - **静态服务**：`/static` 为白名单静态路由（`routers/static.py`），仅放行 `papers/`、`notes/`、`my-thesis/`、`summaries/` 四个目录，`resolve()` 防 `../` 穿越与软链接逃逸；项目根不再整体暴露。
-- **配置加载**（`backend/app/core/config.py`，单例 `Config`）：优先读项目根 `config.yaml`，缺失时回退 `config.yaml.example`；若设了 `PAPERMIND_DATA_DIR`（Electron 生产包），则从该目录读/复制配置，并自动检测占位符 API Key。`core/settings.py` 提供 `PAPERMIND_*` 环境变量覆盖与启动校验（lifespan 中执行）。
+- **配置加载**（`backend/app/core/config.py`，单例 `Config`）：开发模式优先读项目根 `config.yaml`，缺失时回退 `config.yaml.example`；若设了 `PAPERMIND_DATA_DIR`，只在首次启动复制公开模板，真实配置保存在应用数据目录且升级不覆盖。`runtime_root` 统一重定向所有可变数据。
 - **检索**（`backend/app/routers/search.py`）：语义检索（ChromaDB cosine，Embedding 用 BGE-M3）与关键词检索（SQLite FTS5 `papers_fts` 表）可独立开关，同时开启时用 RRF（Reciprocal Rank Fusion）融合；语义检索结果有 60 秒内存缓存（`services/cache.py`）。`config.yaml` 里 `retrieval.rerank` 默认为 `false`，BGE-Reranker 相关代码是预留。
 - **Skill 系统**（`backend/app/services/skills.py`）：`SkillRegistry` 可注册注册表（Skill-as-Tool 基础），`Skill` dataclass 预留 `tools` 字段供后续工具化；模块级 `build_skill_prompt()` / `list_skills()` 保持原签名。现有 6 个默认 Skill：translator、proofreader、method_comparator、outline_generator、data_analyst、writing_assistant。根目录 `skills/` 目录为空，属预留。
 - **对话**（`routers/chat.py`）：`POST /api/chat` 为 SSE 流式。LLM 调用前的编排（记忆加载 → 向量检索 → 消息组装）由 `services/agent_graph.py` 的 LangGraph StateGraph 完成；流式生成与 SSE 事件格式（`{delta}` / `{finished, citations}` / `{error}`）由路由层保持。另有会话 CRUD、消息删除/重新生成、`/analyze-image`（多模态）、`/skills` 列表。
@@ -177,7 +177,7 @@ cd frontend && npm run build
 cd ../electron && npm run build    # 产物在 frontend/out/（dmg/zip/exe）
 ```
 
-打包逻辑（`electron/electron-builder.yml` + `main.js`）：`frontend/dist`、`backend/`（**含 venv，包体 500MB+**）、`config.yaml`、各数据目录作为 extraResources 打入；运行时主进程 spawn `backend/venv/bin/python -m uvicorn`，并通过 `PAPERMIND_DATA_DIR` 把数据写到系统应用数据目录（macOS: `~/Library/Application Support/PaperMind/PaperMindData`）。项目根已有打包产物 `PaperMind-1.0.0-arm64.dmg` / `PaperMind-1.0.0-arm64-mac.zip`。
+打包逻辑（`electron/electron-builder.yml` + `main.js`）：仅将 `frontend/dist`、`backend/`（**含 venv，包体 500MB+**）与 `config.yaml.example` 作为 extraResources 打入；真实配置和个人数据严禁进入安装包。运行时通过 `PAPERMIND_DATA_DIR` 把全部可变数据写到系统应用数据目录。
 
 ---
 
@@ -223,7 +223,7 @@ env -u PYTHONPATH venv/bin/python -m eval.run --with-llm      # 含生成侧（�
 ## 9. 安全与隐私
 
 - `config.yaml` 含 Kimi API Key，**已加入 `.gitignore`，严禁提交**；同样被忽略的还有 `data/`、`papers/`、`notes/`、`vector_db/`、`logs/`、`cache/`、模型缓存与 venv。
-- `config.py` 会识别占位符 Key（`sk-xxxx` / `your-` 开头）， Electron 打包时只有填了真实 Key 的 `config.yaml` 才会被采用。
+- Electron 安装包只携带 `config.yaml.example`；真实 Key 必须由用户在应用数据目录或设置界面填写，不得随分发包提供。
 - CORS 已严格化：显式 origin 白名单（`http://localhost:5173`、`http://127.0.0.1:5173`、Electron `file://` 的 `"null"`），`allow_credentials=False`——仍不要将后端暴露到公网。
 - `/static` 为白名单静态路由（仅 papers/notes/my-thesis/summaries），`resolve()` 防路径穿越与软链接逃逸；新增敏感文件不要放进这四个目录。
 - 全局异常处理不向前端返回异常原文（仅通用文案 + error_code），详情只写 `logs/app.log`。

@@ -17,30 +17,8 @@ extraResources:
       - "!__pycache__"
       - "!*.pyc"
       - "!.DS_Store"
-  - from: ../config.yaml
-    to: config.yaml
   - from: ../config.yaml.example
     to: config.yaml.example
-  - from: ../data
-    to: data
-    filter:
-      - "!.DS_Store"
-  - from: ../papers
-    to: papers
-    filter:
-      - "!.DS_Store"
-  - from: ../notes
-    to: notes
-    filter:
-      - "!.DS_Store"
-  - from: ../my-thesis
-    to: my-thesis
-    filter:
-      - "!.DS_Store"
-  - from: ../vector_db
-    to: vector_db
-    filter:
-      - "!.DS_Store"
 mac:
   category: public.app-category.productivity
   target:

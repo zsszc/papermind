@@ -23,6 +23,7 @@ from app.schemas import (
 from app.services.docx_parser import DocxParser
 from app.services.llm import llm_service
 from app.core.logger import logger
+from app.core.config import config
 
 router = APIRouter()
 
@@ -63,8 +64,7 @@ async def _save_upload_file(file: UploadFile, target_path: Path, max_size: Optio
 
 
 def get_thesis_dir() -> Path:
-    project_root = Path(__file__).resolve().parents[3]
-    thesis_dir = project_root / "my-thesis"
+    thesis_dir = config.runtime_root / "my-thesis"
     thesis_dir.mkdir(parents=True, exist_ok=True)
     return thesis_dir
 
@@ -147,7 +147,7 @@ async def upload_thesis(
 
     thesis = ThesisFile(
         title=parsed.get("title") or target_path.stem,
-        file_path=str(target_path.relative_to(Path(__file__).resolve().parents[3])),
+        file_path=str(target_path.relative_to(config.runtime_root)),
         filename=target_path.name,
         chapter_structure=parsed.get("chapters", []),
         word_count=parsed.get("word_count"),
@@ -206,7 +206,7 @@ def delete_thesis(thesis_id: int, db: Session = Depends(get_db)):
     db.commit()
 
     # 可选：删除本地文件
-    file_path = Path(__file__).resolve().parents[3] / thesis.file_path
+    file_path = config.runtime_root / thesis.file_path
     if file_path.exists():
         try:
             os.remove(file_path)
@@ -300,7 +300,7 @@ def get_chapter_text(
         raise HTTPException(status_code=404, detail="Thesis not found")
 
     parser = DocxParser()
-    project_root = Path(__file__).resolve().parents[3]
+    project_root = config.runtime_root
     file_path = project_root / thesis.file_path
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="Word file not found")
@@ -333,7 +333,7 @@ async def analyze_thesis(
         raise HTTPException(status_code=404, detail="Thesis not found")
 
     parser = DocxParser()
-    project_root = Path(__file__).resolve().parents[3]
+    project_root = config.runtime_root
     file_path = project_root / thesis.file_path
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="Word file not found")
@@ -408,7 +408,7 @@ async def analyze_thesis(
         )
     except Exception as e:
         logger.exception("[ThesisAnalyze] 序列化响应失败")
-        raise HTTPException(status_code=500, detail=f"响应序列化失败: {e}") from e
+        raise HTTPException(status_code=500, detail="响应序列化失败，请稍后再试") from e
 
 
 @router.post("/{thesis_id}/suggest-citations")

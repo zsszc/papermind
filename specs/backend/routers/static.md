@@ -14,7 +14,7 @@
 
 - `GET /static/{file_path:path}`：按白名单提供单个文件下载
 - `_resolve_static_path` 的三级校验契约（白名单 → 防穿越 → 存在性）
-- 白名单目录集 `ALLOWED_DIRS` 与项目根定位 `PROJECT_ROOT`
+- 白名单目录集 `ALLOWED_DIRS` 与 `config.runtime_root` 运行时根目录
 
 ### 2.2 非目标
 
@@ -30,7 +30,7 @@
 
 ### 3.0 模块常量
 
-- `PROJECT_ROOT = Path(__file__).resolve().parents[3]`：项目根（`backend/app/routers/` 上溯三级）。**不随 `PAPERMIND_DATA_DIR` 重定向**——Electron 生产包中数据目录被重定向到系统应用数据目录后，本常量仍指向安装包内路径（与 `services/backup.py::get_project_root` 同一已知遗留，见该规格第 8 节）。
+- 根目录动态取 `config.runtime_root`：开发模式为项目根，Electron 生产模式为应用数据目录。
 - `ALLOWED_DIRS = ("papers", "notes", "my-thesis", "summaries")`：允许访问的一级子目录，与前端实际使用保持一致。
 
 ### 3.1 `_resolve_static_path(file_path: str) -> Path`
@@ -39,7 +39,7 @@
 
 1. **白名单校验**：`parts = Path(file_path).parts`；`parts` 为空或 `parts[0]` 不在 `ALLOWED_DIRS` → **403** `detail="禁止访问该路径"`。
    - 由此直接拦下：`config.yaml`、`backend/...`、`data/...`、`logs/...`、`backups/...`、`../...`（`parts[0]` 为 `".."`）、`%2e%2e` 解码后的 `..` 等。
-2. **防穿越校验**：`allowed_root = (PROJECT_ROOT / parts[0]).resolve()`；`target = allowed_root.joinpath(*parts[1:]).resolve()`（`len(parts)==1` 时 `target = allowed_root`）；`target != allowed_root and allowed_root not in target.parents` → **403** 同文案。
+2. **防穿越校验**：`allowed_root = (config.runtime_root / parts[0]).resolve()`；其余祖先包含校验不变。
    - `resolve()` 同时归一化 `..` 段并**追随软链接**——`papers/../../config.yaml` 与白名单内指向外部文件的软链接（如 `papers/evil.txt -> ../../secret.yaml`）均因越出 `allowed_root` 被 403；
    - 指向白名单目录**内部**另一文件的软链接合法放行；
    - 仅请求目录本身（`/static/papers`）时 `target == allowed_root`，通过本级，留给第三级处理。
@@ -88,12 +88,12 @@
 
 - **已覆盖**（`backend/tests/test_security.py`）：
   - `TestStaticTraversal`（7 个参数化路径）：`../config.yaml`、直接 `config.yaml`、`backend/`、`data/`、`logs/`、白名单内 `../..` 穿越、`%2e%2e` 编码穿越，断言 403/404 且响应体无 `api_key` → 覆盖 AC2、AC3
-  - `TestStaticWhitelist`（monkeypatch `PROJECT_ROOT` 到 `tmp_path`，4 例）：白名单文件 200 且内容一致、缺失文件 404、白名单内穿越被拦、软链接逃逸被拦 → 覆盖 AC1、AC4（逃逸向）、AC5
+  - `TestStaticWhitelist`（设置 `PAPERMIND_DATA_DIR` 到 `tmp_path`，4 例）：白名单文件 200 且内容一致、缺失文件 404、白名单内穿越被拦、软链接逃逸被拦 → 覆盖 AC1、AC4（逃逸向）、AC5
 - **盲区**：
   - 指向白名单**内部**的软链接放行行为（AC4 的放行向）无测试（**低**，属刻意放行但无固化）
   - `notes/`、`my-thesis/`、`summaries/` 三个白名单目录只测了 `papers/`（**低**，共用同一 `_resolve_static_path`，风险低）
   - `/static/papers`（请求目录本身）→ 404 无显式用例（**低**，被 `not-exist.txt` 用例间接覆盖 `is_file` 分支）
-  - `PROJECT_ROOT` 不随 `PAPERMIND_DATA_DIR` 重定向的 Electron 生产包行为无测试（**中**，与 backup 同源的已知遗留；桌面包内数据被重定向后 `/static` 可能取不到真实文件）
+  - Electron 路径重定向已由 `tests/test_runtime_paths.py` 覆盖。
   - 多级子目录（`papers/sub/file`）放行无显式用例（**低**）
 
 ## 8. 关键设计决策

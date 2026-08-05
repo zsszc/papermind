@@ -1,7 +1,5 @@
 import logging
 import logging.handlers
-from pathlib import Path
-
 from app.core.config import config
 
 
@@ -14,8 +12,7 @@ def setup_logger(name: str = "papermind") -> logging.Logger:
     logger.setLevel(logging.INFO)
 
     # 日志目录
-    project_root = Path(__file__).resolve().parents[3]
-    log_dir = project_root / "logs"
+    log_dir = config.runtime_root / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
 
     log_file = log_dir / "app.log"

@@ -110,6 +110,7 @@ async function startBackend() {
   fs.mkdirSync(path.join(dataDir, 'data'), { recursive: true })
   fs.mkdirSync(path.join(dataDir, 'papers'), { recursive: true })
   fs.mkdirSync(path.join(dataDir, 'notes'), { recursive: true })
+  fs.mkdirSync(path.join(dataDir, 'summaries'), { recursive: true })
   fs.mkdirSync(path.join(dataDir, 'my-thesis'), { recursive: true })
   fs.mkdirSync(path.join(dataDir, 'vector_db'), { recursive: true })
   fs.mkdirSync(path.join(dataDir, 'backups'), { recursive: true })

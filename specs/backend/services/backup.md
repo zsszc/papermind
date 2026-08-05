@@ -32,13 +32,13 @@ PaperMind 是本地优先应用（宪法第 1 条）：SQLite 数据库、PDF、
 ### 3.1 `get_project_root() -> Path`
 
 - **输出**：`Path(__file__).resolve().parents[3]`，即项目根目录（`backend/app/services/` 上溯三级）
-- **注意**：与 `PAPERMIND_DATA_DIR` 重定向**无关**——Electron 生产包中数据目录被重定向到系统应用数据目录后，本函数仍指向安装包内路径，备份清单可能取不到真实数据（见第 8 节）
+- 返回 `config.runtime_root`；开发模式为项目根，Electron 生产模式为应用数据目录。
 
 ### 3.2 `create_backup(dirs: List[str] = None, include_db: bool = True, include_vector: bool = True) -> bytes`
 
 - **输入**：
   - `dirs`：自定义目录清单；为 `None` 时用默认清单 `["data", "papers", "notes", "my-thesis", "skills", "logs"]`，且 `include_vector=True`（默认）时追加 `"vector_db"`。传了 `dirs` 则 `include_vector` 不再生效；
-  - **`include_db` 是死参数**：函数体从不引用它——`data` 目录（含 SQLite 库）永远在默认清单内，**无法通过参数排除数据库**；
+  - `include_db=True` 时确保当前 `config.data_dir/papers.db` 以 `data/papers.db` 入包；Electron 历史布局把数据库放在运行时根目录时也不会遗漏；
 - **输出**：完整 zip 文件的 bytes（整个压缩包在内存中构建）
 - **打包规则**：
   - 清单中不存在的目录**静默跳过**；
@@ -142,9 +142,9 @@ PaperMind 是本地优先应用（宪法第 1 条）：SQLite 数据库、PDF、
   - 备份内容清单（默认目录集、`include_vector` 开关、不存在目录跳过）无测试（**高**）
   - `auto_backup` 失败 re-raise 与调度线程「记 warning 不死」的容错链无测试（**中**）
   - 两个手动端点的契约差异（含/不含 config.yaml、流式 vs 落盘）无测试（**中**）
-  - `include_db` 死参数（传入 False 也照样备份数据库）无测试（**中**，误导性 API）
+  - `include_db` 的 Electron 根目录数据库兼容路径已有专项测试；完整并发一致性快照仍待治理。
   - `summaries/` 未纳入任何备份清单——无测试、无文档警示（**中**，AI 概括数据存在丢失面）
-  - 同秒文件名冲突覆盖、大 zip 内存峰值、`PAPERMIND_DATA_DIR` 下项目根定位失真，均无测试（**低**）
+  - 同秒文件名冲突覆盖、大 zip 内存峰值仍无测试（**低**）；运行时根定位已由 Batch 8 修复。
 
 ## 8. 关键设计决策
 
@@ -153,5 +153,5 @@ PaperMind 是本地优先应用（宪法第 1 条）：SQLite 数据库、PDF、
 - **文件名前缀区分 auto / 手动**：清理只认 `papermind_auto_backup_*`，手动下载流本就落客户端、不参与保留策略
 - **daemon 线程 + sleep 重算**：不引入 APScheduler 等调度框架；每次循环重算下次 3 点，天然免疫「睡过头后时间漂移累积」，但无 missed-job 补跑
 - **容错分层**：`create_backup` 不兜底（纯函数式抛错）→ `auto_backup` 记日志后 re-raise（保留调用方可观测性）→ 调度线程 try/except 兜底（保线程存活）；HTTP 层则交给全局异常处理脱敏
-- **注释与行为不符处以代码为准**（宪法第 20 条）：`include_db` 死参数、`config.yaml` 未脱敏、`shutil`/`config` 死导入均按现状记录；修复时应先补测试再改行为，并同步修订本规格
-- **`get_project_root` 不经 `config.data_dir`**：与宪法第 3 条可移植性在 Electron 生产包下存在张力（`PAPERMIND_DATA_DIR` 重定向后备份源路径可能失真），属已知遗留，改造时需连同 `create_backup` 的目录解析一并处理
+- **数据库兼容布局**：开发模式数据库通常已随 `data/` 遍历入包；Electron 历史布局在运行时根，`include_db` 会补写并避免重复 arcname。
+- **`get_project_root` 为兼容旧调用名**：实际返回 `config.runtime_root`，确保桌面端备份真实用户数据。

@@ -137,7 +137,7 @@ cd ../electron && npm run build
 > **注意**：
 > - 当前 `electron-builder.yml` 会把 `backend/venv` 一并打包，因此安装包较大（约 500MB+），但无需目标机器安装 Python 环境。
 > - 数据默认保存在系统应用数据目录（macOS: `~/Library/Application Support/PaperMind/PaperMindData`；Windows: `%APPDATA%/PaperMind/PaperMindData`），不会随应用升级丢失。
-> - 首次运行前请确保 `config.yaml` 中已填写有效的 Kimi API Key。
+> - 桌面包不会携带开发机的 API Key 或个人数据；首次运行后请在设置界面填写 Kimi API Key。
 
 ---
 

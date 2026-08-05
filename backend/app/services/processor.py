@@ -1,9 +1,9 @@
-from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 from sqlalchemy.orm import Session
 
 from app.core.logger import logger
+from app.core.config import config
 from app.models import Paper, Chunk
 from app.services.pdf_parser import PDFParser
 from app.services.embedding import TextChunker
@@ -18,8 +18,7 @@ class PaperProcessor:
         self.vector_store = get_vector_store()
 
     def process(self, paper: Paper, db: Session) -> Dict[str, Any]:
-        project_root = Path(__file__).resolve().parents[3]
-        pdf_path = project_root / paper.file_path
+        pdf_path = config.runtime_root / paper.file_path
 
         if not pdf_path.exists():
             return {"status": "error", "message": "PDF file not found"}

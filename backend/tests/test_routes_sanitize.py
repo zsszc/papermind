@@ -182,6 +182,29 @@ class TestSummarizeSanitize:
         assert not r2.json()["summary"].startswith("# ")
 
 
+class TestProcessSanitize:
+    """papers /process 的内部异常不得透传。"""
+
+    def test_processor_exception_detail_sanitized(self, client, db, monkeypatch):
+        paper = Paper(
+            title="处理失败测试",
+            file_path="papers/x.pdf",
+            filename="x.pdf",
+        )
+        db.add(paper)
+        db.commit()
+
+        def fail_process(self, paper, db):
+            raise RuntimeError(SECRET_RAISE)
+
+        monkeypatch.setattr(papers_router.PaperProcessor, "process", fail_process)
+        response = client.post(f"/api/papers/{paper.id}/process")
+
+        assert response.status_code == 500
+        assert SECRET_RAISE not in response.text
+        assert response.json()["detail"] == "文献处理失败，请稍后再试"
+
+
 class TestAnalyzeSanitize:
     """thesis /analyze 的 LLM 失败脱敏。"""
 
@@ -226,6 +249,21 @@ class TestAnalyzeSanitize:
         assert r.status_code == 200
         assert r.json()["suggestions"].startswith("## 评审/概括")
         assert r.json()["chapter_title"] == "第一章 绪论"
+
+    def test_response_serialization_exception_sanitized(self, thesis_env, monkeypatch):
+        """响应模型构造失败时也只返回通用文案。"""
+        client, thesis = thesis_env
+        monkeypatch.setattr(thesis_router.llm_service, "chat_completion", _fake_chat_ok)
+
+        def fail_response(**kwargs):
+            raise RuntimeError(SECRET_RAISE)
+
+        monkeypatch.setattr(thesis_router, "ThesisAnalyzeResponse", fail_response)
+        response = client.post(f"/api/thesis/{thesis.id}/analyze", json={})
+
+        assert response.status_code == 500
+        assert SECRET_RAISE not in response.text
+        assert response.json()["detail"] == "响应序列化失败，请稍后再试"
 
 
 class TestSuggestCitationsSanitize:

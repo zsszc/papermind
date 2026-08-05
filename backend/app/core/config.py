@@ -25,32 +25,11 @@ class Config:
             data_dir.mkdir(parents=True, exist_ok=True)
             config_path = data_dir / "config.yaml"
 
-            # 生产包中优先使用 app resources 里的真实配置（含真实 API key）
-            bundled_config = project_root / "config.yaml"
+            # 生产包只携带配置模板，真实 API Key 由用户在应用数据目录配置。
+            # 禁止从 resources 复制真实 config.yaml，避免密钥随安装包分发。
             example_config = project_root / "config.yaml.example"
 
-            def _is_placeholder_config(path: Path) -> bool:
-                """检查配置是否还是占位符模板。"""
-                if not path.exists():
-                    return True
-                try:
-                    text = path.read_text(encoding="utf-8")
-                    if "sk-xxxx" in text or "your-" in text.lower():
-                        return True
-                    cfg = yaml.safe_load(text) or {}
-                    key = cfg.get("llm", {}).get("api_key", "")
-                    if not key or "xxxx" in str(key) or str(key).startswith("your-"):
-                        return True
-                except Exception:
-                    return True
-                return False
-
-            if bundled_config.exists() and (
-                not config_path.exists() or _is_placeholder_config(config_path)
-            ):
-                import shutil
-                shutil.copy(bundled_config, config_path)
-            elif not config_path.exists() and example_config.exists():
+            if not config_path.exists() and example_config.exists():
                 import shutil
                 shutil.copy(example_config, config_path)
         else:
@@ -86,6 +65,17 @@ class Config:
             return
         with open(self._config_path, "w", encoding="utf-8") as f:
             yaml.dump(self._config, f, allow_unicode=True, sort_keys=False, default_flow_style=False)
+
+    @property
+    def runtime_root(self) -> Path:
+        """返回可变运行时文件的统一根目录。
+
+        开发模式使用项目根；Electron 生产模式使用 PAPERMIND_DATA_DIR。
+        """
+        env_data_dir = os.environ.get("PAPERMIND_DATA_DIR")
+        path = Path(env_data_dir) if env_data_dir else Path(__file__).resolve().parents[3]
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
     @property
     def data_dir(self) -> Path:

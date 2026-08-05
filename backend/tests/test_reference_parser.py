@@ -339,14 +339,11 @@ def _make_processor(pages):
 
 @pytest.fixture()
 def paper_pdf(tmp_path, monkeypatch):
-    """把 processor 模块的 project_root 重定向到 tmp_path，并放置一个假 PDF 文件。"""
+    """把运行时数据根重定向到 tmp_path，并放置一个假 PDF 文件。"""
     papers_dir = tmp_path / "papers"
     papers_dir.mkdir()
     (papers_dir / "ref_test.pdf").write_bytes(b"%PDF-fake")
-    # Path(__file__).resolve().parents[3] -> tmp_path
-    monkeypatch.setattr(
-        processor_module, "__file__", str(tmp_path / "a" / "b" / "c" / "processor.py")
-    )
+    monkeypatch.setenv("PAPERMIND_DATA_DIR", str(tmp_path))
     return "papers/ref_test.pdf"
 
 

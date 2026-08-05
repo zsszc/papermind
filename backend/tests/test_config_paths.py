@@ -1,10 +1,10 @@
-"""core/config.py 的 PAPERMIND_DATA_DIR 分支特征化测试（只测不改）。
+"""core/config.py 的 PAPERMIND_DATA_DIR 分支契约测试。
 
 锁定 Electron 生产包配置加载路径的现有行为：
 - 数据目录自动创建（mkdir -p）
-- bundled 配置（项目根 config.yaml）复制/覆盖规则
-- 占位符配置检测（sk-xxxx / your- 前缀 / 空 Key / 解析异常）
-- bundled 缺失时复制 example、开发模式缺失 config.yaml 时只读回退 example
+- 生产环境只复制公开 example，绝不复制项目根真实 config.yaml
+- 已有用户配置不被覆盖，损坏 YAML 显式报错并保留原文件
+- 开发模式缺失 config.yaml 时只读回退 example
 
 注意：
 - Config 是单例，每个用例前后重置 ``Config._instance`` 与类属性 ``Config._config``，
@@ -73,13 +73,8 @@ class TestDataDirBranch:
 
         assert target_dir.is_dir()
 
-    def test_bundled_copied_when_target_missing(self, tmp_path, monkeypatch):
-        """锁定：目标 config.yaml 缺失时，bundled（项目根 config.yaml）被复制过去。
-
-        前置：项目根必须存在真实 config.yaml（本仓库开发机/打包机上均成立）。
-        """
-        if not BUNDLED_CONFIG.exists():
-            pytest.skip("项目根无 config.yaml，无法验证 bundled 复制分支")
+    def test_example_copied_when_target_missing(self, tmp_path, monkeypatch):
+        """目标缺失时只复制公开模板，绝不复制项目根真实配置。"""
         monkeypatch.setenv("PAPERMIND_DATA_DIR", str(tmp_path))
 
         c = Config()
@@ -87,60 +82,57 @@ class TestDataDirBranch:
         target = tmp_path / "config.yaml"
         assert c.config_path == target
         assert target.exists()
-        # 用摘要对比，避免断言失败时把真实 Key 打进日志
-        assert _sha256(target) == _sha256(BUNDLED_CONFIG)
-        # 加载结果来自复制后的配置（取非敏感字段验证）
-        bundled_cfg = yaml.safe_load(BUNDLED_CONFIG.read_text(encoding="utf-8"))
-        assert c.get("llm.model") == bundled_cfg["llm"]["model"]
+        assert _sha256(target) == _sha256(EXAMPLE_CONFIG)
+        example_cfg = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
+        assert c.get("llm.model") == example_cfg["llm"]["model"]
 
-    def test_bundled_overwrites_placeholder_with_sk_xxxx(self, tmp_path, monkeypatch):
-        """锁定：目标含 sk-xxxx 占位符文本时被 bundled 覆盖。"""
-        if not BUNDLED_CONFIG.exists():
-            pytest.skip("项目根无 config.yaml，无法验证 bundled 覆盖分支")
+    def test_existing_placeholder_is_not_overwritten(self, tmp_path, monkeypatch):
+        """已有用户配置即使仍为占位符也不被安装包内容覆盖。"""
         monkeypatch.setenv("PAPERMIND_DATA_DIR", str(tmp_path))
         target = tmp_path / "config.yaml"
-        target.write_text("llm:\n  api_key: sk-xxxx\n  model: kimi-k2-7\n", encoding="utf-8")
+        original = "llm:\n  api_key: sk-xxxx\n  model: custom-placeholder-model\n"
+        target.write_text(original, encoding="utf-8")
 
-        Config()
+        c = Config()
 
-        assert _sha256(target) == _sha256(BUNDLED_CONFIG)
+        assert target.read_text(encoding="utf-8") == original
+        assert c.get("llm.model") == "custom-placeholder-model"
 
-    def test_bundled_overwrites_placeholder_with_your_prefix(self, tmp_path, monkeypatch):
-        """锁定：目标含 your- 开头占位符（忽略大小写）时被 bundled 覆盖。"""
-        if not BUNDLED_CONFIG.exists():
-            pytest.skip("项目根无 config.yaml，无法验证 bundled 覆盖分支")
+    def test_existing_empty_key_config_is_not_overwritten(self, tmp_path, monkeypatch):
+        """已有空 Key 配置保持原样，避免升级时覆盖用户的其他设置。"""
         monkeypatch.setenv("PAPERMIND_DATA_DIR", str(tmp_path))
         target = tmp_path / "config.yaml"
-        target.write_text("llm:\n  api_key: your-api-key-here\n", encoding="utf-8")
+        original = "llm:\n  api_key: ''\n  model: offline-model\n"
+        target.write_text(original, encoding="utf-8")
 
-        Config()
+        c = Config()
 
-        assert _sha256(target) == _sha256(BUNDLED_CONFIG)
+        assert target.read_text(encoding="utf-8") == original
+        assert c.get("llm.model") == "offline-model"
 
-    def test_bundled_overwrites_placeholder_with_empty_api_key(self, tmp_path, monkeypatch):
-        """锁定：目标 YAML 合法但 llm.api_key 为空时，视为占位符被 bundled 覆盖。"""
-        if not BUNDLED_CONFIG.exists():
-            pytest.skip("项目根无 config.yaml，无法验证 bundled 覆盖分支")
+    def test_existing_your_prefix_config_is_not_overwritten(self, tmp_path, monkeypatch):
+        """your- 占位配置同样只由用户主动修改。"""
         monkeypatch.setenv("PAPERMIND_DATA_DIR", str(tmp_path))
         target = tmp_path / "config.yaml"
-        target.write_text("llm:\n  api_key: ''\n  model: some-model\n", encoding="utf-8")
+        original = "llm:\n  api_key: your-api-key-here\n  model: local-only\n"
+        target.write_text(original, encoding="utf-8")
 
-        Config()
+        c = Config()
 
-        assert _sha256(target) == _sha256(BUNDLED_CONFIG)
+        assert target.read_text(encoding="utf-8") == original
+        assert c.get("llm.model") == "local-only"
 
-    def test_bundled_overwrites_unparseable_config(self, tmp_path, monkeypatch):
-        """锁定：目标文件 YAML 解析失败时，保守按占位符处理并被 bundled 覆盖。"""
-        if not BUNDLED_CONFIG.exists():
-            pytest.skip("项目根无 config.yaml，无法验证 bundled 覆盖分支")
+    def test_unparseable_existing_config_raises_without_overwrite(self, tmp_path, monkeypatch):
+        """损坏配置显式报错且保留原文件，禁止静默覆盖用户内容。"""
         monkeypatch.setenv("PAPERMIND_DATA_DIR", str(tmp_path))
         target = tmp_path / "config.yaml"
-        # 未闭合引号，必然触发 yaml.YAMLError；且不含任何占位符文本标记
-        target.write_text("llm: 'unclosed quote\n", encoding="utf-8")
+        original = "llm: 'unclosed quote\n"
+        target.write_text(original, encoding="utf-8")
 
-        Config()
+        with pytest.raises(yaml.YAMLError):
+            Config()
 
-        assert _sha256(target) == _sha256(BUNDLED_CONFIG)
+        assert target.read_text(encoding="utf-8") == original
 
     def test_real_key_target_not_overwritten(self, tmp_path, monkeypatch):
         """锁定：目标已含真实 Key（非占位符）时不被 bundled 覆盖，且按目标内容加载。"""

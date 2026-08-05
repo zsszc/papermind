@@ -54,3 +54,16 @@ class TestConfigRedaction:
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
             assert "config.yaml" not in zf.namelist()
             assert "data/x.txt" in zf.namelist()
+
+
+def test_include_db_backs_up_database_outside_data_subdir(tmp_path, monkeypatch):
+    """Electron 兼容：数据库位于运行时根时仍以 data/papers.db 入包。"""
+    database = tmp_path / "papers.db"
+    database.write_bytes(b"sqlite-test")
+    monkeypatch.setattr(backup, "get_project_root", lambda: tmp_path)
+    monkeypatch.setattr(type(backup.config), "data_dir", property(lambda self: tmp_path))
+
+    data = backup.create_backup(dirs=["missing"], include_db=True, include_vector=False)
+
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        assert zf.read("data/papers.db") == b"sqlite-test"

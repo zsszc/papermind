@@ -75,7 +75,7 @@ PaperMind 排查问题依赖单一日志文件 `logs/app.log`（见 AGENTS.md：
 | `logs/` 目录不存在 | 自动创建（含多级父目录） |
 | `logs/` 存在但无写权限 | 模块导入期抛 `OSError`，应用无法启动（显式失败，不降级为纯控制台） |
 | 跨零点长时间运行 | 自动轮转，`app.log` 始终是当天文件，历史文件最多 7 份，更老的在下次轮转时删除 |
-| `PAPERMIND_DATA_DIR` 已设置（Electron 生产包） | **日志仍写项目根 `logs/`**，不跟随数据目录重定向（见第 8 节决策） |
+| `PAPERMIND_DATA_DIR` 已设置（Electron 生产包） | 日志写入 `<PAPERMIND_DATA_DIR>/logs/app.log` |
 | 同一进程内测试多次 import | Python 模块缓存保证只配置一次 |
 | 子 logger（如 `logging.getLogger("papermind.x")`） | 未在项目代码中使用；按 logging 语义会 propagate 到 `papermind` 的 handler |
 
@@ -105,7 +105,7 @@ PaperMind 排查问题依赖单一日志文件 `logs/app.log`（见 AGENTS.md：
   - 日志格式串（文件带时间戳、控制台不带）——**低**：格式错误只影响可读性
   - `logs/` 目录自动创建——**低**：失败会在导入期直接抛错，容易暴露
   - DEBUG 消息被过滤、propagate 默认 True 与 uvicorn root logger 叠加的重复输出现象——**低**：属已知现象无断言
-  - Electron 场景日志不随 `PAPERMIND_DATA_DIR` 重定向——**中**：生产包日志写在 resources 内（只读卷上可能失败），无任何测试守护
+  - Electron 路径重定向已由 Batch 8 统一运行时根目录契约覆盖。
 
 ## 8. 关键设计决策
 
@@ -113,5 +113,5 @@ PaperMind 排查问题依赖单一日志文件 `logs/app.log`（见 AGENTS.md：
 - **双 handler 分工**：文件要全量上下文（时间/级别/logger 名）供事后排查；控制台只留级别和消息，保证开发期终端清爽。两种格式是有意的不一致。
 - **固定 INFO 级别**：单用户本地应用没有多环境日志分级需求，DEBUG 噪音默认关闭；需要时改源码一处即可。
 - **按天轮转保留 7 天**：与「每日凌晨 3 点备份、保留 10 份」的运维节奏一致；本地磁盘占用可预期。
-- **日志路径锚定项目根而非 `config.data_dir`**：历史实现如此——`data_dir` 管数据库与向量库，日志独立放项目根 `logs/`；副作用是 Electron 生产包中日志不随 `PAPERMIND_DATA_DIR` 迁移（AGENTS.md 另记 electron-main.log 在数据目录）。改动此处需同时评估打包场景写权限。
+- **日志路径锚定 `config.runtime_root`**：开发模式仍为项目根 `logs/`；Electron 与主进程日志共同落在应用数据目录。
 - **对 `config.py` 的冗余 import**：`from app.core.config import config` 未被使用，但使 logger 导入连带触发 config 的导入期加载；删除它是安全的最小改动，但目前保持原样（宪法第 6 条最小改动）。

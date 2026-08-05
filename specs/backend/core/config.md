@@ -5,14 +5,14 @@
 
 ## 1. 背景与目标
 
-PaperMind 是本地优先的单用户应用，全部运行时配置（LLM Key、模型、检索参数等）集中存放在项目根 `config.yaml`。本模块提供全局唯一的配置访问入口 `config` 单例：负责在进程启动时定位并加载 YAML 配置文件（含 Electron 生产包的数据目录重定向与占位符 Key 检测），并向全项目提供点分路径读取、写回持久化、数据目录解析三类能力。它的存在让其余模块无需关心配置文件在哪里、是否存在。
+PaperMind 是本地优先的单用户应用，开发模式配置集中存放在项目根 `config.yaml`，Electron 生产模式存放在应用数据目录。本模块提供全局唯一的配置访问入口，并统一解析配置路径、数据库目录与可变运行时文件根目录。
 
 ## 2. 范围
 
 ### 2.1 包含
 
 - `Config` 单例的创建与首次加载时机
-- 配置文件定位逻辑：`PAPERMIND_DATA_DIR` 分支、占位符检测、bundled/example 复制、example 回退
+- 配置文件定位逻辑：`PAPERMIND_DATA_DIR` 分支、example 首次复制与开发模式回退
 - 点分路径读取 `get()`、`config_path` 属性、`reload()`、`save()`、`data_dir` 属性
 - 模块级 `config = Config()` 的导入期副作用
 
@@ -43,8 +43,8 @@ PaperMind 是本地优先的单用户应用，全部运行时配置（LLM Key、
 - **副作用**（文件 I/O，按分支）：
   - 设了 `PAPERMIND_DATA_DIR`（Electron 生产包）：
     1. `mkdir(parents=True, exist_ok=True)` 创建该数据目录；
-    2. 目标为 `<数据目录>/config.yaml`；若项目根 `config.yaml`（bundled，打包进去的真实配置）存在，且目标文件不存在或是占位符配置，则将 bundled 复制覆盖到目标；
-    3. 否则若目标不存在且项目根 `config.yaml.example` 存在，则复制 example 到目标；
+    2. 目标为 `<数据目录>/config.yaml`；目标不存在且项目根 `config.yaml.example` 存在时复制 example；
+    3. 安装包不携带、也绝不复制真实 `config.yaml`；已有用户配置（含占位符或自定义离线配置）不覆盖；
   - 未设 `PAPERMIND_DATA_DIR`（开发模式）：目标为项目根 `config.yaml`；
   - 若最终目标文件不存在，回退为项目根 `config.yaml.example`（只读回退，不复制）；
   - 以 UTF-8 打开目标文件并 `yaml.safe_load`。
@@ -98,7 +98,12 @@ PaperMind 是本地优先的单用户应用，全部运行时配置（LLM Key、
 - **下游调用方**：`database.py`（拼 `papers.db` 的 `DATABASE_URL`）
 - **异常**：无权限创建目录 → `OSError`
 
-### 3.8 模块级 `config = Config()`
+### 3.8 `Config.runtime_root`（property）`-> Path`
+
+- 设置 `PAPERMIND_DATA_DIR` 时返回该目录，否则返回项目根；返回前自动创建。
+- PDF、笔记、概括、论文、向量库、日志、备份和静态文件均从此根目录派生。
+
+### 3.9 模块级 `config = Config()`
 
 - **行为**：模块被导入时立即实例化单例，即首次 import 就完成配置文件定位与加载
 - **副作用**：导入期文件 I/O（创建数据目录、可能复制 config.yaml、读 YAML）；因此**在测试里 monkeypatch 环境变量必须先于首次 import 本模块**
@@ -112,9 +117,9 @@ PaperMind 是本地优先的单用户应用，全部运行时配置（LLM Key、
 | `config.yaml` 内容不是 dict（如纯列表/标量） | `get()` 第一级就因 `isinstance(value, dict)` 失败而返回 default |
 | `get("")`（空 key） | 按单段 key 查找，通常返回 default |
 | `PAPERMIND_DATA_DIR` 指向不存在/未建目录 | 自动 `mkdir -p` 创建 |
-| 数据目录已有真实 Key 的 config.yaml | 不被 bundled 覆盖（`_is_placeholder_config` 为 False 时不复制） |
-| 数据目录 config.yaml 是占位符但 bundled 有真实 Key | bundled 覆盖复制过去 |
-| bundled 不存在且目标不存在 | 复制 example 兜底 |
+| 数据目录已有任意 config.yaml | 原样加载，不被安装包覆盖 |
+| 目标不存在 | 复制 example 兜底 |
+| 已有配置 YAML 损坏 | 抛 `yaml.YAMLError`，原文件保持不变 |
 | `save()` 时从未成功 `_load`（`_config_path=None`） | 静默返回，不写文件 |
 | `save()` 写回 | YAML 注释全部丢失、键顺序按原 dict 顺序（`sort_keys=False`） |
 | 并发调用 `Config()` | 无锁，理论上竞争创建实例；实际项目单进程单线程启动期导入，风险可忽略 |
@@ -128,8 +133,8 @@ PaperMind 是本地优先的单用户应用，全部运行时配置（LLM Key、
 
 - [ ] AC1：开发模式（无 `PAPERMIND_DATA_DIR`）且项目根有 `config.yaml` 时，`config.config_path` 指向它
 - [ ] AC2：项目根 `config.yaml` 缺失时回退到 `config.yaml.example`，`get("llm.model")` 返回 example 中的值
-- [ ] AC3：设置 `PAPERMIND_DATA_DIR` 为临时目录、目标 config 缺失且 bundled 含真实 Key 时，加载后临时目录下出现 bundled 的拷贝
-- [ ] AC4：目标 config 为占位符（含 `sk-xxxx`）时 bundled 覆盖；目标已含真实 Key 时不被覆盖
+- [x] AC3：设置 `PAPERMIND_DATA_DIR` 且目标缺失时只复制 `config.yaml.example`
+- [x] AC4：已有配置不覆盖；损坏配置显式报错且内容不变
 - [ ] AC5：`get("a.b.c")` 在嵌套 dict 中逐层命中；任一层缺失返回传入的 default 且不抛异常
 - [ ] AC6：`save()` 后重新 `reload()`，修改过的键值持久存在
 - [ ] AC7：`data_dir` 在设置 `PAPERMIND_DATA_DIR` 时返回该目录且目录被创建；未设置时返回 `<项目根>/data`（默认）并被创建
@@ -152,7 +157,7 @@ PaperMind 是本地优先的单用户应用，全部运行时配置（LLM Key、
 ## 8. 关键设计决策
 
 - **模块级单例 + 导入期加载**：`config = Config()` 在 import 时即完成文件定位与读取，保证任何模块 `from app.core.config import config` 后立即可用；代价是测试想改环境必须抢在首次 import 之前。
-- **占位符保守判定**：`_is_placeholder_config` 对任何读取/解析异常一律返回 True（视为占位符），宁可被 bundled 覆盖也不让坏配置留在数据目录——这是为 Electron 首启场景设计的自愈逻辑。
+- **真实密钥不进入安装包**：生产首次启动只复制公开模板，用户通过设置界面或应用数据目录配置 Key；升级不得覆盖已有配置。
 - **相对路径一律锚定 `parents[3]`**：满足宪法第 3 条「可移植」，禁止硬编码绝对路径；`data_dir` 同理。
 - **`save()` 不保留注释**：用 `yaml.dump` 全量重写是简单可靠的持久化方案；`config.yaml` 中的注释在首次 `PUT /api/settings` 后会丢失，属已知取舍。
 - **`get()` 静默返回 default**：配置缺失不视为错误，由各消费方自行决定默认值与是否告警（启动期告警统一由 `core/settings.py` 负责），符合分层配置职责划分。
