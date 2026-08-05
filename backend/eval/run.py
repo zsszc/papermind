@@ -25,8 +25,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import platform
 import re
+import subprocess
 import sys
 import time
 from collections import defaultdict
@@ -35,7 +38,9 @@ from typing import Any, Dict, List, Optional
 
 from eval.dataset import load_dataset, resolve_relevant_chunks, validate_dataset
 from eval.metrics import (
-    citation_coverage,
+    citation_f1,
+    citation_precision,
+    citation_recall,
     contains_refusal,
     keyword_hit_rate,
     latency_stats,
@@ -44,11 +49,79 @@ from eval.metrics import (
     recall_at_k,
 )
 
-# 从答案中解析 chunk 引用（形如 p1_c2）
-_CHUNK_ID_RE = re.compile(r"p\d+_c\d+")
+# 只解析显式方括号引用；chunk_index=-1 代表摘要 chunk。
+_CHUNK_ID_RE = re.compile(r"\[(p\d+_c-?\d+)\]")
 
 # 评测报告默认输出目录（backend/eval/reports/）
 DEFAULT_REPORT_DIR = Path(__file__).resolve().parent / "reports"
+
+REPORT_SCHEMA_VERSION = "2.0"
+
+
+def _sha256_bytes(data: bytes) -> str:
+    """返回 bytes 的 SHA256 十六进制摘要。"""
+    return hashlib.sha256(data).hexdigest()
+
+
+def _git_sha() -> Optional[str]:
+    """读取当前 Git 提交；不可用时返回 None，不中断离线评测。"""
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parents[2],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return completed.stdout.strip() or None
+
+
+def _build_benchmark_metadata(db, dataset_path: Path) -> Dict[str, Any]:
+    """构建不含正文的 benchmark 指纹与规模元数据。
+
+    corpus manifest 以 chunk 的稳定定位字段与正文 SHA 组成；报告只保存最终
+    manifest SHA，不保存私有论文正文或逐条正文摘要。
+    """
+    from app.models import Chunk, Paper
+
+    dataset_path = Path(dataset_path)
+    chunks = db.query(Chunk).order_by(Chunk.paper_id, Chunk.chunk_index).all()
+    manifest = [
+        {
+            "paper_id": row.paper_id,
+            "chunk_index": row.chunk_index,
+            "content_sha256": _sha256_bytes((row.content or "").encode("utf-8")),
+        }
+        for row in chunks
+    ]
+    manifest_bytes = json.dumps(
+        manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return {
+        "dataset_sha256": _sha256_bytes(dataset_path.read_bytes()),
+        "corpus_manifest_sha256": _sha256_bytes(manifest_bytes),
+        "n_papers": db.query(Paper).count(),
+        "n_chunks": len(chunks),
+    }
+
+
+def _resolve_qrels_or_raise(db, items: List[Dict[str, Any]]) -> Dict[str, List[str]]:
+    """预解析 qrels；正例无法解析时立即失败，避免混入模型质量分数。"""
+    resolved: Dict[str, List[str]] = {}
+    unresolved: List[str] = []
+    for entry in items:
+        ids = resolve_relevant_chunks(db, entry)
+        resolved[entry["qa_id"]] = ids
+        if entry["has_answer"] and not ids:
+            unresolved.append(entry["qa_id"])
+    if unresolved:
+        raise ValueError(
+            "正例 qrels 无法解析，评测已中止: " + ", ".join(unresolved)
+        )
+    return resolved
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +193,10 @@ class Retriever:
         self.degraded = False
         self.degrade_reason = ""
         self._store = None
+        self.last_query_mode = "keyword-only" if keyword_only else "hybrid"
+        self.last_query_degraded = bool(keyword_only)
+        self.last_query_error: Optional[str] = None
+        self.runtime_degraded_count = 0
 
         if keyword_only:
             self.degraded = True
@@ -144,6 +221,9 @@ class Retriever:
 
     def search(self, query: str) -> List[Dict[str, Any]]:
         """对单条查询返回 top_k 的 chunk 级结果（含 chunk_id 与 content）。"""
+        self.last_query_mode = "keyword-only" if self.degraded else "hybrid"
+        self.last_query_degraded = self.degraded
+        self.last_query_error = None
         keyword_results = _keyword_chunk_search(self.db, query, limit=self.top_k * 2)
         if self.degraded:
             return keyword_results[: self.top_k]
@@ -153,6 +233,10 @@ class Retriever:
         except Exception as e:
             # 运行期语义检索失败：本次查询降级为关键词结果
             print(f"  [warn] 语义检索失败，本条降级为关键词检索: {e}", file=sys.stderr)
+            self.last_query_mode = "keyword-only(runtime-degraded)"
+            self.last_query_degraded = True
+            self.last_query_error = type(e).__name__
+            self.runtime_degraded_count += 1
             return keyword_results[: self.top_k]
         return _rrf_fuse_chunks(semantic_results, keyword_results, self.top_k)
 
@@ -222,6 +306,8 @@ def run_eval(args: argparse.Namespace) -> int:
     db = SessionLocal()
     try:
         t0 = time.time()
+        benchmark = _build_benchmark_metadata(db, Path(args.dataset))
+        resolved_qrels = _resolve_qrels_or_raise(db, items)
         retriever = Retriever(db, top_k=args.top_k, keyword_only=args.keyword_only)
         print(f"[eval] 检索模式: {retriever.mode}"
               + (f"（{retriever.degrade_reason}）" if retriever.degraded else ""))
@@ -229,13 +315,18 @@ def run_eval(args: argparse.Namespace) -> int:
         per_item: List[Dict[str, Any]] = []
         by_type: Dict[str, Dict[str, List[float]]] = defaultdict(
             lambda: {"recall": [], "mrr": [], "ndcg": []})
-        gen_metrics = {"citation_coverage": [], "keyword_hit_rate": []}
+        gen_metrics = {
+            "citation_precision": [],
+            "citation_recall": [],
+            "citation_f1": [],
+            "keyword_hit_rate": [],
+        }
         retrieval_latencies: List[float] = []  # 每次检索的延迟（毫秒）
         negative_total = 0
         negative_refused = 0
 
         for idx, entry in enumerate(items, start=1):
-            relevant_ids = resolve_relevant_chunks(db, entry)
+            relevant_ids = resolved_qrels[entry["qa_id"]]
             search_t0 = time.perf_counter()
             results = retriever.search(entry["question"])
             latency_ms = round((time.perf_counter() - search_t0) * 1000.0, 3)
@@ -249,7 +340,11 @@ def run_eval(args: argparse.Namespace) -> int:
                 "relevant_ids": relevant_ids,
                 "retrieved_ids": retrieved_ids,
                 "latency_ms": latency_ms,
+                "mode_used": retriever.last_query_mode,
+                "degraded": retriever.last_query_degraded,
             }
+            if retriever.last_query_error:
+                record["retrieval_error"] = retriever.last_query_error
 
             if entry["has_answer"]:
                 # 正例：计入检索指标
@@ -269,11 +364,22 @@ def run_eval(args: argparse.Namespace) -> int:
                 record["answer"] = answer
                 if entry["has_answer"]:
                     cited = _extract_citations(answer)
-                    cov = citation_coverage(cited, relevant_ids)
+                    precision = citation_precision(cited, relevant_ids)
+                    recall = citation_recall(cited, relevant_ids)
+                    f1 = citation_f1(cited, relevant_ids)
                     hit = keyword_hit_rate(answer, entry["ground_truth"])
-                    record.update({"citations": cited, "citation_coverage": cov,
-                                   "keyword_hit_rate": hit})
-                    gen_metrics["citation_coverage"].append(cov)
+                    record.update({
+                        "citations": cited,
+                        "citation_precision": precision,
+                        "citation_recall": recall,
+                        "citation_f1": f1,
+                        # 旧字段保持兼容，定义与 citation_recall 相同。
+                        "citation_coverage": recall,
+                        "keyword_hit_rate": hit,
+                    })
+                    gen_metrics["citation_precision"].append(precision)
+                    gen_metrics["citation_recall"].append(recall)
+                    gen_metrics["citation_f1"].append(f1)
                     gen_metrics["keyword_hit_rate"].append(hit)
                 else:
                     refused = contains_refusal(answer)
@@ -304,8 +410,38 @@ def run_eval(args: argparse.Namespace) -> int:
             for qtype, g in sorted(by_type.items())
         ]
 
+        comparison_key = ":".join((
+            benchmark["dataset_sha256"],
+            benchmark["corpus_manifest_sha256"],
+            retriever.mode,
+            str(args.top_k),
+        ))
+        passed = overall[f"recall@{args.top_k}"] >= args.threshold
         report: Dict[str, Any] = {
+            "report_schema": REPORT_SCHEMA_VERSION,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "run": {
+                "git_sha": _git_sha(),
+                "python": platform.python_version(),
+            },
+            "benchmark": {
+                **benchmark,
+                "comparison_key": comparison_key,
+            },
+            "pipeline": {
+                "profile": retriever.mode,
+                "top_k": args.top_k,
+            },
+            "diagnostics": {
+                "unresolved_qrels": [],
+                "runtime_degraded_count": retriever.runtime_degraded_count,
+            },
+            "gate": {
+                "passed": passed,
+                "metric": f"recall@{args.top_k}",
+                "threshold": args.threshold,
+                "actual": overall[f"recall@{args.top_k}"],
+            },
             "dataset": str(args.dataset),
             "top_k": args.top_k,
             "threshold": args.threshold,
@@ -320,12 +456,22 @@ def run_eval(args: argparse.Namespace) -> int:
             "items": per_item,
         }
         if args.with_llm:
-            cov_mean = _mean(gen_metrics["citation_coverage"])
+            precision_mean = _mean(gen_metrics["citation_precision"])
+            recall_mean = _mean(gen_metrics["citation_recall"])
+            f1_mean = _mean(gen_metrics["citation_f1"])
             # C3：citation_coverage 均值同时写入 overall（报告增量字段；
             # trend.py 对缺该字段的旧报告按未知字段忽略，天然兼容）
-            overall["citation_coverage"] = cov_mean
+            overall.update({
+                "citation_precision": precision_mean,
+                "citation_recall": recall_mean,
+                "citation_f1": f1_mean,
+                "citation_coverage": recall_mean,
+            })
             report["generation"] = {
-                "citation_coverage": cov_mean,
+                "citation_precision": precision_mean,
+                "citation_recall": recall_mean,
+                "citation_f1": f1_mean,
+                "citation_coverage": recall_mean,
                 "keyword_hit_rate": _mean(gen_metrics["keyword_hit_rate"]),
                 "negative_refusal_rate": (
                     negative_refused / negative_total if negative_total else None),
@@ -345,7 +491,9 @@ def run_eval(args: argparse.Namespace) -> int:
         print(f"[eval] 负例 {negative_total} 条（不计入检索指标）")
         if args.with_llm:
             g = report["generation"]
-            print(f"[eval] 生成侧: citation_coverage={g['citation_coverage']:.3f} "
+            print(f"[eval] 生成侧: citation_P/R/F1="
+                  f"{g['citation_precision']:.3f}/{g['citation_recall']:.3f}/"
+                  f"{g['citation_f1']:.3f} "
                   f"keyword_hit_rate={g['keyword_hit_rate']:.3f} "
                   f"负例拒答率={g['negative_refusal_rate']}")
 
@@ -358,7 +506,6 @@ def run_eval(args: argparse.Namespace) -> int:
         print(f"[eval] 报告已写入 {report_path}")
 
         # 退出码判定
-        passed = overall[f"recall@{args.top_k}"] >= args.threshold
         print(f"[eval] recall@{args.top_k}={overall[f'recall@{args.top_k}']:.3f} "
               f"阈值={args.threshold} -> {'PASS' if passed else 'FAIL'}")
         return 0 if passed else 1

@@ -161,6 +161,19 @@ class TestWithLlmCitationCoverage:
         assert report["overall"]["citation_coverage"] == pytest.approx(
             report["generation"]["citation_coverage"])
 
+    def test_report_separates_citation_precision_recall_and_f1(
+            self, eval_env, monkeypatch):
+        """Batch 12：报告不能再用单一 coverage 掩盖错误引用。"""
+        monkeypatch.setattr(
+            "app.services.llm.llm_service.chat_completion_sync", _fake_llm_answer)
+        report = _run_and_load_report(eval_env, ["--with-llm"])
+
+        generation = report["generation"]
+        assert generation["citation_precision"] == pytest.approx(0.5)
+        assert generation["citation_recall"] == pytest.approx(0.5)
+        assert generation["citation_f1"] == pytest.approx(0.5)
+        assert report["overall"]["citation_f1"] == pytest.approx(0.5)
+
     def test_per_item_citation_coverage(self, eval_env, monkeypatch):
         """per-item 正例记录含 citation_coverage（既有行为，此处锁定）。"""
         monkeypatch.setattr(

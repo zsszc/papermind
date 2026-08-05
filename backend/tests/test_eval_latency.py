@@ -185,6 +185,20 @@ class TestRunReportLatency:
         assert latency["mean"] == pytest.approx(expected["mean"])
         assert latency["count"] == expected["count"]
 
+    def test_report_v2_contains_comparison_evidence(self, eval_env):
+        """Batch 12：质量报告必须携带可比性指纹与 gate 结果。"""
+        report = self._run_and_load_report(eval_env)
+
+        assert report["report_schema"] == "2.0"
+        assert len(report["benchmark"]["dataset_sha256"]) == 64
+        assert len(report["benchmark"]["corpus_manifest_sha256"]) == 64
+        assert report["benchmark"]["n_chunks"] == 2
+        assert report["pipeline"]["top_k"] == 5
+        assert report["diagnostics"]["unresolved_qrels"] == []
+        assert report["diagnostics"]["runtime_degraded_count"] == 0
+        assert report["gate"]["passed"] is True
+        assert all("mode_used" in item for item in report["items"])
+
 
 # ---------------------------------------------------------------------------
 # trend.py 兼容：缺 latency 字段的旧报告不崩；含 latency 的新报告同样不崩

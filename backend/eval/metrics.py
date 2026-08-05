@@ -6,7 +6,8 @@
 - ndcg_at_k：二值相关性下的归一化折损累计增益
 
 生成侧指标（轻量、可复现）：
-- citation_coverage：答案引用中命中期望 chunk 的比例
+- citation_precision / citation_recall / citation_f1：引用正确性与覆盖程度
+- citation_coverage：citation_recall 的向后兼容别名
 - keyword_hit_rate：答案覆盖参考答案要点的比例
 
 性能侧指标：
@@ -103,8 +104,11 @@ def ndcg_at_k(retrieved_ids: Sequence, relevant_ids: Sequence, k: int) -> float:
     if not relevant or k <= 0:
         return 0.0
 
+    # 同一个结果 id 只允许贡献一次相关性；否则 [a, a] 对 relevant=[a]
+    # 会重复累计 DCG，甚至得到大于 1 的非法 NDCG。
+    unique_retrieved = list(dict.fromkeys(retrieved_ids or []))[:k]
     dcg = 0.0
-    for i, rid in enumerate(list(retrieved_ids or [])[:k]):
+    for i, rid in enumerate(unique_retrieved):
         if rid in relevant:
             dcg += 1.0 / math.log2(i + 2)  # i 为 0 起，位置 = i + 1
 
@@ -115,11 +119,38 @@ def ndcg_at_k(retrieved_ids: Sequence, relevant_ids: Sequence, k: int) -> float:
     return dcg / idcg
 
 
-def citation_coverage(answer_citations: Sequence, relevant_ids: Sequence) -> float:
-    """引用覆盖率：答案引用的 chunk 中，命中期望 chunk 的比例。
+def citation_precision(answer_citations: Sequence, relevant_ids: Sequence) -> float:
+    """引用精确率：答案给出的引用中，有多少属于期望证据。"""
+    cited = _as_id_set(answer_citations)
+    if not cited:
+        return 0.0
+    relevant = _as_id_set(relevant_ids)
+    return len(cited & relevant) / len(cited)
 
-    以期望集合为分母（关注的不是引用是否「多」，而是该引的有没有引到）：
-        |citations ∩ relevant| / |relevant|
+
+def citation_recall(answer_citations: Sequence, relevant_ids: Sequence) -> float:
+    """引用召回率：期望证据中，有多少被答案引用。"""
+    relevant = _as_id_set(relevant_ids)
+    if not relevant:
+        return 0.0
+    cited = _as_id_set(answer_citations)
+    return len(cited & relevant) / len(relevant)
+
+
+def citation_f1(answer_citations: Sequence, relevant_ids: Sequence) -> float:
+    """引用 F1：引用精确率与召回率的调和平均。"""
+    precision = citation_precision(answer_citations, relevant_ids)
+    recall = citation_recall(answer_citations, relevant_ids)
+    if precision + recall == 0.0:
+        return 0.0
+    return 2.0 * precision * recall / (precision + recall)
+
+
+def citation_coverage(answer_citations: Sequence, relevant_ids: Sequence) -> float:
+    """向后兼容的引用覆盖率，定义等同于 ``citation_recall``。
+
+    历史报告使用 ``citation_coverage`` 名称，但其分母一直是期望集合，实际
+    表达引用召回而非引用精确率。新代码应优先使用 citation P/R/F1 三项。
 
     参数：
         answer_citations: 从答案中解析出的引用 chunk id 列表。
@@ -128,11 +159,7 @@ def citation_coverage(answer_citations: Sequence, relevant_ids: Sequence) -> flo
     返回：
         范围 [0, 1]；relevant_ids 为空时返回 0.0。
     """
-    relevant = _as_id_set(relevant_ids)
-    if not relevant:
-        return 0.0
-    cited = _as_id_set(answer_citations)
-    return len(cited & relevant) / len(relevant)
+    return citation_recall(answer_citations, relevant_ids)
 
 
 def split_ground_truth_keywords(ground_truth: Union[str, Sequence[str]]) -> List[str]:
