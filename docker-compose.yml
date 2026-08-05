@@ -15,6 +15,9 @@
 #   - 可选：Langfuse 自托管可观测性栈位于独立 langfuse profile（默认不启动），
 #     启用与对接方式见 docs/DEPLOY.md「5. Langfuse 可观测性（可选）」。
 
+# 显式项目名：项目目录为中文（个人知识库）时 compose 自动派生的项目名为空会报错
+name: papermind
+
 # Langfuse v3 web / worker 共享环境变量（YAML 锚点复用）
 x-langfuse-common-env: &langfuse-common-env
   DATABASE_URL: postgresql://langfuse:${LANGFUSE_POSTGRES_PASSWORD:-postgres}@postgres:5432/langfuse
