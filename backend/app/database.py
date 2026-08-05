@@ -75,9 +75,44 @@ def _apply_schema_migrations():
         logger.warning(f"[schema] 轻量级迁移失败: {e}", exc_info=True)
 
 
+# 新表迁移 DDL（Phase G / G1）：与 models.PaperCitation 保持一致的列定义。
+# 旧库无此表时由 ensure_schema 分支创建；CREATE TABLE IF NOT EXISTS 保证幂等。
+_PAPER_CITATIONS_DDL = """
+CREATE TABLE IF NOT EXISTS paper_citations (
+    id INTEGER PRIMARY KEY,
+    citing_id INTEGER NOT NULL REFERENCES papers(id),
+    cited_id INTEGER NOT NULL REFERENCES papers(id),
+    created_at DATETIME,
+    CONSTRAINT uq_paper_citations_pair UNIQUE (citing_id, cited_id)
+)
+"""
+
+
+def ensure_paper_citations_table(target_engine=None):
+    """确保 paper_citations 引用边表存在（旧库建表迁移，幂等）。
+
+    与既有迁移分支同构：仅当 papers 主表已存在（真实旧库）时才建表；
+    全新空库跳过——新库建表归 Base.metadata.create_all 负责。
+    """
+    eng = target_engine or engine
+    try:
+        with eng.connect() as conn:
+            papers_exists = conn.exec_driver_sql(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='papers'"
+            ).fetchone()
+            if not papers_exists:
+                return
+            conn.exec_driver_sql(_PAPER_CITATIONS_DDL)
+            conn.commit()
+        logger.info("[schema] paper_citations 表检查/创建完成")
+    except Exception as e:
+        logger.warning(f"[schema] paper_citations 迁移失败: {e}", exc_info=True)
+
+
 def ensure_schema():
     """在 Base.metadata.create_all 之后调用，保证旧数据库也能对齐新列。"""
     _apply_schema_migrations()
+    ensure_paper_citations_table()
 
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

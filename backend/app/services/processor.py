@@ -3,9 +3,11 @@ from typing import List, Dict, Any, Optional
 
 from sqlalchemy.orm import Session
 
+from app.core.logger import logger
 from app.models import Paper, Chunk
 from app.services.pdf_parser import PDFParser
 from app.services.embedding import TextChunker
+from app.services.reference_parser import rebuild_citation_edges
 from app.services.retrieval import get_vector_store
 
 
@@ -70,6 +72,14 @@ class PaperProcessor:
             "year": paper.year,
         }
         self.vector_store.add_chunks(paper.id, db_chunks, paper_metadata)
+
+        # 6. 参考文献解析建引用边（Phase G / G1；失败隔离：仅记 warning，不影响入库主流程）
+        try:
+            full_text = "\n".join((p.get("text") or "") for p in pages)
+            rebuild_citation_edges(db, paper.id, full_text)
+        except Exception as e:
+            db.rollback()
+            logger.warning(f"[references] 引用边构建失败 paper_id={paper.id}: {e}", exc_info=True)
 
         return {
             "status": "ok",

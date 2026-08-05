@@ -9,6 +9,7 @@ from sqlalchemy import (
     ForeignKey,
     JSON,
     Table,
+    UniqueConstraint,
     event,
 )
 from sqlalchemy.orm import relationship
@@ -244,3 +245,21 @@ class PaperAnnotation(Base):
 
 
 Paper.annotations = relationship("PaperAnnotation", back_populates="paper", cascade="all, delete-orphan")
+
+
+class PaperCitation(Base):
+    """文献间引用边（Phase G / G1）：citing_id 引用了 cited_id。"""
+
+    __tablename__ = "paper_citations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    citing_id = Column(Integer, ForeignKey("papers.id"), nullable=False)
+    cited_id = Column(Integer, ForeignKey("papers.id"), nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("citing_id", "cited_id", name="uq_paper_citations_pair"),
+    )
+
+    citing_paper = relationship("Paper", foreign_keys=[citing_id])
+    cited_paper = relationship("Paper", foreign_keys=[cited_id])
