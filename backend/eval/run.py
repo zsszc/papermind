@@ -16,6 +16,7 @@
 - 每次检索用 time.perf_counter() 计时（毫秒），逐条记入 item 的 latency_ms，
   汇总经 metrics.latency_stats 得到 {p50, p95, mean, count} 写入报告顶层 latency 字段；
 - --with-llm 时走 llm_service 生成答案，计算 citation_coverage / keyword_hit_rate，
+  其中 citation_coverage 均值同时写入报告 overall（Phase C / C3 增量字段），
   并对负例检查是否出现「不知道/无法回答」类拒答表述；
 - 控制台打印汇总表格，JSON 报告写入 eval/reports/<timestamp>.json（目录自动创建）；
 - 退出码：正例 recall@k 均值低于 --threshold（默认 0.5）时返回 1，否则 0（供 CI 使用）。
@@ -319,8 +320,12 @@ def run_eval(args: argparse.Namespace) -> int:
             "items": per_item,
         }
         if args.with_llm:
+            cov_mean = _mean(gen_metrics["citation_coverage"])
+            # C3：citation_coverage 均值同时写入 overall（报告增量字段；
+            # trend.py 对缺该字段的旧报告按未知字段忽略，天然兼容）
+            overall["citation_coverage"] = cov_mean
             report["generation"] = {
-                "citation_coverage": _mean(gen_metrics["citation_coverage"]),
+                "citation_coverage": cov_mean,
                 "keyword_hit_rate": _mean(gen_metrics["keyword_hit_rate"]),
                 "negative_refusal_rate": (
                     negative_refused / negative_total if negative_total else None),

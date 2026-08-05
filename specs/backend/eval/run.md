@@ -115,7 +115,7 @@
 | `degraded` / `degrade_reason` | bool / str | 降级标志与原因（未降级原因为 `""`） |
 | `with_llm` | bool | 是否含生成侧 |
 | `elapsed_seconds` | float | 保留两位小数 |
-| `overall` | dict | `{f"recall@{k}", "mrr", f"ndcg@{k}", "n_positive", "n_negative"}`——**指标键名嵌 k 值** |
+| `overall` | dict | `{f"recall@{k}", "mrr", f"ndcg@{k}", "n_positive", "n_negative"}`——**指标键名嵌 k 值**；`--with-llm` 时另有 `citation_coverage`（生成侧均值，Phase C / C3 增量字段，旧报告无此键） |
 | `by_question_type` | list[dict] | `{question_type, n, recall, mrr, ndcg}`，按类型名排序 |
 | `items` | list[dict] | 逐条记录：必有 `{qa_id, question_type, has_answer, relevant_ids, retrieved_ids}`；正例另有 `{recall, mrr, ndcg}`；`--with-llm` 正例另有 `{answer, citations, citation_coverage, keyword_hit_rate}`、负例另有 `{answer, refused}` |
 | `generation` | dict（**仅 `--with-llm`**） | `{citation_coverage, keyword_hit_rate, negative_refusal_rate, negative_refused, negative_total}`；**无负例时 `negative_refusal_rate` 为 `None`（JSON null）** |
@@ -182,12 +182,13 @@
 - **盲区**（按严重程度标注）：
   - **高**：`run_eval` 主流程全链路无测试——逐条编排、正/负例分流、分组均值、报告写入与 schema、退出码判定（AC6）均无覆盖；CI 门禁（退出码）本身无回归保护
   - **高**：`Retriever` 降级三分支（keyword-only / available() 为假 / 初始化异常）与 `search` 运行期单条降级（AC7）无测试
-  - **高**：`--with-llm` 生成侧流程（答案记录、引用提取、citation_coverage/keyword_hit_rate 聚合、负例拒答率、LLM 错误串被当 answer 记录的带内错误路径）无测试
+  - **高**：`--with-llm` 生成侧流程（答案记录、引用提取、citation_coverage/keyword_hit_rate 聚合、负例拒答率、LLM 错误串被当 answer 记录的带内错误路径）无测试——**部分已实现（Phase C）**：`tests/test_eval_citation_coverage.py` 覆盖 citation_coverage 接入（overall 增量字段、per-item 值、错误串按 0 计、负例隔离）与 trend 兼容；keyword_hit_rate 聚合与负例拒答率仍无直接断言
   - **中**：`_keyword_chunk_search` 的打分（token 出现次数累加）、排序（`-score, chunk_id`）、`limit` 截断、空白查询返回 `[]`、无空格中文整句作单 token 的行为无测试
   - **中**：`_rrf_fuse_chunks` 的 RRF 计分、chunk_id 去重、载体首选语义路、top_k 截断无测试（路由层论文级 RRF 同样无直接单测，见 retrieval.md 第 7 节）
   - **中**：报告 schema 与 `eval/trend.py` 的键名耦合（`recall@{k}` 嵌 k 键名、`by_question_type` 结构）无契约测试——改键名两处同时漂移的风险存在
   - **低**：`_extract_citations` 的去重保序、误命中非引用语境的 `p\d+_c\d+` 串无测试；报告文件名秒级碰撞覆盖无测试
   - **低**：`_print_table` 控制台输出格式、进度行 `\r` 覆盖行为无测试
+- **C3：citation_coverage 接入 `--with-llm` 流程——已实现（Phase C）**：`--with-llm` 时 `overall.citation_coverage` 写入报告（与 `generation.citation_coverage` 同源的生成侧均值）；trend.py 无需改动即兼容缺该字段的旧报告（未知字段忽略，同 B4 模式）；覆盖测试 `tests/test_eval_citation_coverage.py`（mock LLM 端到端 + trend 兼容，绝不真实调用 LLM）
 
 ## 8. 关键设计决策
 
