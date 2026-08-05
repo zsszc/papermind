@@ -5,6 +5,7 @@
 - 异常原文 + 堆栈只写日志（logger.error(..., exc_info=True) 或等价）。
 """
 
+import copy
 import logging
 
 from app.core.config import config
@@ -22,12 +23,16 @@ def test_put_save_failure_sanitizes_detail(client, monkeypatch, caplog):
     monkeypatch.setattr(config, "save", boom)
 
     # save 被 mock 不落盘，但路由会直改内存单例 _config，测试后还原避免污染其他用例
-    saved_llm = dict(config._config.get("llm", {}))
+    original_config = copy.deepcopy(config._config)
+    config._config = copy.deepcopy(original_config)
+    config._config.setdefault("llm", {})["api_key"] = "sk-test-original-key"
+    saved_config = copy.deepcopy(config._config)
     try:
         with caplog.at_level(logging.ERROR, logger="papermind"):
             r = client.put("/api/settings", json={"llm_api_key": "newkey123456"})
+        assert config._config == saved_config
     finally:
-        config._config["llm"] = saved_llm
+        config._config = original_config
 
     assert r.status_code == 500
     detail = r.json()["detail"]

@@ -94,7 +94,7 @@ cp ../config.yaml.example ../config.yaml
 # 编辑 ../config.yaml，填入你的 Kimi API Key
 
 # 开发模式（热重载）
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
 ### 3. 前端启动

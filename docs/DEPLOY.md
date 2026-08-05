@@ -97,7 +97,7 @@ Dockerfile 中同时声明了 `VOLUME`，即使不用 compose、直接 `docker r
 
 ```bash
 docker build -t papermind .
-docker run -d --name papermind -p 8000:8000 \
+docker run -d --name papermind -p 127.0.0.1:8000:8000 \
   -v $(pwd)/config.yaml:/app/config.yaml:ro \
   -v papermind-data:/app/data \
   -v $(pwd)/papers:/app/papers \
@@ -180,4 +180,4 @@ A：后端配置加载会自动回退到 `config.yaml.example`（已拷贝进镜
 A：PaperMind 定位为本地单用户应用，前端开发期用 Vite dev server，生产分发走 Electron 桌面包（`npm run electron:build`）。Docker 部署面向"后端服务化"场景，故仅打包后端。
 
 **Q：端口冲突？**
-A：修改 `docker-compose.yml` 中 `ports` 左侧的宿主机端口，如 `"8080:8000"`。
+A：修改 `docker-compose.yml` 中 `ports` 的宿主机端口，如 `"127.0.0.1:8080:8000"`。

@@ -32,7 +32,7 @@ if curl -s --fail http://127.0.0.1:8000/api/health >/dev/null 2>&1; then
     BACKEND_PID=""
 else
     echo "[demo] 启动后端..."
-    $BACKEND_PYTHON -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1 > logs/demo-backend.log 2>&1 &
+    $BACKEND_PYTHON -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1 > logs/demo-backend.log 2>&1 &
     BACKEND_PID=$!
 
     for i in $(seq 1 30); do

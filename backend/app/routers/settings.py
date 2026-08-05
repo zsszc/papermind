@@ -1,4 +1,4 @@
-from typing import Any, Dict
+import copy
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -46,6 +46,7 @@ def get_settings():
 @router.put("")
 def update_settings(payload: SettingsUpdate):
     """更新设置并持久化到 config.yaml。"""
+    previous_config = copy.deepcopy(config._config)
     try:
         cfg = config._config
 
@@ -67,6 +68,7 @@ def update_settings(payload: SettingsUpdate):
         logger.info("[settings] 配置已更新")
         return {"ok": True}
     except Exception as e:
+        config._config = previous_config
         # 宪法第 13 条：异常原文只进日志，响应 detail 用通用文案不透传
         logger.error(f"[settings] 更新配置失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="保存配置失败，请稍后再试")

@@ -55,12 +55,12 @@
   - `llm_model` / `llm_base_url` 可选；空串 / None → 忽略；
   - 三项写入前均 `strip()`。
 - **输出**：`{"ok": true}`
-- **行为**：直接改内存单例 `config._config` 的 `llm` 节（`llm` 键不存在时先建空 dict），然后 `config.save()` 把**整个配置 dict** dump 回 `config.config_path`（`yaml.dump`，`allow_unicode=True`，`sort_keys=False`）——**全量重写配置文件**，YAML 注释与键序不保留；内存与磁盘同步生效，**无需重启**，后续 LLM 调用立即用新值
+- **行为**：修改前深拷贝内存配置；更新 `config._config` 的 `llm` 节后调用 `config.save()` 原子写入私有 `config.yaml`。成功后内存与磁盘同步生效，**无需重启**。
 - **副作用**：
   - 磁盘写入：覆盖式重写 `config.yaml`（明文含 API Key——该文件已 gitignore，宪法第 14 条）；
-  - **边界**：若用户从未创建 `config.yaml`（`Config` 回退加载了 `config.yaml.example`），`save()` 会**覆盖写 `config.yaml.example`**（config_path 指向谁就写谁）；
+  - 若此前只加载了 `config.yaml.example`，保存会新建同目录私有 `config.yaml`，模板保持不变；
   - 日志：`logger.info("[settings] 配置已更新")`。
-- **异常**：任何异常（磁盘只读、YAML dump 失败等）→ `logger.error(..., exc_info=True)` + `HTTPException(500, detail="保存配置失败，请稍后再试")`——**通用文案不透传异常原文**（原文+堆栈仅入 `logs/app.log`，宪法第 13 条；**已修复（Batch7b-F8）**，修复前 detail 直给 `f"保存配置失败: {e}"`）；此时内存中的 `_config` **可能已被部分修改但未落盘**，内存与磁盘短暂不一致（重启后按磁盘恢复）。
+- **异常**：任何异常（磁盘只读、YAML dump 失败等）→ 先恢复请求前内存快照，再记录完整日志并返回 `HTTPException(500, detail="保存配置失败，请稍后再试")`；响应不透传异常原文。
 - **校验缺失**：`llm_api_key` 无法通过本端点**删除**（空串被忽略）；`llm_model` / `llm_base_url` 同理只能改不能清；对 key 格式（`sk-` 前缀等）无任何校验。
 
 ## 4. 边界条件与错误处理
@@ -75,8 +75,8 @@
 | PUT `llm_api_key: ""` | 忽略（无法经 API 清空 Key） |
 | PUT `llm_model: ""` / `llm_base_url: ""` | 忽略，保留旧值 |
 | PUT 值首尾带空白 | `strip()` 后入库与落盘 |
-| 磁盘写失败（只读、权限） | 500，detail 为通用文案「保存配置失败，请稍后再试」，异常原文仅入日志（已修复 Batch7b-F8）；内存已改、磁盘未改，不一致至重启 |
-| `config.yaml` 不存在（用了 example 回退） | PUT 成功后 `config.yaml.example` 被覆盖写入真实配置 |
+| 磁盘写失败（只读、权限） | 500，detail 为通用文案，异常原文仅入日志，内存恢复为请求前状态 |
+| `config.yaml` 不存在（用了 example 回退） | PUT 成功后新建私有 `config.yaml`，example 不变 |
 | 并发 PUT | 无锁；后到的 save 全量覆盖先到的（单用户场景视为可接受） |
 
 ## 5. 依赖
@@ -91,6 +91,7 @@
 - [ ] AC3：PUT 把 GET 到的脱敏 key 原样回传 → 配置中的真实 Key 不被 `*` 覆盖
 - [ ] AC4：PUT 缺 `llm_api_key` → 422
 - [ ] AC5：PUT 成功后 `config.config_path` 文件内容与内存一致（`llm` 节三项为新值）
+- [x] AC6：PUT 保存失败时响应脱敏且内存配置回滚
 
 ## 7. 现有测试覆盖与盲区
 
@@ -100,13 +101,13 @@
   - PUT 全链路（AC2、AC3、AC5）零测试：脱敏值回传保护、「含 `*` 不覆盖真 Key」这一关键安全行为无固化（**高**，一旦被重构破坏，前端保存设置即把真 Key 洗成 `****` 且无任何告警）
   - `_mask_key` 的边界（空、≤8 全星、>8 露前 4 后 4）无参数化测试（**中**）
   - PUT 422（缺必填 key）、空串忽略语义、strip 行为无测试（**中**）
-  - ~~保存失败路径（500 + detail 含异常原文、内存/磁盘不一致）无测试~~ **已修复（Batch7b-F8）**：detail 改通用文案「保存配置失败，请稍后再试」、原文+堆栈仅入日志，`tests/test_settings_put.py::test_put_save_failure_sanitizes_detail` 固化（特征串/类型名不出现 + caplog 断言原文入日志）；内存/磁盘短暂不一致的边界语义保留
-  - 「`config.yaml` 缺失时覆盖写 `config.yaml.example`」的边界无测试（**低**）
+  - 保存失败路径已由 `tests/test_settings_put.py` 覆盖响应脱敏、日志记录与内存回滚
+  - 从 example 保存到私有配置、原子性和权限由 `tests/test_config_save.py` 覆盖
   - 全量重写 YAML 丢注释/键序的行为无测试（**低**）
 
 ## 8. 关键设计决策
 
 - **GET 必脱敏、PUT 拒收脱敏值**：配套闭环——前端表单可以安全地把 GET 到的 masked key 回填进输入框原样提交，真 Key 不会被 `*` 覆盖；这是本模块最重要的安全契约（宪法第 14 条）
-- **直改单例 + 全量 `yaml.dump` 回写**：实现最简、改后无需重启即生效；代价是配置文件注释与键序全部丢失，且 `config.yaml` 缺失时会污染 `config.yaml.example`——引入保留注释的 YAML 库（如 ruamel）前，以现状为准
+- **快照后更新 + 原子回写**：改后无需重启即生效；失败时恢复内存快照，磁盘由 `Config.save()` 保证不被截断。配置文件注释仍会丢失。
 - **只开放 `llm` 三项**：embedding 模型等其余配置涉及本地模型加载等重资产，刻意不开放 API 修改；`SettingsUpdate` 加字段即可扩展，但须同步补 PUT 测试（当前零覆盖）
 - **~~异常 detail 直给原文~~已收紧（Batch7b-F8）**：原「`HTTPException` 绕过全局脱敏属已知现状」的取舍按宪法第 13 条收口——detail 改通用文案、异常原文仅入日志（`exc_info=True`），脱敏测试已固化

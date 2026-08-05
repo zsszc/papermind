@@ -1,7 +1,9 @@
 import os
-import yaml
+import tempfile
 from pathlib import Path
 from typing import Any
+
+import yaml
 
 
 class Config:
@@ -60,11 +62,36 @@ class Config:
         self._load()
 
     def save(self):
-        """将当前配置写回文件。"""
+        """将当前配置原子写入私有配置文件。"""
         if not self._config_path:
             return
-        with open(self._config_path, "w", encoding="utf-8") as f:
-            yaml.dump(self._config, f, allow_unicode=True, sort_keys=False, default_flow_style=False)
+
+        target = self._config_path
+        if target.name.endswith(".example"):
+            target = target.with_name(target.name[: -len(".example")])
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
+        )
+        temp_path = Path(temp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                yaml.dump(
+                    self._config,
+                    f,
+                    allow_unicode=True,
+                    sort_keys=False,
+                    default_flow_style=False,
+                )
+                f.flush()
+                os.fsync(f.fileno())
+            temp_path.chmod(0o600)
+            os.replace(temp_path, target)
+            self._config_path = target
+        except Exception:
+            temp_path.unlink(missing_ok=True)
+            raise
 
     @property
     def runtime_root(self) -> Path:

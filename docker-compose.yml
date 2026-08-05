@@ -58,7 +58,7 @@ services:
     build: .
     container_name: papermind-backend
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
       # BGE-M3 首次启动在线下载，走 hf-mirror.com 镜像站
       HF_ENDPOINT: https://hf-mirror.com
@@ -115,7 +115,7 @@ services:
       minio:
         condition: service_started
     ports:
-      - "3001:3000"
+      - "127.0.0.1:3001:3000"
     environment:
       <<: *langfuse-common-env
       NEXTAUTH_URL: ${LANGFUSE_NEXTAUTH_URL:-http://localhost:3001}
