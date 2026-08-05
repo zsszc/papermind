@@ -19,6 +19,7 @@ from app.services.agent_graph import (
     SYSTEM_PROMPT,
     build_rag_prompt as _build_rag_prompt,
     run_pre_orchestration,
+    verify_citations,
 )
 
 router = APIRouter()
@@ -330,12 +331,15 @@ async def chat(request: ChatRequest, db: Session = Depends(get_db)):
 
         # 保存助手回复（使用新的 Session，避免原 Session 已关闭）
         if full_content.strip():
+            # Phase C C1：落库前校验引用忠实度——剔除越界 [^n^] 标记，
+            # citations 附 verified / removed（不阻塞返回，先观测）
+            cleaned_content, verify_report = verify_citations(full_content, retrieved)
             from app.database import SessionLocal
             with SessionLocal() as new_db:
                 assistant_msg = Message(
                     conversation_id=conv_id,
                     role="assistant",
-                    content=full_content,
+                    content=cleaned_content,
                     citations=[{
         "source": r["source"],
         "paper_id": r["paper_id"],
@@ -344,6 +348,8 @@ async def chat(request: ChatRequest, db: Session = Depends(get_db)):
         "year": r.get("year"),
         "page_number": r.get("page_number"),
         "content": r.get("content"),
+        "verified": verify_report["verified"],
+        "removed": verify_report["removed"],
     } for r in retrieved],
                 )
                 new_db.add(assistant_msg)

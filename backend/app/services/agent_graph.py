@@ -18,8 +18,9 @@
 无需真实 LLM / embedding。
 """
 
+import re
 import threading
-from typing import Any, Dict, List, Optional, TypedDict
+from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 from sqlalchemy.orm import Session
@@ -44,9 +45,57 @@ SYSTEM_PROMPT = """你是 PaperMind，一位专业的学术文献助手。你正
 # 联网搜索提示（与原 chat.py 内嵌版本逐字一致）
 WEB_SEARCH_HINT = "用户问题可能涉及最新信息。如果现有文献片段不足以回答，请调用联网搜索工具获取最新资料并标注来源。"
 
+# 零检索拒答硬约束（Phase C C2）：检索结果为空时追加到 system prompt 尾部
+NO_RETRIEVAL_GUARD = "未检索到相关文献片段。必须明确回答「文献库中没有相关内容」，禁止编造任何引用标记。"
+
 # 注入的历史消息条数上限与检索 top_k（与原 chat.py 保持一致）
 HISTORY_LIMIT = 10
 RETRIEVE_TOP_K = 5
+
+# 引用标记正则：[^n^]，n 为整数（允许负数形式以便识别后剔除，编号为 1-based）
+_CITATION_MARKER_PATTERN = re.compile(r"\[\^(-?\d+)\^\]")
+
+
+def verify_citations(
+    answer_text: str, retrieved_chunks: List[Dict[str, Any]]
+) -> Tuple[str, Dict[str, Any]]:
+    """校验答案中的 [^n^] 引用标记是否落在本次检索片段编号范围内（Phase C C1）。
+
+    - 1 <= n <= len(retrieved_chunks) 的标记保留并计入有效引用；
+    - 越界（含 0、负数）或零检索时的标记从文本剔除（保留语句本身）；
+    - 返回 (清洗后文本, {"total", "valid", "removed", "verified"})，
+      全部有效或无引用时 verified=True，有剔除时 verified=False；
+    - 有剔除时记 [guardrails] warning（脱敏：只记编号列表，不记答案全文）。
+
+    幂等纯函数：无 DB / 网络 / LLM 调用，可直接单测。
+    """
+    total = 0
+    valid = 0
+    removed_indices: List[int] = []
+
+    def _replace(match: "re.Match[str]") -> str:
+        nonlocal total, valid
+        total += 1
+        n = int(match.group(1))
+        if 1 <= n <= len(retrieved_chunks):
+            valid += 1
+            return match.group(0)
+        removed_indices.append(n)
+        return ""
+
+    cleaned = _CITATION_MARKER_PATTERN.sub(_replace, answer_text)
+    removed = total - valid
+    if removed:
+        logger.warning(
+            f"[guardrails] 剔除越界引用标记 {removed_indices}"
+            f"（本次检索片段数={len(retrieved_chunks)}）"
+        )
+    return cleaned, {
+        "total": total,
+        "valid": valid,
+        "removed": removed,
+        "verified": removed == 0,
+    }
 
 
 def build_rag_prompt(query: str, retrieved: List[dict]) -> str:
@@ -157,14 +206,21 @@ def retrieve(state: AgentState) -> Dict[str, Any]:
 
 def build_messages(state: AgentState) -> Dict[str, Any]:
     """节点3：组装最终消息列表，并判定联网搜索开关（顺序与原 chat.py 一致）。"""
+    chunks = state.get("context_chunks") or []
+
+    # Phase C C2：零检索时在 system prompt 尾部追加拒答硬约束段；
+    # 有检索结果时 prompt 与现状一致（不回归）
+    system_content = state["system_prompt"]
+    if not chunks:
+        system_content += f"\n\n{NO_RETRIEVAL_GUARD}"
+
     messages: List[Dict[str, str]] = [
-        {"role": "system", "content": state["system_prompt"]}
+        {"role": "system", "content": system_content}
     ]
     # 历史消息（history 中已包含当前 user 消息）
     messages.extend(state.get("history_messages") or [])
 
     # 检索结果作为 system 上下文追加到最后
-    chunks = state.get("context_chunks") or []
     if chunks:
         messages.append(
             {"role": "system", "content": build_rag_prompt(state["user_message"], chunks)}

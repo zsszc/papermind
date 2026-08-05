@@ -158,7 +158,7 @@
 | 完成 | `{"delta": "", "finished": true, "conversation_id": N, "citations": <原始 retrieved chunk dict 列表>}` |
 | 错误 | `{"error": "..."}`——**前端 ChatPanel 兼容解析，但当前后端所有端点从不产生**；LLM 失败走带内错误串（作为普通 delta，随后照常发 finished 帧，错误串会随 `full_content` 落库） |
 
-- **落库时序**：尾帧**之前**完成 assistant 落库——`full_content.strip()` 非空才写库（全空回复不落库）；落库用新 `SessionLocal`；落库 `citations` 为裁剪版 7 键 dict，与尾帧的原始 dict 不同。
+- **落库时序**：尾帧**之前**完成 assistant 落库——`full_content.strip()` 非空才写库（全空回复不落库）；落库用新 `SessionLocal`；落库 `citations` 为裁剪版 7 键 dict，与尾帧的原始 dict 不同。**Phase C C1（已实现）**：落库前调用 `agent_graph.verify_citations(full_content, retrieved)` 校验引用忠实度——越界 `[^n^]` 标记从落库文本剔除（保留语句本身），落库 citations 每条追加 `verified`（有剔除为 false）与 `removed` 计数两键（7 键 → 9 键）；不阻塞返回、SSE 帧格式不变；有剔除时记 `[guardrails]` warning 日志（脱敏，只记编号列表）。非流式分支与 regenerate 路径本轮不接入（phase-c-guardrails spec 2.2）。
 - **取消语义**：每发一帧后 `await asyncio.sleep(0)` 让出控制权，使客户端断开能触发 `asyncio.CancelledError` → 记 `[chat]` info 日志并 return；**已提交的用户消息与 `message_count` 保留（计数因此比实际消息数多 1）**，assistant 消息不落库。
 - `analyze-image` 的帧为子集：`{"delta", "finished"}`，无 `conversation_id` / `citations`。
 
@@ -221,6 +221,7 @@
 
 ## 7. 现有测试覆盖与盲区
 
+- **已实现（Phase C）**：C1 路由集成——mock LLM 输出含越界引用，SSE 完成后落库 citations 带 `verified=false`、`removed=1`，落库文本越界标记已剔除；全部有效时 `verified=true` 且文本不篡改——`backend/tests/test_chat.py::TestGuardrailsIntegration`（2 用例）。纯函数与 C2 拒答硬约束用例见 `backend/tests/test_guardrails.py`（agent_graph.md 第 7 节）
 - **已覆盖**：**无。`backend/tests/` 中不存在 `test_chat.py`**，grep 全测试目录无任何 `/api/chat` 或 `routers.chat` 引用；相关测试仅有 `test_agent_graph.py`（编排层，mock 掉路由）与 `test_skills.py`（服务层注册表，未经路由）、`test_memory.py`（MemoryManager，mock LLM）。
 - **盲区**（按严重程度）：
   - **高**：`POST /api/chat` 全链路零覆盖——SSE 帧序列、自动建会话、用户消息落库时序、`message_count = history_total + 1`、非流式分支、404/422（AC1–AC5）

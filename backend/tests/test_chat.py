@@ -117,3 +117,84 @@ class TestDeleteMessagesFrom:
         """不回归：会话不存在仍 404。"""
         resp = client.delete("/api/chat/conversations/999/messages/1")
         assert resp.status_code == 404
+
+
+class TestGuardrailsIntegration:
+    """C1 路由集成（Phase C）：流式完成后、落库前执行 verify_citations。
+
+    行为契约（specs/phases/phase-c-guardrails/spec.md 3.1 / AC2）：
+    mock LLM 输出含越界引用 → SSE 完成后落库 citations 带 verified=false、
+    文本中越界标记已剔除；全部有效时 verified=true 且文本不被篡改。
+    """
+
+    @staticmethod
+    def _chunk() -> dict:
+        """一条带完整引用字段的检索片段。"""
+        return {
+            "source": "p1_c0",
+            "paper_id": 1,
+            "title": "结直肠癌T分期研究",
+            "authors": "张三",
+            "year": 2024,
+            "page_number": 3,
+            "content": "多实例学习在病理图像上的应用……",
+        }
+
+    def _patch_deps(self, monkeypatch, answer_text, retrieved):
+        """替换 LLM 流式输出、向量库与流式落库会话工厂，全程离线。"""
+        from app.services import agent_graph
+
+        from .conftest import TestingSessionLocal
+
+        async def fake_stream(messages, enable_web_search=False):
+            yield answer_text
+
+        monkeypatch.setattr("app.routers.chat.llm_service.chat_stream", fake_stream)
+        store = SimpleNamespace(
+            available=lambda: True,
+            search=lambda query, top_k, filters: retrieved,
+        )
+        monkeypatch.setattr(agent_graph, "get_vector_store", lambda: store)
+        # 流式落库内部 `from app.database import SessionLocal`，指向内存库
+        monkeypatch.setattr("app.database.SessionLocal", TestingSessionLocal)
+
+    def _assistant_message(self, db, conversation_id):
+        db.expire_all()
+        return (
+            db.query(Message)
+            .filter(Message.conversation_id == conversation_id, Message.role == "assistant")
+            .one()
+        )
+
+    def test_out_of_range_citation_marked_unverified(self, client, db, monkeypatch):
+        """越界引用：落库文本剔除 [^9^]，citations 带 verified=false 与 removed 计数。"""
+        chunk = self._chunk()
+        self._patch_deps(monkeypatch, "根据文献[^1^]，结论成立[^9^]。", [chunk])
+
+        resp = client.post("/api/chat", json={"message": "MIL 是什么"})
+        assert resp.status_code == 200
+        assert '"finished": true' in resp.text
+
+        msg = self._assistant_message(db, 1)
+        assert msg.content == "根据文献[^1^]，结论成立。"
+        assert len(msg.citations) == 1
+        saved = msg.citations[0]
+        assert saved["verified"] is False
+        assert saved["removed"] == 1
+        # 原 7 键不丢失
+        assert saved["source"] == "p1_c0"
+        assert saved["title"] == "结直肠癌T分期研究"
+
+    def test_all_valid_citations_verified(self, client, db, monkeypatch):
+        """全部有效：文本不被篡改，citations 带 verified=true、removed=0。"""
+        chunk = self._chunk()
+        answer = "根据文献[^1^]，结论成立。"
+        self._patch_deps(monkeypatch, answer, [chunk])
+
+        resp = client.post("/api/chat", json={"message": "MIL 是什么"})
+        assert resp.status_code == 200
+
+        msg = self._assistant_message(db, 1)
+        assert msg.content == answer
+        assert msg.citations[0]["verified"] is True
+        assert msg.citations[0]["removed"] == 0

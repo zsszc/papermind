@@ -37,6 +37,7 @@
 |------|----|------|
 | `SYSTEM_PROMPT` | 多行中文字符串 | 基础 system prompt（PaperMind 学术文献助手人设 + 4 条规则，含 `[^i^]` 引用标注要求）。与原 chat.py 内嵌版本逐字一致 |
 | `WEB_SEARCH_HINT` | 单行中文字符串 | 联网搜索提示，启用时作为独立 system 消息追加。与原 chat.py 内嵌版本逐字一致 |
+| `NO_RETRIEVAL_GUARD` | 单行中文字符串 | 零检索拒答硬约束（Phase C C2，已实现）：「未检索到相关文献片段。必须明确回答「文献库中没有相关内容」，禁止编造任何引用标记。」检索结果为空时追加到 system prompt 尾部 |
 | `HISTORY_LIMIT = 10` | int | 注入的历史消息条数上限（取最近 10 条） |
 | `RETRIEVE_TOP_K = 5` | int | 向量检索 top_k |
 
@@ -108,7 +109,7 @@
 - **输出**：`{"messages", "web_search_enabled", "skill_prompt"}`
 - **前置条件**：`load_memory`、`retrieve` 已执行（线性拓扑保证）
 - **后置条件**（消息组装顺序固定，与原 chat.py 一致）：
-  1. `messages[0]` = `{"role": "system", "content": system_prompt}`（含记忆）
+  1. `messages[0]` = `{"role": "system", "content": system_prompt}`（含记忆）；**Phase C C2（已实现）**：`context_chunks` 为空时 content 追加 `\n\n` + `NO_RETRIEVAL_GUARD` 硬约束段，非空时与现状逐字一致
   2. 追加全部 `history_messages`（其中已包含当前 user 消息）
   3. `context_chunks` 非空时，追加 `{"role": "system", "content": build_rag_prompt(user_message, chunks)}`
   4. `web_search_enabled = bool(enable_web_search) or web_search_service.should_search_online(user_message)`；为真时追加 `{"role": "system", "content": WEB_SEARCH_HINT}`
@@ -149,6 +150,15 @@
 | LLM 流式/非流式调用（`llm_service.chat_stream` / `chat_completion`） | 路由层 |
 | assistant 消息落库（流式路径用新 Session） | 路由层 |
 | SSE 事件格式（`{delta}` / `{finished, citations}` / `{error}`） | 路由层 |
+
+### 3.11 `def verify_citations(answer_text, retrieved_chunks) -> (cleaned_text, report)`（Phase C C1，已实现）
+
+- **输入**：答案全文；本次检索返回的 chunk 列表（编号 1-based，与 prompt 中一致）
+- **规则**：`[^n^]` 且 1 ≤ n ≤ len(retrieved) → 保留并计入有效引用；越界（含 0、负数）或 retrieved 为空 → 从文本剔除该标记（保留语句本身）
+- **输出**：`(清洗后文本, {"total": n, "valid": m, "removed": k, "verified": bool})`；全部有效或无引用时 `verified=True`，有剔除时 `False`
+- **日志**：有剔除时记 `[guardrails]` warning（脱敏：只记被剔除编号列表，不记答案全文）
+- **副作用**：无——幂等纯函数，无 DB/网络/LLM 调用，天然符合宪法第 8 条
+- **调用方**：`routers/chat.py` 流式分支在落库前调用（chat.md 3.10）；非流式分支与 regenerate 路径本轮不接入（phase-c-guardrails spec 2.2）
 
 ## 4. 边界条件与错误处理
 
@@ -191,6 +201,10 @@
 
 ## 7. 现有测试覆盖与盲区
 
+- **已实现（Phase C）**：
+  - C1 `verify_citations` 纯函数全边界用例（有效/越界/零检索/无引用/混合/0 与负数/重复标记/日志脱敏）——`backend/tests/test_guardrails.py::TestVerifyCitations`（10 用例）
+  - C2 零检索拒答硬约束（空检索注入 / 非空不回归）——`backend/tests/test_guardrails.py::TestNoRetrievalGuard`（2 用例）
+  - C1 路由集成（落库文本剔除越界标记、citations 附 verified/removed）——`backend/tests/test_chat.py::TestGuardrailsIntegration`（2 用例）
 - **已覆盖**：`backend/tests/test_agent_graph.py`（13 用例）
   - `TestGraphStructure`：编译与单例、节点存在、边拓扑、插桩验证执行顺序
   - `TestGraphOutputs`：三要素输出、记忆拼接、RAG 消息内容与位置、filters/top_k 透传
