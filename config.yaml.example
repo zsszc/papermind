@@ -42,3 +42,14 @@ ui:
 
 export:
   citation_format: "GB/T 7714"
+
+# MCP 客户端：连接外部 MCP server（默认关闭，取消注释即启用）。
+# 外部 server 一律作为独立进程运行：stdio 型用 command+args[+env]，SSE 型用 url。
+# 如 arXiv 检索经 uvx 启动（uvx 为其管理独立虚拟环境，与本项目锁定依赖零冲突）。
+# mcp_servers:
+#   - name: arxiv
+#     command: uvx                # stdio 型：command + args [+ env]
+#     args: ["arxiv-mcp-server"]
+#     # env: { ... }              # 可选
+#   # - name: remote-x            # SSE 型：url
+#   #   url: http://127.0.0.1:9000/sse
