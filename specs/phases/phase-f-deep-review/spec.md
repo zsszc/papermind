@@ -72,3 +72,19 @@ synthesize(topic, sub_answers) -> Review        # LLM 汇总：引言/分节/结
 - **长任务耗时**（5 子问题 × 生成 60-120s 可能超 10 分钟）→ 初版子问题数硬上限 5；超时由前端/网关层后续处理
 - **Moonshot 冻结** → AC5 遗留；mock 测试不受阻
 - 回退：不调用新端点即零影响（独立链路，不改现有 /api/chat）
+
+### 7.1 F1 依赖决策结论（2026-08-05 实测记录）
+
+**结论：不引入 deepagents，回退手写「规划→分派→汇总」三段（行为契约不变）。**
+
+实测过程（`env -u PYTHONPATH venv/bin/pip install deepagents` → `pip check`）：
+
+1. deepagents 0.7.4 拖入 `httpx-0.28.1`、`pydantic-2.13.4`、`langchain-1.3.14` 等 18 个包；
+2. `pip check` 表面零冲突（openai 1.12 声明约束为 `httpx<1`，声明层拦不住 0.28.1）；
+3. **运行时实测击穿**：openai 1.12.0 + httpx 0.28.1 构造 client 即
+   `TypeError: Client.__init__() got an unexpected keyword argument 'proxies'`，
+   即宪法 §16 记录的不兼容；`services/llm.py` 导入即构造 client，引入会炸掉全站 LLM 唯一入口。
+
+恢复与验证：卸载 deepagents 及其传递依赖，`httpx==0.27.2` / `pydantic==2.7.4` 回锁，
+`langchain-core==1.4.7`（langgraph 1.2.9 声明下限）恢复；`pip check` 零冲突，
+全套件 387 基线无回归。requirements.txt / pyproject.toml 零改动。
