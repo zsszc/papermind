@@ -58,7 +58,7 @@ class VectorStore:
             documents.append(chunk["content"])
             meta = {
                 "paper_id": paper_id,
-                "chunk_index": i,
+                "chunk_index": chunk.get("chunk_index", i),
                 "chunk_type": chunk.get("chunk_type", "paragraph"),
             }
             if title is not None:

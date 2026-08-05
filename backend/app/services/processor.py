@@ -91,8 +91,9 @@ class PaperProcessor:
             content = first_text[:1500]
             page_number = pages[0].get("page_number")
         return {
-            "id": f"p{paper.id}_abstract",
+            "id": f"p{paper.id}_c-1",  # 对齐 ChromaDB id = p{pid}_c{chunk_index} 不变式（eval 命中匹配依赖）
             "content": content,
             "page_number": page_number,
             "chunk_type": "abstract",
+            "chunk_index": -1,
         }

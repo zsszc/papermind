@@ -36,7 +36,7 @@ Phase A 基线（1 篇示例论文）：keyword-only recall@5=0.447，hybrid rec
 
 - **生成时机**：论文入库处理流水线（processor）分块完成后
 - **内容来源**：`paper.abstract` 非空 → 用之；否则取第一页文本前 1500 字符（学术 PDF 首页通常含摘要段）
-- **标记**：`chunk_type: "abstract"`；chunk id 形如 `p{paper_id}_abstract`；**`chunk_index: -1`**（2026-08-05 实证补充：TextChunker 的段落分类器也会把以 Abstract 开头的普通段落标为 `chunk_type=abstract`，区分两者的唯一可靠依据是 `chunk_index=-1` 或 id 模式；消费方查询摘要级 chunk 必须带此过滤）
+- **标记**：`chunk_type: "abstract"`；**ChromaDB id 形如 `p{paper_id}_c-1`**（2026-08-05 修正：初版用 `p{paper_id}_abstract`，破坏了「ChromaDB id = `p{pid}_c{chunk_index}`」不变式——eval 的 relevant_ids 按 SQLite 重建为 `p1_c-1`，语义检索返回 `p1_abstract` 导致命中不计入 recall；对齐后语义/关键词两路命中均有效）；`chunk_index: -1`（与 TextChunker 段落分类器产出的 abstract 类普通段落区分）；ChromaDB metadata 的 `chunk_index` 亦须为 -1（`add_chunks` 优先取 chunk 字典自带值）
 - **幂等**：重复处理同篇论文时先删旧摘要 chunk 再写（不产生重复；19 篇重处理实证每篇恰 1 个）
 - **降级**：首页文本也为空 → 跳过，不阻塞入库
 

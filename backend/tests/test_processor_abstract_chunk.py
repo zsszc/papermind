@@ -97,17 +97,18 @@ def test_abstract_chunk_created_from_abstract_field(db, paper_file):
     abstracts = _abstract_chunks(db, paper.id)
     assert len(abstracts) == 1
     assert abstracts[0].content == "本研究提出了一种结直肠癌分期方法。"
-    # ChromaDB 写入的 chunk 列表中也包含摘要 chunk，id 形如 p{paper_id}_abstract
+    # ChromaDB 写入的 chunk 列表中也包含摘要 chunk，id 对齐不变式 p{paper_id}_c-1
     add_call = proc.vector_store.add_chunks.call_args
     assert add_call is not None
     written = add_call.args[1] if add_call.args else add_call.kwargs["chunks"]
     abstract_entries = [c for c in written if c.get("chunk_type") == "abstract"]
     assert len(abstract_entries) == 1
-    assert abstract_entries[0]["id"] == f"p{paper.id}_abstract"
+    assert abstract_entries[0]["id"] == f"p{paper.id}_c-1"
+    assert abstract_entries[0]["chunk_index"] == -1
 
 
 def test_add_chunks_honors_explicit_chunk_id():
-    """VectorStore.add_chunks 遇到带 id 的 chunk 时用其 id（摘要 chunk 的 p{id}_abstract 契约）。"""
+    """VectorStore.add_chunks 遇带 id/chunk_index 的 chunk 时两者都用其值（摘要 chunk 不变式契约）。"""
     from app.services.retrieval import VectorStore
 
     store = VectorStore.__new__(VectorStore)
@@ -117,13 +118,14 @@ def test_add_chunks_honors_explicit_chunk_id():
 
     store.add_chunks(
         7,
-        [{"id": "p7_abstract", "content": "摘要内容", "chunk_type": "abstract", "page_number": 1}],
+        [{"id": "p7_c-1", "content": "摘要内容", "chunk_type": "abstract", "chunk_index": -1, "page_number": 1}],
         {"title": "t", "authors": "a", "year": 2024},
     )
 
     add_kwargs = store.collection.add.call_args.kwargs
-    assert add_kwargs["ids"] == ["p7_abstract"]
+    assert add_kwargs["ids"] == ["p7_c-1"]
     assert add_kwargs["metadatas"][0]["chunk_type"] == "abstract"
+    assert add_kwargs["metadatas"][0]["chunk_index"] == -1
 
 
 def test_abstract_chunk_falls_back_to_first_page_1500_chars(db, paper_file):
