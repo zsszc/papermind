@@ -7,6 +7,8 @@
 - [x] T4 GREEN：修正指标并保持 coverage 兼容。
 - [x] T5 RED：正例 unresolved、逐条降级与报告 v2 指纹测试失败。
 - [x] T6 GREEN：实现 preflight、诊断与报告元数据。
+- [x] T6a RED：技术锚点 tokenizer、IDF 与长度归一测试失败。
+- [x] T6b GREEN：新增显式 BM25 观察 profile，默认 count 行为不变。
 - [ ] T7：运行离线评测与定向测试，记录指标差值。
 - [ ] T8：运行后端全测、前端 lint/build，生成测试报告。
 - [ ] T9：更新计划台账，提交并推送。

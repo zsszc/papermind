@@ -3,6 +3,8 @@
 用法（在 backend/ 目录下）：
     env -u PYTHONPATH venv/bin/python -m eval.run                 # 仅检索指标（默认）
     env -u PYTHONPATH venv/bin/python -m eval.run --keyword-only  # 强制只用关键词检索（不加载模型，快）
+    env -u PYTHONPATH venv/bin/python -m eval.run --keyword-only --lexical-profile bm25
+                                                               # BM25 技术锚点观察实验
     env -u PYTHONPATH venv/bin/python -m eval.run --with-llm      # 加跑生成侧指标（会真实调用 LLM）
     env -u PYTHONPATH venv/bin/python -m eval.run --threshold 0.6 # 自定义 recall@5 达标阈值
 
@@ -19,6 +21,8 @@
   其中 citation_coverage 均值同时写入报告 overall（Phase C / C3 增量字段），
   并对负例检查是否出现「不知道/无法回答」类拒答表述；
 - 控制台打印汇总表格，JSON 报告写入 eval/reports/<timestamp>.json（目录自动创建）；
+- 报告 v2 记录 dataset/corpus 指纹、Git/Python、逐题降级与 gate，只有 comparison_key
+  一致的报告才可直接比较；
 - 退出码：正例 recall@k 均值低于 --threshold（默认 0.5）时返回 1，否则 0（供 CI 使用）。
 """
 
@@ -27,12 +31,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import platform
 import re
 import subprocess
 import sys
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -128,7 +133,73 @@ def _resolve_qrels_or_raise(db, items: List[Dict[str, Any]]) -> Dict[str, List[s
 # 检索
 # ---------------------------------------------------------------------------
 
-def _keyword_chunk_search(db, query: str, limit: int = 20) -> List[Dict[str, Any]]:
+_TECHNICAL_TOKEN_RE = re.compile(
+    r"[A-Za-z0-9]+(?:[.\-][A-Za-z0-9]+)*%?"
+)
+
+
+def _tokenize_technical_terms(text: str) -> List[str]:
+    """提取中英混合问题中的 ASCII 技术锚点。
+
+    保留连字符、小数、科学计数法和百分号，例如 ReCo-MIL、F1-score、
+    1e-4、87.3%。纯中文不做猜测式翻译，返回空列表。
+    """
+    return [token.lower() for token in _TECHNICAL_TOKEN_RE.findall(text or "")]
+
+
+def _bm25_chunk_search(db, query: str, limit: int = 20) -> List[Dict[str, Any]]:
+    """基于技术锚点的轻量 BM25 chunk 检索（Batch 12 观察 profile）。"""
+    from app.models import Chunk
+
+    query_tokens = list(dict.fromkeys(_tokenize_technical_terms(query)))
+    if not query_tokens:
+        return []
+
+    rows = db.query(Chunk).all()
+    if not rows:
+        return []
+    tokenized = [_tokenize_technical_terms(row.content or "") for row in rows]
+    lengths = [len(tokens) for tokens in tokenized]
+    avg_length = sum(lengths) / len(lengths) if lengths else 0.0
+    if avg_length <= 0.0:
+        return []
+
+    doc_freq = {
+        token: sum(1 for tokens in tokenized if token in set(tokens))
+        for token in query_tokens
+    }
+    n_docs = len(rows)
+    k1 = 1.2
+    b = 0.9
+    scored: List[Dict[str, Any]] = []
+    for row, tokens, doc_length in zip(rows, tokenized, lengths):
+        counts = Counter(tokens)
+        score = 0.0
+        for token in query_tokens:
+            tf = counts.get(token, 0)
+            if tf == 0:
+                continue
+            df = doc_freq[token]
+            idf = math.log(1.0 + (n_docs - df + 0.5) / (df + 0.5))
+            length_norm = 1.0 - b + b * doc_length / avg_length
+            score += idf * (tf * (k1 + 1.0)) / (tf + k1 * length_norm)
+        if score > 0.0:
+            scored.append({
+                "chunk_id": f"p{row.paper_id}_c{row.chunk_index}",
+                "paper_id": row.paper_id,
+                "content": row.content or "",
+                "score": score,
+                "source": "keyword-bm25",
+            })
+    scored.sort(key=lambda item: (-item["score"], item["chunk_id"]))
+    return scored[:limit]
+
+def _keyword_chunk_search(
+    db,
+    query: str,
+    limit: int = 20,
+    lexical_profile: str = "count",
+) -> List[Dict[str, Any]]:
     """chunk 级关键词检索：按查询词在 chunk content 中的出现次数打分。
 
     路由层 _keyword_search 基于 papers_fts 只返回论文级结果（无 chunk id），
@@ -137,6 +208,9 @@ def _keyword_chunk_search(db, query: str, limit: int = 20) -> List[Dict[str, Any
 
     返回按得分降序的 chunk 列表，元素含 chunk_id / paper_id / content / score。
     """
+    if lexical_profile == "bm25":
+        return _bm25_chunk_search(db, query, limit)
+
     from app.models import Chunk  # 延迟导入，避免加载本模块即连库
 
     tokens = [t for t in re.split(r"\s+", query.strip()) if t]
@@ -187,12 +261,19 @@ def _rrf_fuse_chunks(
 class Retriever:
     """评测用检索器：优先语义+关键词混合，模型不可用时降级为仅关键词。"""
 
-    def __init__(self, db, top_k: int, keyword_only: bool = False):
+    def __init__(
+        self,
+        db,
+        top_k: int,
+        keyword_only: bool = False,
+        lexical_profile: str = "count",
+    ):
         self.db = db
         self.top_k = top_k
         self.degraded = False
         self.degrade_reason = ""
         self._store = None
+        self.lexical_profile = lexical_profile
         self.last_query_mode = "keyword-only" if keyword_only else "hybrid"
         self.last_query_degraded = bool(keyword_only)
         self.last_query_error: Optional[str] = None
@@ -224,7 +305,12 @@ class Retriever:
         self.last_query_mode = "keyword-only" if self.degraded else "hybrid"
         self.last_query_degraded = self.degraded
         self.last_query_error = None
-        keyword_results = _keyword_chunk_search(self.db, query, limit=self.top_k * 2)
+        keyword_results = _keyword_chunk_search(
+            self.db,
+            query,
+            limit=self.top_k * 2,
+            lexical_profile=self.lexical_profile,
+        )
         if self.degraded:
             return keyword_results[: self.top_k]
         try:
@@ -308,7 +394,12 @@ def run_eval(args: argparse.Namespace) -> int:
         t0 = time.time()
         benchmark = _build_benchmark_metadata(db, Path(args.dataset))
         resolved_qrels = _resolve_qrels_or_raise(db, items)
-        retriever = Retriever(db, top_k=args.top_k, keyword_only=args.keyword_only)
+        retriever = Retriever(
+            db,
+            top_k=args.top_k,
+            keyword_only=args.keyword_only,
+            lexical_profile=args.lexical_profile,
+        )
         print(f"[eval] 检索模式: {retriever.mode}"
               + (f"（{retriever.degrade_reason}）" if retriever.degraded else ""))
 
@@ -414,6 +505,7 @@ def run_eval(args: argparse.Namespace) -> int:
             benchmark["dataset_sha256"],
             benchmark["corpus_manifest_sha256"],
             retriever.mode,
+            args.lexical_profile,
             str(args.top_k),
         ))
         passed = overall[f"recall@{args.top_k}"] >= args.threshold
@@ -430,6 +522,7 @@ def run_eval(args: argparse.Namespace) -> int:
             },
             "pipeline": {
                 "profile": retriever.mode,
+                "lexical_profile": args.lexical_profile,
                 "top_k": args.top_k,
             },
             "diagnostics": {
@@ -524,6 +617,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="recall@k 达标阈值，低于则退出码为 1（默认 0.5）")
     parser.add_argument("--keyword-only", action="store_true",
                         help="强制仅关键词检索（不加载语义模型，速度快）")
+    parser.add_argument(
+        "--lexical-profile",
+        choices=("count", "bm25"),
+        default="count",
+        help="chunk 词法检索策略；bm25 为观察实验，默认 count 保持历史行为",
+    )
     parser.add_argument("--with-llm", action="store_true",
                         help="加跑生成侧指标（会真实调用 LLM API，默认关闭）")
     parser.add_argument("--report-dir", default=str(DEFAULT_REPORT_DIR),
