@@ -75,9 +75,11 @@ Phase A 基线（1 篇示例论文）：keyword-only recall@5=0.447，hybrid rec
 
 ## 7. 现有测试覆盖与盲区
 
-- reranker 全功能为零（新代码，全部 test-first）
-- 摘要 chunk 为零（新代码，全部 test-first）
+- ~~reranker 全功能为零~~ **B1 已实现（3c4bc7b）**：16 契约用例（服务级 7 + 集成 9），降级三路径锁定
+- ~~摘要 chunk 为零~~ **B2 已实现（bfda87f）**：5 用例（abstract 优先/首页回退/幂等/跳过）
+- ~~延迟统计~~ **B4 已实现（e5a3d61）**：latency_stats 边界 + 报告集成 + trend 兼容
 - dataset 多 locator 解析：现有 16 用例部分覆盖（specs/backend/eval/dataset.md 第 7 节）
+- **定标测量（2026-08-05 实测）**：19 篇规模 hybrid recall@5=0.295/MRR=0.350（阈值 0.5 FAIL）——B1/B2 尚未对存量论文激活（rerank 默认关、旧论文无摘要 chunk），待重处理后重新定标；factoid/summary 仍为 0.000 弱项
 - 门控测量依赖 QA 数据集（当前 14 条候选，Moonshot 解冻守望中）
 
 ## 8. 关键设计决策
