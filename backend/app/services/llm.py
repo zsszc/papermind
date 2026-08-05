@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import time
 from typing import AsyncIterator, List, Dict, Any, Optional
 
@@ -11,23 +12,86 @@ from app.core.logger import logger
 
 class LLMService:
     def __init__(self):
-        self.client = AsyncOpenAI(
-            api_key=config.get("llm.api_key"),
-            base_url=config.get("llm.base_url", "https://api.moonshot.cn/v1"),
-            max_retries=1,
-            timeout=120,
-        )
-        # 同步 client：供后台线程（无事件循环）使用，配置与 async client 保持一致
-        self.sync_client = OpenAI(
-            api_key=config.get("llm.api_key"),
-            base_url=config.get("llm.base_url", "https://api.moonshot.cn/v1"),
-            max_retries=1,
-            timeout=120,
-        )
+        api_key = config.get("llm.api_key")
+        base_url = config.get("llm.base_url", "https://api.moonshot.cn/v1")
+
+        # Phase D（D2）：Langfuse 观测开关。两个 key 都配置才启用 langfuse.openai
+        # drop-in wrapper（对三方法零改动）；任一缺失或初始化失败 → 标准 openai client，
+        # 行为与现状逐字节一致（零侵入降级）。
+        self._langfuse_enabled = False
+        self.client = None
+        self.sync_client = None
+        public_key = os.environ.get("PAPERMIND_LANGFUSE_PUBLIC_KEY")
+        secret_key = os.environ.get("PAPERMIND_LANGFUSE_SECRET_KEY")
+        if public_key and secret_key:
+            try:
+                from langfuse.openai import openai as _langfuse_openai
+
+                # langfuse 2.x wrapper 的官方配置注入点：模块属性（等效 LANGFUSE_* env）
+                _langfuse_openai.langfuse_public_key = public_key
+                _langfuse_openai.langfuse_secret_key = secret_key
+                _langfuse_openai.langfuse_host = os.environ.get(
+                    "PAPERMIND_LANGFUSE_HOST", "http://localhost:3001"
+                )
+                self.client = _langfuse_openai.AsyncOpenAI(
+                    api_key=api_key, base_url=base_url, max_retries=1, timeout=120,
+                )
+                self.sync_client = _langfuse_openai.OpenAI(
+                    api_key=api_key, base_url=base_url, max_retries=1, timeout=120,
+                )
+                self._langfuse_enabled = True
+            except Exception as e:
+                # 降级契约：初始化失败记 warning，回退未启用态，绝不影响主链路
+                logger.warning(f"[langfuse] 初始化失败，降级为未启用态: {e}")
+                self.client = None
+                self.sync_client = None
+                self._langfuse_enabled = False
+
+        if self.client is None:
+            self.client = AsyncOpenAI(
+                api_key=api_key,
+                base_url=base_url,
+                max_retries=1,
+                timeout=120,
+            )
+            # 同步 client：供后台线程（无事件循环）使用，配置与 async client 保持一致
+            self.sync_client = OpenAI(
+                api_key=api_key,
+                base_url=base_url,
+                max_retries=1,
+                timeout=120,
+            )
         self.model = config.get("llm.model", "moonshot-v1-8k")
         self.max_tokens = config.get("llm.max_tokens", 4096)
         self.temperature = config.get("llm.temperature", 0.3)
         self.max_total_chars = config.get("llm.max_total_chars", 200000)
+
+    def _observation_kwargs(
+        self,
+        method_name: str,
+        messages: List[Dict[str, str]],
+        stream: bool,
+        trace_metadata: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """组装 langfuse.openai wrapper 的观测 kwargs（name/metadata）。
+
+        未启用时返回空 dict（零侵入）；metadata 由调用方经可选参数 trace_metadata
+        传入（约定携带 conversation_id/skill/chunk_count），缺省不报错；
+        组装过程任何异常一律吞掉记 warning 并返回空 dict，绝不影响主链路。
+        """
+        if not self._langfuse_enabled:
+            return {}
+        try:
+            metadata: Dict[str, Any] = {
+                "message_count": len(messages),
+                "stream": stream,
+            }
+            if trace_metadata:
+                metadata.update(trace_metadata)
+            return {"name": method_name, "metadata": metadata}
+        except Exception as e:
+            logger.warning(f"[langfuse] 观测参数组装失败，已跳过本次观测: {e}")
+            return {}
 
     def _get_temperature(self) -> float:
         # kimi-k2.6 系列模型目前只支持 temperature=1
@@ -89,6 +153,7 @@ class LLMService:
         self,
         messages: List[Dict[str, str]],
         enable_web_search: bool = False,
+        trace_metadata: Optional[Dict[str, Any]] = None,
     ) -> AsyncIterator[str]:
         messages = self._truncate_messages(messages)
         last_exception = None
@@ -103,6 +168,10 @@ class LLMService:
                     "stream": True,
                     "timeout": 180,
                 }
+                # Phase D（D2）：观测 kwargs（未启用时为空 dict，零侵入）
+                kwargs.update(
+                    self._observation_kwargs("chat_stream", messages, True, trace_metadata)
+                )
                 if enable_web_search:
                     kwargs["tools"] = [
                         {
@@ -142,6 +211,7 @@ class LLMService:
         messages: List[Dict[str, str]],
         json_mode: bool = False,
         timeout: Optional[int] = None,
+        trace_metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
         messages = self._truncate_messages(messages)
         call_timeout = timeout or 120
@@ -154,6 +224,10 @@ class LLMService:
                 "temperature": self._get_temperature(),
                 "timeout": call_timeout,
             }
+            # Phase D（D2）：观测 kwargs（未启用时为空 dict，零侵入）
+            kwargs.update(
+                self._observation_kwargs("chat_completion", messages, False, trace_metadata)
+            )
             if json_mode:
                 kwargs["response_format"] = {"type": "json_object"}
             return self.client.chat.completions.create(**kwargs)
@@ -197,6 +271,7 @@ class LLMService:
         messages: List[Dict[str, str]],
         json_mode: bool = False,
         timeout: Optional[int] = None,
+        trace_metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
         """chat_completion 的同步入口：供后台线程（无事件循环）使用。
 
@@ -214,6 +289,12 @@ class LLMService:
                 "temperature": self._get_temperature(),
                 "timeout": call_timeout,
             }
+            # Phase D（D2）：观测 kwargs（未启用时为空 dict，零侵入）
+            kwargs.update(
+                self._observation_kwargs(
+                    "chat_completion_sync", messages, False, trace_metadata
+                )
+            )
             if json_mode:
                 kwargs["response_format"] = {"type": "json_object"}
             return self.sync_client.chat.completions.create(**kwargs)

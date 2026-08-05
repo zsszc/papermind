@@ -34,6 +34,8 @@ dependencies = [
     "langgraph==1.2.9",
     "mcp==1.3.0",
     "sse-starlette==1.8.2",
+    # Phase D（D2）：Langfuse 可观测性 SDK；pip check 与锁定栈零冲突后锁定
+    "langfuse==2.60.10",
 ]
 
 # 注意：httpx 已固定 0.27.2（openai 1.12 与 httpx>=0.28 不兼容，升级前必须验证）

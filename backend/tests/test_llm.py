@@ -45,3 +45,18 @@ class TestFormatError:
 
     def test_unknown_error_passthrough(self, svc):
         assert svc._format_error(Exception("some other error")) == "some other error"
+
+
+class TestObservabilityZeroIntrusion:
+    """Phase D（D2）：未配置 PAPERMIND_LANGFUSE_* 时三方法零侵入（开关关闭态）。"""
+
+    def test_unconfigured_service_not_enabled(self, monkeypatch):
+        """两个 key 均未设置 → 未启用态，client 保持标准 openai 实现。"""
+        from openai import AsyncOpenAI, OpenAI
+
+        monkeypatch.delenv("PAPERMIND_LANGFUSE_PUBLIC_KEY", raising=False)
+        monkeypatch.delenv("PAPERMIND_LANGFUSE_SECRET_KEY", raising=False)
+        service = LLMService()
+        assert service._langfuse_enabled is False
+        assert type(service.client) is AsyncOpenAI
+        assert type(service.sync_client) is OpenAI
