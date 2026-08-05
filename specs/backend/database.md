@@ -1,6 +1,6 @@
 # database.py（SQLAlchemy 引擎与轻量 Schema 迁移）规格说明书
 
-> 本文档描述 `backend/app/database.py` 的**行为契约**：全局 SQLite 引擎、会话工厂、声明式基类、WAL PRAGMA 监听、版本化轻量迁移登记表 `SCHEMA_MIGRATIONS` 与 `ensure_schema()`。
+> 本文档描述 `backend/app/database.py` 的**行为契约**：全局 SQLite 引擎、会话工厂、声明式基类、外键/WAL PRAGMA 监听、版本化轻量迁移登记表 `SCHEMA_MIGRATIONS` 与 `ensure_schema()`。
 > 依据源码全文反向工程（92 行，SQLAlchemy 2.0 风格），函数签名与迁移分支照抄代码。
 
 ## 1. 背景与目标
@@ -12,7 +12,7 @@
 ### 2.1 包含
 
 - 模块级对象：`DATABASE_URL`、`engine`、`SessionLocal`、`Base` 的创建语义与配置。
-- 引擎 `connect` 事件监听器 `_set_sqlite_pragma`（WAL / synchronous PRAGMA）。
+- 引擎 `connect` 事件监听器 `_set_sqlite_pragma`（foreign_keys / WAL / synchronous PRAGMA）。
 - `SCHEMA_MIGRATIONS` 登记表的格式约定与全部 7 个迁移分支。
 - `_apply_schema_migrations()`、`ensure_schema()`、`get_db()` 三个函数的行为契约。
 
@@ -38,10 +38,10 @@
 
 - **输入**：DBAPI 原生连接对象（由 SQLAlchemy 连接事件传入）。
 - **输出**：无返回。
-- **后置条件**：该连接上已执行 `PRAGMA journal_mode=WAL;` 与 `PRAGMA synchronous=NORMAL;`。
+- **后置条件**：该连接上已执行 `PRAGMA foreign_keys=ON;`、`PRAGMA journal_mode=WAL;` 与 `PRAGMA synchronous=NORMAL;`。
 - **副作用**：对每条新建的数据库连接执行两条 PRAGMA。
 - **异常**：无显式处理；PRAGMA 失败会以连接事件异常形式上抛。
-- **注意**：**未**设置 `PRAGMA foreign_keys=ON`，因此 SQLite 数据库级外键约束不强制，孤儿行清理由 ORM 级联负责（见 models.py 规格）。内存数据库上 `journal_mode=WAL` 为静默无操作。
+- **注意**：外键约束对每个新连接启用；路由必须先清理或解除旧表中没有 `ON DELETE` 规则的关联数据。内存数据库上 `journal_mode=WAL` 为静默无操作。
 
 ### 3.4 `SCHEMA_MIGRATIONS`（模块级常量）
 
@@ -143,12 +143,13 @@ def get_db():
 - [ ] AC4：模块级 `engine` 新建连接的 `PRAGMA journal_mode` 返回 `wal`、`PRAGMA synchronous` 返回 `1`（NORMAL）。
 - [ ] AC5：`get_db()` 产出的会话在依赖清理后处于关闭状态（再使用会抛/重新建立连接）。
 - [ ] AC6：迁移函数抛错路径（如对损坏库执行）只写 WARNING 日志，不向上抛异常。
+- [x] AC7：`_set_sqlite_pragma` 执行后 `PRAGMA foreign_keys` 返回 1，且测试引擎复用同一初始化函数。
 
 ## 7. 现有测试覆盖与盲区
 
 - **已覆盖**：
   - `tests/conftest.py` 导入 `Base` 与 `get_db`：每个用例经 `Base.metadata.create_all/drop_all` 间接验证「`Base` 能汇集全部表定义」；`get_db` 作为依赖注入锚点被 `dependency_overrides` 替换（仅验证其「可覆盖」角色，不验证其自身逻辑）。
-  - 除此之外**没有任何测试直接引用** `ensure_schema` / `SCHEMA_MIGRATIONS` / `_apply_schema_migrations` / `SessionLocal` / PRAGMA 监听器。
+  - `tests/test_database_integrity.py` 直接验证外键 PRAGMA；其余迁移与 `SessionLocal` 行为仍未直接覆盖。
 - **盲区**：
   - 【高】7 个迁移分支（3.4 全表）全部无测试：没有用「旧 schema 库」验证 `ADD COLUMN` 真正补齐列且保留数据，登记错误（类型写错、表名写错）不会被 CI 发现。
   - 【高】迁移失败「吞异常继续启动」路径（3.5 异常分支）无测试，无法保证降级行为符合预期而非静默带伤运行。
@@ -162,5 +163,5 @@ def get_db():
 - **无 Alembic，登记表 + ADD COLUMN**：项目为单用户本地应用，schema 演进只有「加列」一种形态；登记表把「新列 = 模型 + 迁移 + schemas 三处同步」简化为一次登记，刻意不引入迁移框架（宪法第 9 条、AGENTS.md 第 5 节）。新增字段时必须同步改 `models.py` + 本表 + `schemas.py`。
 - **迁移异常只警告不抛出**：保证「数据库有轻微问题时应用仍能启动」；代价是迁移失败会被静默降级，问题延后暴露——排查启动后查询异常时应先搜日志 `[schema]`。
 - **引擎/会话工厂/Base 全部模块级单例**：导入即定型，与 `Config` 单例一致；测试通过自建引擎 + `dependency_overrides` 隔离，不复用模块级引擎。
-- **只设 WAL/synchronous，不设 foreign_keys=ON**：外键完整性依赖 ORM 级联（`cascade="all, delete-orphan"`）而非数据库约束，绕过 ORM 的裸 SQL 删除可能留下孤儿行。
+- **连接级外键强制**：生产与测试连接共用 PRAGMA 初始化，避免测试容忍生产会拒绝的孤儿写入。
 - **`check_same_thread=False`**：FastAPI 同步路由在线程池执行、PDF 处理等在后台线程执行，均需跨线程使用连接；安全性靠「每请求/每任务独立会话」约定保障。

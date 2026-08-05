@@ -8,12 +8,20 @@ from urllib.parse import quote
 import aiofiles
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import text
+from sqlalchemy import or_, text
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
 from app.database import get_db
-from app.models import Paper, Tag, Chunk, PaperAnnotation, ThesisCitation, ThesisFile
+from app.models import (
+    Chunk,
+    Paper,
+    PaperAnnotation,
+    PaperCitation,
+    Tag,
+    ThesisCitation,
+    ThesisFile,
+)
 from app.schemas import (
     CitationGraphResponse,
     PaperCreate,
@@ -144,6 +152,14 @@ def _get_paper_lock(paper_id: int) -> threading.Lock:
         return _paper_locks[paper_id]
 
 
+def _release_paper_lock(paper_id: int, lock: threading.Lock) -> None:
+    """原子释放并移除锁，避免释放后被复用再误删注册项。"""
+    with _paper_locks_lock:
+        lock.release()
+        if _paper_locks.get(paper_id) is lock:
+            _paper_locks.pop(paper_id, None)
+
+
 def get_papers_dir() -> Path:
     papers_dir = config.runtime_root / "papers"
     papers_dir.mkdir(parents=True, exist_ok=True)
@@ -239,7 +255,9 @@ def _process_paper_background(paper_id: int):
             for attempt in range(2):
                 try:
                     processor = PaperProcessor()
-                    processor.process(paper, db)
+                    result = processor.process(paper, db)
+                    if result.get("status") != "ok":
+                        raise RuntimeError("文献处理器返回非成功状态")
                     process_ok = True
                     break
                 except Exception as e:
@@ -257,9 +275,7 @@ def _process_paper_background(paper_id: int):
             db.commit()
             logger.info(f"[background] paper {paper_id} 核心处理完成")
     finally:
-        lock.release()
-        with _paper_locks_lock:
-            _paper_locks.pop(paper_id, None)
+        _release_paper_lock(paper_id, lock)
 
     # LLM 元数据增强与自动标签作为独立后台任务执行，不阻塞核心流程
     threading.Thread(target=_enhance_paper_metadata, args=(paper_id,), daemon=True).start()
@@ -561,6 +577,10 @@ def delete_paper(paper_id: int, db: Session = Depends(get_db)):
     db.query(Chunk).filter(Chunk.paper_id == paper_id).delete()
     # 级联清理大论文引用关联行，避免 thesis_citations 悬空指向已删文献（Batch7b-F10）
     db.query(ThesisCitation).filter(ThesisCitation.paper_id == paper_id).delete()
+    # 清理文献引用图的全部入边/出边，保证开启 SQLite 外键后仍可删除。
+    db.query(PaperCitation).filter(
+        or_(PaperCitation.citing_id == paper_id, PaperCitation.cited_id == paper_id)
+    ).delete(synchronize_session=False)
     db.delete(paper)
     db.commit()
     return
@@ -746,9 +766,17 @@ def process_paper(paper_id: int, db: Session = Depends(get_db)):
     if not paper:
         raise HTTPException(status_code=404, detail="Paper not found")
 
-    processor = PaperProcessor()
+    lock = _get_paper_lock(paper_id)
+    if not lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="文献正在处理中，请稍后再试")
+
     try:
+        paper.processed = "processing"
+        db.commit()
+        processor = PaperProcessor()
         result = processor.process(paper, db)
+        if result.get("status") != "ok":
+            raise RuntimeError("文献处理器返回非成功状态")
         paper.processed = "done"
         db.commit()
         return {"paper_id": paper_id, **result}
@@ -757,6 +785,8 @@ def process_paper(paper_id: int, db: Session = Depends(get_db)):
         db.commit()
         logger.exception(f"[process] paper_id={paper_id} 处理失败")
         raise HTTPException(status_code=500, detail="文献处理失败，请稍后再试") from e
+    finally:
+        _release_paper_lock(paper_id, lock)
 
 
 @router.post("/{paper_id}/summarize")

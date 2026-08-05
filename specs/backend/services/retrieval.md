@@ -56,7 +56,7 @@ PaperMind 的检索子系统解决「在个人文献库中快速定位相关内�
   - `paper_metadata`：可选；取 `title`/`authors`/`year` 三键。`title`/`authors` 为 None 时不写入对应 metadata 键；`year` 为 None 时不写入
 - **输出**：无返回值
 - **前置条件**：Embedding 模型可用——本方法**内部不做 `available()` 检查**，模型不可用时 `embed()` 会抛 `RuntimeError("Embedding 模型不可用: ...")` 并传播给调用方（当前唯一调用方 `processor.py` 也未检查，PDF 处理任务因此整体失败）
-- **后置条件**：全部 chunk 的向量、原文、metadata 写入 `papers` 集合；同一 chunk id 重复 add 会抛 ChromaDB 重复 id 错误（**本方法不幂等**，去重依赖调用方先 `delete_by_paper_id`，`processor.py` 正是这样做的）
+- **后置条件**：全部 chunk 的向量、原文、metadata 写入 `papers` 集合，并清除 `semantic_search:` 前缀缓存；同一 chunk id 重复 add 会抛 ChromaDB 重复 id 错误。
 - **副作用**：网络无关；调用 embedding worker 队列（阻塞等待）；ChromaDB 持久化写入
 
 ### 3.4 `VectorStore.search(self, query: str, top_k: int = 10, filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]`
@@ -84,7 +84,7 @@ PaperMind 的检索子系统解决「在个人文献库中快速定位相关内�
 - **已知契约缺陷**：
   - 缓存键使用 Python 内置 `hash()`：字符串哈希**按进程随机加盐**（PYTHONHASHSEED），键仅在当前进程内稳定（对纯内存缓存无害），且理论上存在哈希碰撞导致串结果的可能；
   - 缓存命中返回的是**同一列表对象的引用**，调用方对元素字典的修改（如 search 路由覆写 `source`）会作用于缓存对象——当前覆写值与原值相同（`"semantic"`），故无实际危害，但属隐患；
-  - 60 秒窗口内新增/删除的 chunk 不会反映在缓存结果中（最终一致性）。
+  - 向量增删会主动清除语义缓存；未发生数据变更时按 60 秒 TTL 复用。
 
 ### 3.5 `VectorStore._build_where(self, filters: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]`
 
@@ -103,7 +103,7 @@ PaperMind 的检索子系统解决「在个人文献库中快速定位相关内�
 - **输出**：无返回值
 - **后置条件**：`papers` 集合中 `metadata.paper_id == paper_id` 的条目全部删除
 - **异常**：**内部全捕获**——任何异常仅写 warning 日志（`[VectorStore] 删除 paper {paper_id} 向量失败`，含堆栈），绝不向外抛；调用方（papers 删除路由、processor）无法感知失败
-- **注意**：只清 ChromaDB，不清 SQLite `chunks` 表（各自由调用方负责）；不清检索缓存（60 秒内旧结果仍可命中）
+- **注意**：只清 ChromaDB，不清 SQLite `chunks` 表（各自由调用方负责）；无论删除成功或失败都会清语义缓存。
 
 ### 3.7 `get_vector_store() -> VectorStore`
 
@@ -165,7 +165,7 @@ PaperMind 的检索子系统解决「在个人文献库中快速定位相关内�
 | `use_semantic` = true 但 `use_keyword` = false，且模型不可用 | 两路皆空，返回空结果 |
 | 双开关皆 false | 返回空结果列表，200 |
 | `filters` 同时含 `year_gte` + `year_lte`，或 `year_*` + `paper_id` | ChromaDB 抛 `ValueError`（0.4.24 实证）；`/api/search` 无兜底 → 500；chat/agent_graph 有 try/except → 降级为空结果 |
-| 语义缓存 60 秒窗口内新增/删除文献 | 缓存结果不反映变更（最终一致性，可接受） |
+| 语义缓存期间新增/删除文献 | 向量写入/删除边界立即清除语义缓存 |
 | `add_chunks` 传空 chunks | 直接返回，无任何写入 |
 | `add_chunks` 时模型不可用 | 抛 `RuntimeError`，PDF 处理任务整体失败（processor 未兜底） |
 | `delete_by_paper_id` 删除失败 | 仅 warning 日志，不抛异常，调用方无感知 |
@@ -202,6 +202,7 @@ PaperMind 的检索子系统解决「在个人文献库中快速定位相关内�
 - [ ] AC8：`_build_where` 单条件（year_gte / year_lte / paper_id 任一）产出合法 where；组合条件的行为被明确规约（**当前无测试，且实现存在 3.5 所述缺陷**）
 - [ ] AC9：RRF 融合按 `1/(k+rank+1)` 计分、按 paper_id 去重、同论文多 chunk 分数累计（**当前无测试**）
 - [ ] AC10：`get_vector_store()` 单例：多次调用返回同一对象（**当前无测试**）
+- [x] AC11：向量成功写入或删除尝试后清除 `semantic_search:` 缓存，其他缓存键保留。
 
 ## 7. 现有测试覆盖与盲区
 
@@ -214,7 +215,7 @@ PaperMind 的检索子系统解决「在个人文献库中快速定位相关内�
   - **高**：`_reciprocal_rank_fusion` 无直接单测——RRF 计分公式、paper_id 去重、同论文多 chunk 分数累计、载体选择优先级（语义优先）均未验证；现有「混合降级」用例只走了单路非空的融合路径
   - ~~**高**：`_build_where` 组合过滤缺陷~~ **已修复（Batch7-F1, 6cec40c）**：多条件包装 `$and` + `_query_with_fallback` 降级兜底，`tests/test_search.py::TestBuildWhere` 4 用例固化
   - **中**：`add_chunks` 的 id 生成、metadata 条件写入（title/authors/year/page_number 为 None 时不写）、空 chunks 短路、重复 id 不幂等，无测试
-  - **中**：`delete_by_paper_id` 的按 metadata 过滤删除与吞异常行为，无测试
+  - `tests/test_cache_invalidation.py` 已覆盖 add/delete（含删除异常）后的语义缓存失效；metadata 过滤参数本身仍缺断言。
   - **中**：`get_vector_store()` 单例与并发双重检查锁，无测试
   - **中**：`_keyword_search` 内部异常降级（FTS 表缺失 → 返回 `[]`）无测试
   - **低**：双开关皆 false → 空结果；`top_k=None/0` → 回落 10；融合结果 `source` 恒被覆写为 `hybrid`（语义降级时关键词结果被误标 hybrid），无测试

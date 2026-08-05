@@ -42,6 +42,13 @@ class SimpleCache:
             "expires": time.time() + (ttl or self.default_ttl),
         }
 
+    def delete_prefix(self, prefix: str) -> int:
+        """删除指定前缀的缓存项，返回删除数量。"""
+        keys = [key for key in self._store if key.startswith(prefix)]
+        for key in keys:
+            self._store.pop(key, None)
+        return len(keys)
+
     def cached(
         self,
         ttl: Optional[int] = None,

@@ -39,9 +39,7 @@
 - **输入**：
   - `paper`：已持久化的 `Paper` ORM 对象，`paper.file_path` 为相对项目根的 PDF 路径（由导入路由写入）
   - `db`：调用方持有的 SQLAlchemy Session；**本方法内部会执行一次 `db.commit()`**（见副作用），调用方不应假定事务仍打开
-- **输出**：字典，两种形态：
-  - 成功：`{"status": "ok", "pages": <提取页数 int>, "chunks": <写入块数 int>}`
-  - PDF 文件缺失：`{"status": "error", "message": "PDF file not found"}`——**以返回值表达错误而非抛异常**（重要怪癖，见第 4 节）
+- **输出**：成功返回 `{"status": "ok", "pages": <提取页数 int>, "chunks": <写入块数 int>}`。
 - **前置条件**：`paper.file_path` 指向项目根下的相对路径；Embedding 模型可用（不可用则在第 5 步抛 `RuntimeError`，见 retrieval 规格 `add_chunks` 前置条件）
 - **后置条件**（成功路径）：
   1. 该 paper 在 SQLite `chunks` 表中的旧记录**全部删除**，替换为本次分块结果（`chunk_index` 从 0 连续编号，`section_title`/`chunk_type`/`token_count` 透传自 `TextChunker`）；
@@ -54,7 +52,7 @@
   - 文件 I/O：读 PDF（只读）
   - 触发 embedding 计算（本地模型，无网络；首次可能触发模型加载）
 - **异常**：
-  - PDF 缺失不抛异常（返回 error 字典）；
+  - PDF 缺失抛 `FileNotFoundError`；
   - 解析失败（pdfplumber 异常）、分块 `KeyError`、embedding 不可用（`RuntimeError`）、ChromaDB 写入失败等均**直接向外抛**，本方法不做任何兜底；
   - **不一致窗口**：若第 5 步（ChromaDB 写入）抛出，SQLite chunks 已提交、ChromaDB 旧向量已删——paper 处于「有 SQLite 块、无（或部分）向量」状态，语义检索会漏掉该论文，需重处理修复。
 
@@ -71,7 +69,7 @@
 | paper 已被删除 | 不变更状态，记 warning 后返回 |
 | 锁被占用（同 paper 已有任务在跑） | 不变更状态，记 info「正在处理中，跳过重复任务」后返回 |
 
-- **重试语义**：`for attempt in range(2)`——**最多 2 次尝试（即失败后重试 1 次）**，无退避间隔；每次尝试都重新 `PaperProcessor()` 并调用 `process()`；仅异常触发重试，**返回 error 字典（PDF 缺失）不算失败**（`process_ok=True`），paper 会被标记为 `done` 但只有 0 个 chunk
+- **重试语义**：`for attempt in range(2)`——最多 2 次尝试；异常或非 `ok` 结果均视为失败，连续失败后标 `error`。
 - **并发语义**：按 paper_id 的细粒度 `threading.Lock`（模块级 `_paper_locks` 字典 + `_paper_locks_lock` 保护）；非阻塞 `acquire(blocking=False)`，同 paper 重复任务直接跳过；**不同 paper 之间可并发**；任务结束（含异常路径，finally）释放锁并从字典中移除
 - **Session 语义**：任务内自建 `SessionLocal()`，不使用请求作用域的 db
 - **解耦设计**：核心处理标记 `done` **之后**，才以独立守护线程启动 `_enhance_paper_metadata(paper_id)`（LLM 元数据增强 + 自动打标，见 auto_tag 规格）；增强/打标失败**不影响** `processed` 状态
@@ -79,9 +77,7 @@
 
 ### 3.4 `POST /api/papers/{paper_id}/process`（手动同步重处理）
 
-- **行为**：同步执行 `PaperProcessor().process(paper, db)`；成功返回 `{"paper_id": …, **result}` 并置 `processed="done"`；`process()` 抛异常则置 `processed="error"` 并抛 500（`detail=f"处理失败: {e}"`——**注意此处把异常原文透传给前端**，与全局异常脱敏约定不同）
-- **无并发保护**：不经 `_paper_locks`，与后台任务/另一手动请求并发时可能交叉重建 chunks
-- **怪癖**：`process()` 返回 error 字典（PDF 缺失）时不抛异常，路由照样置 `processed="done"` 并返回 200（body 内含 `"status": "error"`）
+- **行为**：与后台任务共用 paper_id 互斥锁；冲突返回 409。取得锁后先置 `processing`，仅 `status="ok"` 时置 `done`；异常或非成功结果置 `error` 并返回脱敏 500。
 - **不触发后续任务**：此端点**不会**触发元数据增强与自动打标（与导入路径不同）
 
 ### 3.5 组件交互契约（引用其他规格，不重复定义）
@@ -121,21 +117,21 @@
 
 ## 7. 现有测试覆盖与盲区
 
-- **已覆盖**：`backend/tests/` 中**无任何直接针对 `PaperProcessor` 的测试**。`test_upload.py` 仅覆盖导入接口的落盘/校验，且用 `monkeypatch.setattr(papers_router, "_process_paper_background", lambda paper_id: None)` 把后台处理整体桩掉——状态机、重试、锁、流水线全部不在测试内。
+- **已覆盖**：`test_processor_abstract_chunk.py` 覆盖成功分块/摘要重建；`test_process_integrity.py` 覆盖缺文件异常、非成功结果和手动锁冲突。后台状态机仍由导入测试整体桩掉。
 - **盲区**：
   - **高**：`process()` 成功路径全链路（解析→分块→清旧→双库写入→返回统计）无测试（AC1、AC3）
   - **高**：后台任务状态机（pending→processing→done/error）与「失败重试 1 次」语义无测试（AC4、AC5）
-  - **中**：PDF 缺失返回 error 字典却被标 `done` 的怪癖无测试，属静默数据问题（零 chunk 的 done 论文）
+  - PDF 缺失、非成功结果和手动锁冲突已由 `tests/test_process_integrity.py` 覆盖。
   - **中**：第 5 步失败后的「SQLite 有块、ChromaDB 无向量」不一致窗口无测试、无修复机制
-  - **中**：手动 `/process` 端点（含 500 时异常原文外泄、`done` 误标）无测试
+  - 手动 `/process` 的成功响应与处理期间状态可见性仍缺测试；失败脱敏和状态已覆盖。
   - **低**：`_paper_locks` 锁泄漏（任务异常路径锁已由 finally 覆盖，但字典清理与锁复用语义无测试）
   - **低**：`section_title` 恒为 None、`token_count` 为字符数等透传字段语义无断言
 
 ## 8. 关键设计决策
 
-- **错误以返回值表达（PDF 缺失）而非异常**：历史上为让调用方友好处理缺文件场景，但与「异常即失败」的重试/状态机约定不一致，导致缺文件论文被误标 `done`——修订时应统一为抛异常并让调用方区分处理（改动需同步本规格）
+- **处理失败统一为异常/非成功防御检查**：缺 PDF 抛 `FileNotFoundError`；调用方仍校验结果状态，避免第三方处理器返回错误字典时误标完成。
 - **先 commit SQLite 再写 ChromaDB**：保证 SQLite 块元数据不丢失，代价是第 5 步失败留下不一致窗口；单用户本地场景接受最终需重处理修复
 - **重试仅 1 次、无退避**：处理失败的常见原因是模型未就绪或 PDF 损坏，快速重试一次覆盖瞬时故障即可；反复重试对损坏文件无意义
 - **按 paper_id 细粒度锁而非全局锁**：不同 PDF 可并行处理（embedding worker 本身是串行队列，见 embedding 规格），锁只为防同 paper 重复处理；非阻塞取锁 + 跳过，避免任务堆积
 - **核心处理与 LLM 增强解耦**：`done` 只代表「可检索」，不等 LLM；增强/打标放独立守护线程，失败不影响检索可用性
-- **手动 `/process` 不挂锁、不触发打标**：定位为调试/修复入口，刻意轻量（历史遗留，未与后台路径对齐）
+- **手动 `/process` 共享核心锁但不触发打标**：避免与后台交叉重建 chunks，同时保留调试/修复入口的轻量语义。

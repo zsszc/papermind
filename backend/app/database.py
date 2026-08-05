@@ -33,8 +33,9 @@ SCHEMA_MIGRATIONS = {
 
 @event.listens_for(engine, "connect")
 def _set_sqlite_pragma(dbapi_conn, connection_record):
-    """启用 WAL 模式，提升并发写入性能，减少 database locked。"""
+    """启用外键约束与 WAL，保证引用完整性并减少写锁冲突。"""
     cursor = dbapi_conn.cursor()
+    cursor.execute("PRAGMA foreign_keys=ON;")
     cursor.execute("PRAGMA journal_mode=WAL;")
     cursor.execute("PRAGMA synchronous=NORMAL;")
     cursor.close()

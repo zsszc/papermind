@@ -75,6 +75,7 @@ class VectorStore:
             metadatas=metadatas,
             embeddings=embeddings,
         )
+        cache.delete_prefix("semantic_search:")
 
     def search(
         self,
@@ -171,6 +172,8 @@ class VectorStore:
             self.collection.delete(where={"paper_id": paper_id})
         except Exception:
             logger.warning(f"[VectorStore] 删除 paper {paper_id} 向量失败", exc_info=True)
+        finally:
+            cache.delete_prefix("semantic_search:")
 
     @staticmethod
     def _query_with_fallback(collection, query_embedding, n_results, where):

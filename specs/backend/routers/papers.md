@@ -91,8 +91,8 @@
   1. 404 检查；
   2. 清理 ChromaDB 向量（`get_vector_store().delete_by_paper_id`），**失败仅记 warning 不阻断**；
   3. 删除三类本地文件：`{project_root}/{paper.file_path}`、`notes/{paper_id}.md`、`summaries/{paper_id}.md`，**失败仅记 warning**；
-  4. 删 `chunks` 表记录 → **删 `thesis_citations` 中 `paper_id` 关联行（Batch7b-F10 新增级联）** → `db.delete(paper)` → commit。标注（`paper_annotations`）经 ORM `cascade="all, delete-orphan"` 随 paper 删除；`paper_tags` 关联行由多对多关系自动清除。
-- **后置条件**：无论文件/向量清理成败，DB 记录一定删除（清理失败只留日志与孤儿数据）；`thesis_citations` 无指向该论文的悬空引用。
+  4. 删 `chunks`、`thesis_citations`，再删除 `paper_citations` 中全部入边/出边，最后 `db.delete(paper)` → commit。标注与标签关联由 ORM 清除。
+- **后置条件**：SQLite 外键开启时仍可删除；论文引用图和大论文引用均无悬空记录。
 
 ### 3.7 `POST /{paper_id}/tags` — `add_tag_to_paper(paper_id: int, tag_name: str = Form(...), db)`
 
@@ -135,7 +135,7 @@
 
 ### 3.15 `POST /{paper_id}/process` — `process_paper(paper_id, db)`
 
-手动同步重处理。**契约（状态机怪癖、500 时异常原文外泄、不触发打标、无并发锁）见 processor.md §3.4**，本规格不重复。404（paper）；`process()` 抛异常 → 置 `processed="error"` + 500。
+手动同步重处理。与后台任务共享同 paper 锁，冲突 409；开始置 `processing`，仅成功结果置 `done`，异常或非成功结果置 `error` 并返回脱敏 500。详见 processor.md §3.4。
 
 ### 3.16 `POST /{paper_id}/summarize` 与 `GET /{paper_id}/summary`
 

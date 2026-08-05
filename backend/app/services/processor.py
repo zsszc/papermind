@@ -21,7 +21,7 @@ class PaperProcessor:
         pdf_path = config.runtime_root / paper.file_path
 
         if not pdf_path.exists():
-            return {"status": "error", "message": "PDF file not found"}
+            raise FileNotFoundError(f"PDF file not found: {paper.file_path}")
 
         # 1. 提取文本
         pages = self.parser.extract_text(str(pdf_path))

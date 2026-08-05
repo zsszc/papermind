@@ -75,7 +75,7 @@
 - **输出**：204 No Content
 - **后置条件**：会话行删除；其全部消息经 ORM `cascade="all, delete-orphan"`（`models.py` Conversation.messages）**级联删除**
 - **异常**：会话不存在 → 404
-- **副作用**：`conversations` + `messages` 两表写入（删除）；**不清理** `memory_summaries` 中 `source_conversation_id` 指向该会话的短期记忆（残留为无属主数据，memory 路由可独立清理）
+- **副作用**：删除会话与级联消息；关联 `memory_summaries` 保留内容，但 `source_conversation_id` 置空。
 
 ### 3.5 `delete_messages_from(conversation_id, message_id, db)`（`DELETE /api/chat/conversations/{conversation_id}/messages/{message_id}`）
 
@@ -191,7 +191,7 @@
 | LLM 全部重试失败 | 带内错误串作为普通回复渲染并落库；HTTP 200；随后照常 finished 帧 |
 | 客户端流式中断 | CancelledError → assistant 不落库；用户消息已落库；`message_count` 比实际多 1 |
 | LLM 返回全空/纯空白 | 流式：assistant 不落库，仍发 finished 帧 |
-| 删除会话 | 消息级联删除；`memory_summaries` 短期记忆残留（不级联） |
+| 删除会话 | 消息级联删除；来源记忆保留且来源 id 置空 |
 | 删除消息（from 语义） | 目标及其后全部删除；`message_count` 回溯为实际剩余消息数（已修复 Batch7b-F11，修复前不回溯） |
 | regenerate 通过前置校验 | 原地替换内容与 citations（2026-08-04 修复前必因 NameError 失败） |
 | regenerate 目标为 user 消息 / 首条消息 / 前条非 user | 404 / 400 / 400 |

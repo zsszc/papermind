@@ -12,7 +12,7 @@ import json
 
 import pytest
 
-from app.models import Chunk
+from app.models import Chunk, Paper
 from eval.dataset import (
     DEFAULT_SEED_PATH,
     load_dataset,
@@ -151,6 +151,12 @@ def test_resolve_negative_entry_returns_empty(db):
 
 def test_resolve_matches_chunks(db):
     """内存库造 Chunk 记录：按 section/keywords 命中并返回 p{paper_id}_c{i} 形式 id。"""
+    # 先建父文献，保持测试数据符合生产 SQLite 外键约束。
+    db.add_all([
+        Paper(id=1, title="论文一", file_path="papers/one.pdf", filename="one.pdf"),
+        Paper(id=2, title="论文二", file_path="papers/two.pdf", filename="two.pdf"),
+    ])
+    db.commit()
     db.add_all([
         Chunk(paper_id=1, chunk_index=0, section_title="Abstract",
               content="We propose ReCo-MIL for T-stage prediction."),

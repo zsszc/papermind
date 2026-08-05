@@ -9,7 +9,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models import Conversation, Message, Paper
+from app.models import Conversation, MemorySummary, Message, Paper
 from app.schemas import ChatRequest, ConversationResponse, DeepReviewRequest, ImageAnalysisRequest
 from app.core.logger import logger
 from app.services.llm import llm_service
@@ -115,6 +115,9 @@ def delete_conversation(conversation_id: int, db: Session = Depends(get_db)):
     conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
+    db.query(MemorySummary).filter(
+        MemorySummary.source_conversation_id == conversation_id
+    ).update({MemorySummary.source_conversation_id: None}, synchronize_session=False)
     db.delete(conv)
     db.commit()
     return
