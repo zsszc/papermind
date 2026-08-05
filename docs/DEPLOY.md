@@ -158,8 +158,8 @@ Web 控制台：<http://localhost:3001>（宿主端口默认 3001，避开 3000/
 | `PAPERMIND_LANGFUSE_SECRET_KEY` | 项目私钥 | 5.2 节得到的 `sk-lf-...` |
 | `PAPERMIND_LANGFUSE_HOST` | Langfuse 地址 | 宿主机直跑后端：`http://localhost:3001`；后端跑在 compose：`http://langfuse-web:3000`（compose 内网，为 compose 默认值可不设） |
 
-- **宿主机直跑后端**：`export` 上述三个变量后启动 uvicorn。
-- **compose 部署后端**：在 `.env` 填入 `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY`（或直接填 `PAPERMIND_LANGFUSE_*`，优先级更高），`docker-compose.yml` 会自动透传给 backend 容器。
+- **宿主机直跑后端**：`export` 上述三个变量后启动 uvicorn。**若系统设了全局代理**（macOS 系统代理或 shell `HTTP_PROXY`），必须同时 `export NO_PROXY="localhost,127.0.0.1"`——否则 SDK 会把 localhost 的 trace 上报路由进代理，报 `Bad gateway`。
+- **compose 部署后端**：在 `.env` 填入 `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY`（或直接填 `PAPERMIND_LANGFUSE_*`，优先级更高），`docker-compose.yml` 会自动透传给 backend 容器（compose 已为 backend 预置 `NO_PROXY` 含 `langfuse-web`）。
 
 配置后重启后端，在 Langfuse 控制台「Traces」中即可看到每次对话的 prompt、延迟与 token 统计；trace metadata 关联 conversation_id / skill / 检索 chunk 数。
 

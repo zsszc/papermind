@@ -61,11 +61,11 @@
 
 ## 6. 验收标准（可测试）
 
-- [ ] AC1：未配置环境变量时 `test_llm.py` 全绿且无 Langfuse import 副作用
-- [ ] AC2：mock langfuse client 下，三方法调用产生预期 trace 字段（测试断言 metadata/耗时/error 路径）
-- [ ] AC3：langfuse client 初始化抛异常 → 降级 warning，三方法行为不变（新用例）
-- [ ] AC4：`docker compose --profile langfuse config` 校验通过；DEPLOY.md 章节可复现启动
-- [ ] AC5：`pip check` 零冲突；全套件全绿
+- [x] AC1：未配置环境变量时 `test_llm.py` 全绿且无 Langfuse import 副作用（D2 子代理交付，45364c1）
+- [x] AC2：mock langfuse client 下，三方法调用产生预期 trace 字段（测试断言 metadata/耗时/error 路径）（同上）
+- [x] AC3：langfuse client 初始化抛异常 → 降级 warning，三方法行为不变（新用例）（同上）
+- [x] AC4：`docker compose --profile langfuse config` 校验通过；DEPLOY.md 章节可复现启动——**2026-08-05 端到端实证**：全栈 6 容器 healthy，web HTTP 200，真实 LLM 调用 trace 落库可查（修复四坑后达成，见 e92ee29）
+- [x] AC5：`pip check` 零冲突；全套件全绿（356 passed；pip check 验证须 env -u PYTHONPATH 否则幽灵冲突误报）
 
 ## 7. 现有测试覆盖与盲区
 
