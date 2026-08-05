@@ -385,8 +385,14 @@ async def analyze_thesis(
         suggestions = await llm_service.chat_completion(messages)
         logger.info(f"[ThesisAnalyze] thesis_id={thesis_id} 成功获取评审意见，长度={len(suggestions)}")
     except Exception as e:
+        # 异常脱敏（宪法第 13 条）：通用文案回前端，异常原文与堆栈只入日志
         logger.exception(f"[ThesisAnalyze] thesis_id={thesis_id} LLM 调用失败")
-        raise HTTPException(status_code=500, detail=f"AI 评审调用失败: {e}") from e
+        raise HTTPException(status_code=500, detail="AI 评审失败，请稍后再试") from e
+
+    if suggestions.startswith("[调用 LLM 出错"):
+        # llm_service 错误串可能携带异常原文（_format_error 兜底透传），转为通用 500，原文只入日志
+        logger.warning(f"[ThesisAnalyze] thesis_id={thesis_id} 返回错误内容: {suggestions}")
+        raise HTTPException(status_code=500, detail="AI 评审失败，请稍后再试")
 
     try:
         citations_query = db.query(ThesisCitation).filter(ThesisCitation.thesis_id == thesis_id)
@@ -445,7 +451,17 @@ async def suggest_citations(
         {"role": "system", "content": "你是学术写作助手，擅长为论文段落推荐合适的参考文献。"},
         {"role": "user", "content": prompt},
     ]
-    result = await llm_service.chat_completion(messages)
+    try:
+        result = await llm_service.chat_completion(messages)
+    except Exception as e:
+        # 异常脱敏（宪法第 13 条）：通用文案回前端，异常原文与堆栈只入日志
+        logger.exception(f"[ThesisSuggest] thesis_id={thesis_id} LLM 调用失败")
+        raise HTTPException(status_code=500, detail="引用推荐失败，请稍后再试") from e
+
+    if result.startswith("[调用 LLM 出错"):
+        # llm_service 错误串可能携带异常原文（_format_error 兜底透传），转为通用 500，原文只入日志
+        logger.warning(f"[ThesisSuggest] thesis_id={thesis_id} 返回错误内容: {result}")
+        raise HTTPException(status_code=500, detail="引用推荐失败，请稍后再试")
 
     return {
         "thesis_id": thesis_id,

@@ -109,7 +109,7 @@ AI 章节评审。
   3. 文本截断 6000 字符；`strip` 后 < 30 字符 → 400「章节内容为空或过短，无法生成评审意见」；
   4. 调 `llm_service.chat_completion(messages)`（system 写死「医学图像分析和深度学习领域」，prompt 要求四段式 Markdown 评审）；
   5. 返回 `ThesisAnalyzeResponse{thesis_id, chapter_title, suggestions, citations}`；citations 按 `chapter_index` 过滤（未指定时为全论文引用）。
-- **异常**：LLM 调用失败 → 500 且 `detail=f"AI 评审调用失败: {e}"`（**异常原文外泄**，与全局脱敏约定不符）；响应序列化失败 → 500。
+- **异常（已修复 Batch7b-F8，宪法第 13 条）**：LLM 调用抛异常，或返回串以 `[调用 LLM 出错` 开头（llm_service 错误格式化产物，`_format_error` 兜底透传异常原文）→ 均 500 通用文案「AI 评审失败，请稍后再试」，原文仅入日志；修复前抛异常路 detail 直给 `f"AI 评审调用失败: {e}"`，错误串路则以 200 把错误串带进 `suggestions` 字段。响应序列化失败 → 500。
 - **副作用**：一次 LLM 调用；**不写库、不写文件**（评审意见不落盘，前端刷新即失）。
 
 ### 3.11 `POST /{thesis_id}/suggest-citations` — `suggest_citations(thesis_id, paragraph: str, db)`
@@ -119,7 +119,7 @@ AI 章节评审。
 - **输入**：`paragraph: str` 为**查询参数**（标量无 Body 声明）——长段落走 query string，受 URL 长度限制。
 - **行为**：404（thesis）；`get_vector_store()` 可用时 `store.search(query=paragraph, top_k=5)` 取候选片段（**不可用时 `retrieved=[]`，context 为空串仍继续调 LLM**——降级不短路）；拼 prompt 要求推荐 3–5 篇；调 `llm_service.chat_completion`。
 - **输出**：`{"thesis_id", "paragraph", "suggestions"（LLM 原始 Markdown 文本，非结构化）, "citations": retrieved（检索原始片段列表）}`。
-- **异常**：LLM 调用异常**未捕获**，向外传播经全局脱敏为 500。
+- **异常（已修复 Batch7b-F8，宪法第 13 条）**：LLM 调用抛异常，或返回串以 `[调用 LLM 出错` 开头 → 均 500 通用文案「引用推荐失败，请稍后再试」，原文仅入日志；修复前抛异常路由全局异常处理器兜底 500（文案不含路由语义），错误串路则以 200 把错误串带进 `suggestions` 字段。
 - **注意**：`paragraph` 仅用于检索与 prompt，**不校验它是否真属于该 thesis**；thesis_id 只作存在性检查与回填。
 
 ## 4. 边界条件与错误处理
@@ -136,7 +136,7 @@ AI 章节评审。
 | 引用落在所有章节范围外 | `chapter_index=None`；计入 total，不进任何章的 citation-map |
 | `chapter_index` 负数 | `/chapters/{i}/text` 400；`/analyze` **放行**（负索引取倒数章，怪癖） |
 | 章节文本 < 30 字符 | `/analyze` 400 |
-| LLM 评审失败 | 500，detail 含异常原文（脱敏例外，同 papers 的 /process） |
+| LLM 评审/引用推荐失败 | 500 通用文案（「AI 评审失败，请稍后再试」/「引用推荐失败，请稍后再试」），异常原文仅入日志；LLM 错误串不再以 200 混入 `suggestions`（已修复 Batch7b-F8） |
 | 向量库不可用 | `/suggest-citations` 以空候选继续调 LLM，正常 200 |
 | 取消引用关联 | `PUT citations/{id}` 传 `{"paper_id": null}` → 解除；传不存在的 paper_id → 404 |
 | 删除 thesis 后 | citations 一并删除；`paper_stats` 的 citation_graph 自动消失（按现存记录生成） |
@@ -163,8 +163,7 @@ AI 章节评审。
 - **已覆盖**：`backend/tests/test_upload.py` 三个 thesis 用例——`test_thesis_upload_oversized_returns_413`（阈值 monkeypatch + 无残留）、`test_thesis_upload_invalid_extension_returns_400`、`test_thesis_upload_small_docx_success`（mock `DocxParser.parse`，验证 title/落盘）。其余测试文件不触 `/api/thesis` 任何端点。
 - **盲区**：
   - **高**：引用自动匹配 `find_paper_by_citation`（数字引用落空、作者-年份子串匹配、年份过滤、多命中不确定性）无测试（AC3）——引用治理的核心正确性
-  - **高**：`/analyze` 全链路（章节选择、30 字符下限、6000 截断、LLM 失败 500、citations 按章过滤）无测试（AC8）
-  - **高**：`/suggest-citations`（向量库可用/降级两路、LLM 异常传播）无测试（AC9）
+  - **高**：~~`/analyze` LLM 失败路径~~ 与 ~~`/suggest-citations` LLM 异常传播~~ **已修复（Batch7b-F8）**：`tests/test_routes_sanitize.py::TestAnalyzeSanitize` / `TestSuggestCitationsSanitize` 固化（抛异常与 `[调用 LLM 出错` 错误串两路均 500 通用文案、特征串不出现、400 文案与成功路径不回归、向量库不可用降级 200）；`/analyze` 的章节选择/30 字符下限/6000 截断/citations 按章过滤其余链路仍无测试（AC8 部分）
   - **中**：citation-map 聚合语义（chapter_index=None 排除、matched 计数、paper_titles 预加载）无测试（AC6）
   - **中**：引用手动关联/解除（双条件 404、paper 校验）无测试（AC5）
   - **中**：同名 `_1/_2` 改名与重复上传不去重无测试（AC4）
@@ -183,4 +182,4 @@ AI 章节评审。
 - **章节正文/analyze 每次重解析 docx**：无缓存换实现简单与「文件被外部替换后行为一致」；docx 解析开销可接受。
 - **评审意见不落盘**：定位为即时辅助，历史评审无管理需求；citations 随响应回传供前端并排展示。
 - **`ThesisAnalyzeRequest()` 默认实例作参数缺省**：让「不传 body 分析绪论」成为最简调用路径；FastAPI 对缺省 body 模型按可选处理（现状可用，升级 FastAPI 时需回归验证）。
-- **LLM 失败 detail 透传异常原文**：与全局脱敏约定（宪法第 13 条）不一致，属历史遗留（papers 的 `/process`、`/summarize` 同款），修订时应统一为通用文案 + error_code 并同步本规格。
+- **~~LLM 失败 detail 透传异常原文~~ 已统一脱敏（Batch7b-F8）**：`/analyze`、`/suggest-citations` 与 papers `/summarize` 同按宪法第 13 条收口——LLM 抛异常与 `[调用 LLM 出错` 错误串两路均改通用文案（原文仅入日志）；papers `/process` 的 `f"处理失败: {e}"` 仍为脱敏例外（归 processor.md §3.4，后续批次处理）。

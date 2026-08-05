@@ -265,7 +265,7 @@ def _process_paper_background(paper_id: int):
     threading.Thread(target=_enhance_paper_metadata, args=(paper_id,), daemon=True).start()
 
 
-@router.post("/import", response_model=PaperListResponse)
+@router.post("/import")
 async def import_papers(
     files: List[UploadFile] = File(...),
     background_tasks: BackgroundTasks = None,
@@ -274,9 +274,10 @@ async def import_papers(
     papers_dir = get_papers_dir()
     parser = PDFParser()
     imported = []
+    errors = []
 
     for file in files:
-        # 扩展名白名单：仅允许 PDF
+        # 扩展名白名单：仅允许 PDF（校验失败仍整体中止，保持 400/413 契约不变）
         if not file.filename or not file.filename.lower().endswith(".pdf"):
             raise HTTPException(status_code=400, detail=f"只支持 .pdf 文件: {file.filename or '未命名文件'}")
 
@@ -298,52 +299,70 @@ async def import_papers(
             target_path = papers_dir / f"{stem}_{counter}{suffix}"
             counter += 1
 
-        # 分块异步写盘，避免同步写阻塞事件循环
-        await _save_upload_file(file, target_path)
-
+        # 逐篇容错（Batch7b-F9）：写盘/建档/笔记任一环节失败，清理该篇已落盘的
+        # PDF 与笔记文件并回滚其 DB 记录，记入错误标记后继续后续篇目，不留孤儿文件
+        note_path = None
         try:
-            metadata = await run_in_threadpool(parser.parse_metadata, str(target_path))
+            # 分块异步写盘，避免同步写阻塞事件循环
+            await _save_upload_file(file, target_path)
+
+            try:
+                metadata = await run_in_threadpool(parser.parse_metadata, str(target_path))
+            except Exception as e:
+                logger.warning(f"[import] 解析元数据失败 {safe_name}: {e}")
+                metadata = {"parse_error": str(e)}
+
+            paper = Paper(
+                title=metadata.get("title") or target_path.stem,
+                authors=metadata.get("authors"),
+                year=metadata.get("year"),
+                journal=metadata.get("journal"),
+                abstract=metadata.get("abstract"),
+                doi=metadata.get("doi"),
+                pages=metadata.get("pages"),
+                file_path=str(target_path.relative_to(Path(__file__).resolve().parents[3])),
+                filename=target_path.name,
+                status="unread",
+                source="local",
+                metadata_json=metadata,
+            )
+            db.add(paper)
+            db.flush()
+
+            # 创建对应的空笔记文件（放线程池，避免同步写盘阻塞事件循环）
+            notes_dir = get_notes_dir()
+            note_path = notes_dir / f"{paper.id}.md"
+            note_content = f"# {paper.title or paper.filename}\n\n"
+            await run_in_threadpool(note_path.write_text, note_content, "utf-8")
+
+            # 逐篇提交：失败篇目回滚不影响已成功篇目（批量导入通常个位数文件，吞吐损失可忽略）
+            db.commit()
+            db.refresh(paper)
+
+            # 后台自动处理
+            if background_tasks:
+                background_tasks.add_task(_process_paper_background, paper.id)
+
+            imported.append(paper)
         except Exception as e:
-            logger.warning(f"[import] 解析元数据失败 {safe_name}: {e}")
-            metadata = {"parse_error": str(e)}
+            # 异常原文只入日志（宪法第 13 条），错误标记用通用文案
+            logger.error(f"[import] 导入失败 {safe_name}，清理残留文件: {e}", exc_info=True)
+            db.rollback()
+            for path in (target_path, note_path):
+                if path is None:
+                    continue
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            errors.append({"filename": safe_name, "detail": "该文件导入失败，已清理残留文件"})
+            continue
 
-        paper = Paper(
-            title=metadata.get("title") or target_path.stem,
-            authors=metadata.get("authors"),
-            year=metadata.get("year"),
-            journal=metadata.get("journal"),
-            abstract=metadata.get("abstract"),
-            doi=metadata.get("doi"),
-            pages=metadata.get("pages"),
-            file_path=str(target_path.relative_to(Path(__file__).resolve().parents[3])),
-            filename=target_path.name,
-            status="unread",
-            source="local",
-            metadata_json=metadata,
-        )
-        db.add(paper)
-        db.flush()
-
-        # 创建对应的空笔记文件（放线程池，避免同步写盘阻塞事件循环）
-        notes_dir = get_notes_dir()
-        note_path = notes_dir / f"{paper.id}.md"
-        note_content = f"# {paper.title or paper.filename}\n\n"
-        await run_in_threadpool(note_path.write_text, note_content, "utf-8")
-
-        # 后台自动处理
-        if background_tasks:
-            background_tasks.add_task(_process_paper_background, paper.id)
-
-        imported.append(paper)
-
-    db.commit()
-    for p in imported:
-        db.refresh(p)
-
-    return PaperListResponse(
-        total=len(imported),
-        items=[PaperListItem.model_validate(p) for p in imported],
-    )
+    return {
+        "total": len(imported),
+        "items": [PaperListItem.model_validate(p) for p in imported],
+        "errors": errors,
+    }
 
 
 @router.get("", response_model=PaperListResponse)
@@ -495,6 +514,8 @@ def delete_paper(paper_id: int, db: Session = Depends(get_db)):
             logger.warning(f"[delete] 清理文件失败 {file_path}: {e}")
 
     db.query(Chunk).filter(Chunk.paper_id == paper_id).delete()
+    # 级联清理大论文引用关联行，避免 thesis_citations 悬空指向已删文献（Batch7b-F10）
+    db.query(ThesisCitation).filter(ThesisCitation.paper_id == paper_id).delete()
     db.delete(paper)
     db.commit()
     return
@@ -743,12 +764,14 @@ async def summarize_paper(paper_id: int, db: Session = Depends(get_db)):
         summary = await llm_service.chat_completion(messages, timeout=300)
         logger.info(f"[Summarize] paper_id={paper_id} summary_len={len(summary)}")
     except Exception as e:
+        # 异常脱敏（宪法第 13 条）：通用文案回前端，异常原文与堆栈只入日志
         logger.exception(f"[Summarize] paper_id={paper_id} LLM 调用失败")
-        raise HTTPException(status_code=504, detail=f"AI 概括调用失败: {e}") from e
+        raise HTTPException(status_code=504, detail="AI 概括失败，请稍后再试") from e
 
     if summary.startswith("[调用 LLM 出错"):
+        # llm_service 错误串可能携带异常原文（_format_error 兜底透传），同样只入日志不外发
         logger.warning(f"[Summarize] paper_id={paper_id} 返回错误内容: {summary}")
-        raise HTTPException(status_code=504, detail=summary)
+        raise HTTPException(status_code=504, detail="AI 概括失败，请稍后再试")
 
     summaries_dir = get_summaries_dir()
     summary_path = summaries_dir / f"{paper_id}.md"

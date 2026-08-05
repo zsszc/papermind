@@ -40,9 +40,9 @@
 批量导入 PDF。
 
 - **输入**：multipart 文件列表 `files`。
-- **输出**：`PaperListResponse{total, items[PaperListItem]}`，仅含本次成功导入的论文（`db.refresh` 后）。
+- **输出**：未声明 response_model 的 dict：`{total, items[PaperListItem], errors[{filename, detail}]}`——`items` 仅含本次成功导入的论文（逐篇 commit + refresh 后），`errors` 为失败篇目的错误标记（通用文案，不含异常原文）。**已修复（Batch7b-F9）**：原 `response_model=PaperListResponse`，无 errors 字段。
 - **行为（对每个文件，顺序固定）**：
-  1. 扩展名白名单：`filename` 为空或不以 `.pdf` 结尾（`lower()` 后判断）→ 400「只支持 .pdf 文件: <文件名>」；
+  1. 扩展名白名单：`filename` 为空或不以 `.pdf` 结尾（`lower()` 后判断）→ 400「只支持 .pdf 文件: <文件名>」（校验失败仍整体中止）；
   2. 声明大小快筛：`file.size > MAX_UPLOAD_SIZE`（50MB）→ 413；
   3. `safe_name = Path(file.filename).name`（剥离目录成分）；
   4. **重名改名**：目标已存在则依次尝试 `{stem}_1{suffix}`、`{stem}_2`……直到不重名；
@@ -50,10 +50,10 @@
   6. `PDFParser().parse_metadata` 放线程池执行；**解析异常不阻断导入**，降级为 `metadata = {"parse_error": str(e)}`；
   7. 建 `Paper`（`title` 取元数据标题或文件 stem，`status="unread"`、`source="local"`、`file_path` 为相对项目根路径、`metadata_json=metadata`），`db.flush()` 分配 id；
   8. 创建空笔记 `notes/{paper.id}.md`，内容为 `# {title 或 filename}\n\n`（线程池写入）；
-  9. `background_tasks.add_task(_process_paper_background, paper.id)`——响应返回后触发后台处理（状态机见 processor.md §3.3）。
-- **后置条件**：全部文件处理完后统一 `db.commit()`；PDF 已落盘、笔记已创建、每条 Paper 已登记后台任务。
-- **副作用**：文件 I/O（`papers/`、`notes/`）；DB 写入；登记后台任务（间接触发解析/向量化/LLM 增强/打标）。
-- **异常**：400（扩展名）、413（超限）。**中途失败语义**：第 N 个文件抛错时已处理的前 N-1 个文件因未 `commit` 而**回滚 DB 记录，但 PDF 与笔记文件已残留在磁盘上**（孤儿文件，无清理）。
+  9. **逐篇 commit + refresh**（Batch7b-F9，替代原循环外统一 commit）；
+  10. `background_tasks.add_task(_process_paper_background, paper.id)`——响应返回后触发后台处理（状态机见 processor.md §3.3）。
+- **中途失败语义（已修复 Batch7b-F9）**：第 5/7/8 步任一环节抛错 → `logger.error(exc_info=True)` + `db.rollback()` + **删除该篇已落盘的 PDF 与笔记文件（missing_ok 容错）** + `errors` 记错误标记（`{"filename", "detail": "该文件导入失败，已清理残留文件"}`）→ `continue` 后续篇目。DB 无该篇记录（逐篇回滚），已成功篇目不受影响，磁盘不留孤儿文件。
+- **后置条件**：成功篇目 PDF 已落盘、笔记已创建、已登记后台任务；失败篇目无文件残留、无 DB 记录。
 - **契约引用**：`_process_paper_background` 的状态机/重试/锁见 processor.md §3.3；`parse_metadata` 的字段语义（`journal`/`abstract` 恒 None）见 pdf_parser.md §3.1。
 
 ### 3.2 `GET ""` — `list_papers(skip: int = 0, limit: int = 20, status: Optional[str] = None, tag: Optional[str] = None, q: Optional[str] = None, ...)`
@@ -91,9 +91,8 @@
   1. 404 检查；
   2. 清理 ChromaDB 向量（`get_vector_store().delete_by_paper_id`），**失败仅记 warning 不阻断**；
   3. 删除三类本地文件：`{project_root}/{paper.file_path}`、`notes/{paper_id}.md`、`summaries/{paper_id}.md`，**失败仅记 warning**；
-  4. 删 `chunks` 表记录 → `db.delete(paper)` → commit。标注（`paper_annotations`）经 ORM `cascade="all, delete-orphan"` 随 paper 删除；`paper_tags` 关联行由多对多关系自动清除。
-- **已知悬空**：`thesis_citations.paper_id` 不清理——被大论文引用记录指向已删论文（SQLite 默认不强制外键，无级联；stats/citation-map 读侧以 `paper_id.isnot(None)` + join 容忍）。
-- **后置条件**：无论文件/向量清理成败，DB 记录一定删除（清理失败只留日志与孤儿数据）。
+  4. 删 `chunks` 表记录 → **删 `thesis_citations` 中 `paper_id` 关联行（Batch7b-F10 新增级联）** → `db.delete(paper)` → commit。标注（`paper_annotations`）经 ORM `cascade="all, delete-orphan"` 随 paper 删除；`paper_tags` 关联行由多对多关系自动清除。
+- **后置条件**：无论文件/向量清理成败，DB 记录一定删除（清理失败只留日志与孤儿数据）；`thesis_citations` 无指向该论文的悬空引用。
 
 ### 3.7 `POST /{paper_id}/tags` — `add_tag_to_paper(paper_id: int, tag_name: str = Form(...), db)`
 
@@ -144,7 +143,7 @@
   - **前置**：paper 存在（404）；`processed == "done"`（否则 400「论文尚未处理完成，请稍后再试」）；存在 chunk（否则 400「论文内容为空，无法生成概括」）。
   - **行为**：拼接**全部** chunks 内容按字符截断到 6000 → 调 `llm_service.chat_completion(messages, timeout=300)`（prompt 含六段固定结构，第 5 段写死「与结直肠癌 T 分期预测研究的关联」）。
   - **后置**：成功时把 `# {title}\n\n{summary}\n` 覆写 `summaries/{paper_id}.md`；返回 `{"paper_id", "summary"}`。
-  - **异常**：LLM 调用抛异常 → 504（detail 含异常原文，与脱敏约定不符）；返回串以 `[调用 LLM 出错` 开头（llm_service 的错误格式化产物）→ 504。
+  - **异常（已修复 Batch7b-F8，宪法第 13 条）**：LLM 调用抛异常，或返回串以 `[调用 LLM 出错` 开头（llm_service 的错误格式化产物，`_format_error` 兜底会透传异常原文）→ 均 504 通用文案「AI 概括失败，请稍后再试」，异常原文/错误串仅入日志（`logger.exception` / `logger.warning`）；修复前 detail 直给 `f"AI 概括调用失败: {e}"` 或错误串原文。
 - `GET`：读概括文件；paper 不存在 → 404；文件不存在 → 404「尚未生成 AI 概括」；剥离首行 `# ` 标题行后返回正文 `{"paper_id", "summary"}`。
 
 ### 3.17 标注 `GET|POST /{paper_id}/annotations`、`DELETE /{paper_id}/annotations/{annotation_id}`
@@ -187,7 +186,7 @@
 | 声明大小或实际字节 > 50MB | 413；`_save_upload_file` 清理残留文件，磁盘无半成品 |
 | 同名文件重复导入 | 自动改名 `name_1.pdf`、`name_2.pdf`……DB 中 `filename` 为改名后名字，标题元数据不受改名影响 |
 | 文件名含路径成分（如 `../../x.pdf`） | `Path(filename).name` 剥目录，只取末段文件名写入 `papers/` |
-| 多文件批量导入中途失败 | 已处理文件 DB 回滚（commit 在循环外），但 PDF/笔记文件残留磁盘成孤儿 |
+| 多文件批量导入中途失败 | 失败篇目：DB 回滚 + 已落盘 PDF/笔记清理 + errors 错误标记，继续后续篇目；已成功篇目不受影响（已修复 Batch7b-F9，原「DB 回滚但文件残留成孤儿」） |
 | 损坏 PDF 导入 | `parse_metadata` 异常容错为 `{"parse_error": ...}`，导入继续，标题兜底为文件 stem |
 | 列表 `limit > 200` 或 < 1 | 钳制到 200 / 1 |
 | 多标签筛选 `tag=a,b` | OR 语义（in_），非 AND |
@@ -197,7 +196,7 @@
 | `read-progress` 传入 0/负数页码 | 钳为 1 |
 | `batch/tags` 传非法 action | 静默无操作，200 |
 | summarize 时 `processed != "done"` 或无 chunk | 400 |
-| LLM 概括超时/失败 | 504（detail 含异常原文）；已生成的旧概括文件不受影响 |
+| LLM 概括超时/失败 | 504 通用文案「AI 概括失败，请稍后再试」，异常原文仅入日志（已修复 Batch7b-F8）；已生成的旧概括文件不受影响 |
 | 后台增强线程 LLM 故障 | paper 保持规则元数据，abstract/journal 恒空；打标连锁跳过；仅日志可见 |
 | 同 paper 并发触发后台处理 | 后到任务取锁失败跳过（processor.md §3.3） |
 
@@ -211,7 +210,7 @@
 - [ ] AC1：上传 > 50MB（测试中 monkeypatch 调小阈值）返回 413 且目标目录无残留文件
 - [ ] AC2：上传非 .pdf 返回 400；上传合法小 PDF 返回 200，PDF 落盘、`notes/{id}.md` 创建、Paper 记录存在
 - [ ] AC3：同名文件二次导入落盘为 `name_1.pdf`，两条 Paper 记录各自独立
-- [ ] AC4：多文件导入中第 2 个文件 400/413 时，第 1 个文件无 DB 记录（回滚语义；文件残留为已知行为）
+- [ ] AC4：多文件导入中第 2 个文件处理失败时，第 1 个文件成功保留、第 2 个文件无 PDF/笔记残留且无 DB 记录、响应带 errors 错误标记（已修复 Batch7b-F9，原「整体回滚 + 文件残留」语义废弃）
 - [ ] AC5：`GET ""` 的 status/tag（单、多）/q 过滤与 `limit` 钳制（>200 → 200）符合 §3.2；`total` 为分页前计数
 - [ ] AC6：`PUT /{paper_id}` 只更新传入字段，未传字段保持原值
 - [ ] AC7：`DELETE /{paper_id}` 后 chunks/annotations/关联标签行清除，PDF/笔记/概括文件删除
@@ -225,11 +224,11 @@
 - **已覆盖**：`backend/tests/test_upload.py` 三个 papers 用例——`test_import_oversized_pdf_returns_413`（monkeypatch 阈值 + 无残留）、`test_import_invalid_extension_returns_400`、`test_import_small_pdf_success`（落盘 + 记录 + 空笔记，后台处理整体桩掉）。其余 14 个测试文件不触 papers HTTP 端点（test_mcp 直调 mcp_server 函数，test_search 直建 ORM）。
 - **盲区**：
   - **高**：列表过滤语义（status/tag 单多与 OR/q/分页钳制、total 语义）无测试（AC5）
-  - **高**：`PUT` 部分更新、`DELETE` 的级联清理（chunks/annotations/文件/向量）无测试（AC6、AC7）
+  - **高**：`PUT` 部分更新、`DELETE` 的级联清理（chunks/annotations/文件/向量）无测试（AC6、AC7）——其中 thesis_citations 级联删除**已修复（Batch7b-F10）**：`tests/test_papers_integrity.py::TestDeletePaperCascadesCitations` 固化（关联行删除、他篇引用与大论文不受影响、无引用时正常删除）
   - **高**：`_enhance_paper_metadata` 守护线程全链路（字段覆盖/保留、打标连锁跳过、异常不改 processed）无测试（AC10）——abstract 空值问题的核心链路
-  - **高**：summarize 的前置 400（未 done/无 chunk）、504 路径、文件覆写与 `GET /summary` 标题行剥离无测试（AC9）
+  - **高**：~~summarize 的 504 路径~~ **已修复（Batch7b-F8）**：`tests/test_routes_sanitize.py::TestSummarizeSanitize` 固化（抛异常与 `[调用 LLM 出错` 错误串两路均 504 通用文案、特征串不出现、成功路径与前置 400 不回归）；前置 400（未 done/无 chunk）与文件覆写/`GET /summary` 标题行剥离已有成功路径守卫
   - **中**：同名 `_1/_2` 改名、文件名路径剥离无测试（AC3）
-  - **中**：批量导入中途失败的「DB 回滚 + 文件残留」语义无测试（AC4）
+  - **中**：~~批量导入中途失败的「DB 回滚 + 文件残留」语义无测试（AC4）~~ **已修复（Batch7b-F9）**：`tests/test_papers_integrity.py::TestImportOrphanCleanup` 固化（写盘失败/笔记写入失败/全部失败三场景：成功篇保留、失败篇文件清理 + DB 回滚 + errors 标记、缺失文件清理容错）
   - **中**：批量三端点（静默跳过不存在 id、非法 action 空操作）无测试
   - **中**：`/stats/overview`（含 citation_graph、N+1）无测试
   - **中**：标注 CRUD 与跨论文删除防护无测试（AC11）
@@ -240,7 +239,7 @@
 
 - **上传先快筛后兜底**：声明大小（`file.size`）快筛 + 实际字节数兜底——声明可伪造/缺失，分块计数才是最终防线；任何写盘失败清理残留，避免损坏 PDF 入库（宪法第 12 条配套）。
 - **解析失败不阻断导入**：`parse_metadata` 异常降级为 `parse_error` 记录，保证「任何 PDF 都能建档」；更精确的元数据交给后台 LLM 增强（pdf_parser.md §8 的设计配套）。
-- **commit 在循环外**：批量导入一次 commit 换吞吐；代价是中途失败留下孤儿文件（DB 回滚而文件已落盘），单用户场景接受，未做补偿清理。
+- **~~commit 在循环外~~ 逐篇容错 + 逐篇 commit（Batch7b-F9）**：原「一次 commit 换吞吐」的代价是中途失败留下孤儿文件（DB 回滚而文件已落盘）；现改为逐篇 commit——失败篇目独立回滚并清理其已落盘的 PDF/笔记、记入 errors 标记后继续，单用户批量导入通常个位数文件，吞吐损失可忽略。
 - **核心处理与 LLM 增强解耦 + 同步镜像**：后台线程无事件循环，复用 async client 会跨事件循环崩溃（历史事故），故路由层维护一份 `_enhance_metadata_with_llm_sync` 同步镜像，prompt 需与 pdf_parser 异步版手工保持一致——**双份维护是已知腐化点**（pdf_parser.md §3.2 注释亦明示）。
 - **增强/打标失败静默化**：只记日志、不动 `processed`——保证检索可用性不被 LLM 故障连累；代价是 abstract/journal/标签缺失用户无感知（真实库 19/19 篇 abstract 为空的直接成因，见 pdf_parser.md §8）。
 - **删除尽力清理**：向量/文件清理失败不阻断 DB 删除——避免一次 ChromaDB 故障导致无法删文献；代价是可能留孤儿数据。
