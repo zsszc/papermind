@@ -20,6 +20,12 @@ name: papermind
 
 # Langfuse v3 web / worker 共享环境变量（YAML 锚点复用）
 x-langfuse-common-env: &langfuse-common-env
+  # 屏蔽 Docker Desktop/CLI 注入的代理变量：容器间 HTTP 走 compose 内网，
+  # 代理指向的 127.0.0.1 在容器内是空环回，busybox wget 又不认 no_proxy
+  HTTP_PROXY: ""
+  HTTPS_PROXY: ""
+  http_proxy: ""
+  https_proxy: ""
   DATABASE_URL: postgresql://langfuse:${LANGFUSE_POSTGRES_PASSWORD:-postgres}@postgres:5432/langfuse
   CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
   CLICKHOUSE_URL: http://clickhouse:8123
@@ -63,6 +69,9 @@ services:
       PAPERMIND_LANGFUSE_PUBLIC_KEY: ${PAPERMIND_LANGFUSE_PUBLIC_KEY:-${LANGFUSE_PUBLIC_KEY:-}}
       PAPERMIND_LANGFUSE_SECRET_KEY: ${PAPERMIND_LANGFUSE_SECRET_KEY:-${LANGFUSE_SECRET_KEY:-}}
       PAPERMIND_LANGFUSE_HOST: ${PAPERMIND_LANGFUSE_HOST:-http://langfuse-web:3000}
+      # 访问 langfuse-web 走 compose 内网，须绕过注入的代理变量
+      NO_PROXY: "localhost,127.0.0.1,langfuse-web"
+      no_proxy: "localhost,127.0.0.1,langfuse-web"
     volumes:
       # 配置文件（只读，含 API Key，不 baked 进镜像）
       - ./config.yaml:/app/config.yaml:ro
@@ -161,14 +170,24 @@ services:
     image: clickhouse/clickhouse-server:24.12-alpine
     container_name: papermind-langfuse-clickhouse
     profiles: ["langfuse"]
+    # 官方镜像默认仅监听回环（config.xml 只开 ::1/127.0.0.1），
+    # compose 内网访问与健康检查都要求监听全部接口；
+    # "--" 分隔符必需：listen_host 是配置覆盖项不是程序选项（缺了会报 Unknown option）
+    command: ["--", "--listen_host=0.0.0.0"]
     environment:
       CLICKHOUSE_DB: default
       CLICKHOUSE_USER: clickhouse
       CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD:-clickhouse}
+      # 健康检查走本容器 localhost，须屏蔽注入的代理变量（busybox wget 不认 no_proxy）
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
     volumes:
       - langfuse-clickhouse-data:/var/lib/clickhouse
     healthcheck:
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
+      # 显式 IPv4：busybox wget 解析 localhost 优先 ::1，而服务只听 IPv4 时会误判
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://127.0.0.1:8123/ping || exit 1"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -196,6 +215,27 @@ services:
     volumes:
       - langfuse-minio-data:/data
     restart: unless-stopped
+
+  # 一次性初始化：创建 langfuse 事件桶（v3 web 不自动建桶，缺桶会 500 拒收事件）
+  minio-init:
+    image: minio/mc:latest
+    container_name: papermind-langfuse-minio-init
+    profiles: ["langfuse"]
+    depends_on:
+      - minio
+    environment:
+      LANGFUSE_MINIO_ROOT_PASSWORD: ${LANGFUSE_MINIO_ROOT_PASSWORD:-miniosecret}
+      # 屏蔽注入的代理变量（容器内 127.0.0.1 是空环回）
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+    entrypoint: >
+      /bin/sh -c "
+      sleep 3;
+      mc alias set s3 http://minio:9000 minio '${LANGFUSE_MINIO_ROOT_PASSWORD:-miniosecret}';
+      mc mb -p s3/langfuse;
+      "
 
 volumes:
   # Langfuse 栈数据卷（local 驱动，固定卷名，数据不出本机）
