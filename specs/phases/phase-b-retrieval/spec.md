@@ -36,8 +36,8 @@ Phase A 基线（1 篇示例论文）：keyword-only recall@5=0.447，hybrid rec
 
 - **生成时机**：论文入库处理流水线（processor）分块完成后
 - **内容来源**：`paper.abstract` 非空 → 用之；否则取第一页文本前 1500 字符（学术 PDF 首页通常含摘要段）
-- **标记**：`chunk_type: "abstract"`；chunk id 形如 `p{paper_id}_abstract`
-- **幂等**：重复处理同篇论文时先删旧摘要 chunk 再写（不产生重复）
+- **标记**：`chunk_type: "abstract"`；chunk id 形如 `p{paper_id}_abstract`；**`chunk_index: -1`**（2026-08-05 实证补充：TextChunker 的段落分类器也会把以 Abstract 开头的普通段落标为 `chunk_type=abstract`，区分两者的唯一可靠依据是 `chunk_index=-1` 或 id 模式；消费方查询摘要级 chunk 必须带此过滤）
+- **幂等**：重复处理同篇论文时先删旧摘要 chunk 再写（不产生重复；19 篇重处理实证每篇恰 1 个）
 - **降级**：首页文本也为空 → 跳过，不阻塞入库
 
 ### 3.3 B3：标注治理
