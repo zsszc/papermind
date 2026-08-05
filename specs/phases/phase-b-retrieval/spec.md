@@ -80,6 +80,7 @@ Phase A 基线（1 篇示例论文）：keyword-only recall@5=0.447，hybrid rec
 - ~~延迟统计~~ **B4 已实现（e5a3d61）**：latency_stats 边界 + 报告集成 + trend 兼容
 - dataset 多 locator 解析：现有 16 用例部分覆盖（specs/backend/eval/dataset.md 第 7 节）
 - **定标测量（2026-08-05 实测）**：19 篇规模 hybrid recall@5=0.295/MRR=0.350（阈值 0.5 FAIL）——B1/B2 尚未对存量论文激活（rerank 默认关、旧论文无摘要 chunk），待重处理后重新定标；factoid/summary 仍为 0.000 弱项
+- **rerank A/B 实测（2026-08-05，同库同 relevant 集）**：recall@5 0.193→0.205（**+0.011**）、MRR +0.023、NDCG +0.016——**收益远低于 +0.05 门控，且延迟 p50 148ms→16.2s（+110 倍，CPU 逐对打分）**。决策：**rerank 保持默认关闭**，功能留作 opt-in；延迟优化（MPS 加速/减小重排池）或更大 QA 集复测后再评估默认开启。experiment_data 类受益最大（0.150→0.200）
 - 门控测量依赖 QA 数据集（当前 14 条候选，Moonshot 解冻守望中）
 
 ## 8. 关键设计决策
