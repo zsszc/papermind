@@ -53,3 +53,67 @@ class TestRegenerate:
         user_msg = [m for m in conv.messages if m.role == "user"][0]
         resp = client.post(f"/api/chat/conversations/{conv.id}/messages/{user_msg.id}/regenerate")
         assert resp.status_code == 404
+
+
+class TestDeleteMessagesFrom:
+    """delete_messages_from 截断删除后回溯 message_count（Batch7b-F11）。
+
+    行为契约（specs/phases/batch-7b-fixes/spec.md 3.4）：
+    删除后会话 message_count == 实际剩余消息数；删全部消息归 0；会话不存在仍 404。
+    """
+
+    @pytest.fixture()
+    def conversation_with_four(self, db):
+        """构造 4 条消息的会话；message_count=5 模拟流式计数领先 1 的现状语义。"""
+        import datetime
+
+        conv = Conversation(title="t", message_count=5)
+        db.add(conv)
+        db.flush()
+        base = datetime.datetime(2026, 1, 1, 0, 0, 0)
+        for i in range(4):
+            db.add(Message(
+                conversation_id=conv.id,
+                role="user" if i % 2 == 0 else "assistant",
+                content=f"m{i}",
+                citations=[],
+                # 显式递增时间戳，保证 created_at 升序与插入序一致（消除同秒并列的不确定性）
+                created_at=base + datetime.timedelta(seconds=i),
+            ))
+        db.commit()
+        db.refresh(conv)
+        return conv
+
+    def test_truncates_and_backfills_message_count(self, client, db, conversation_with_four):
+        """从第 3 条起删除：剩 2 条，message_count 回溯为 2（修复前保持旧值 5）。"""
+        conv = conversation_with_four
+        target = sorted(conv.messages, key=lambda m: m.created_at)[2]
+
+        resp = client.delete(f"/api/chat/conversations/{conv.id}/messages/{target.id}")
+        assert resp.status_code == 204
+
+        db.expire_all()
+        remaining = (
+            db.query(Message).filter(Message.conversation_id == conv.id)
+            .order_by(Message.created_at.asc()).all()
+        )
+        assert [m.content for m in remaining] == ["m0", "m1"]
+        assert conv.message_count == len(remaining)
+
+    def test_delete_all_messages_zeroes_count(self, client, db, conversation_with_four):
+        """边界：从首条起全部删除，message_count 归 0。"""
+        conv = conversation_with_four
+        first = sorted(conv.messages, key=lambda m: m.created_at)[0]
+
+        resp = client.delete(f"/api/chat/conversations/{conv.id}/messages/{first.id}")
+        assert resp.status_code == 204
+
+        db.expire_all()
+        remaining = db.query(Message).filter(Message.conversation_id == conv.id).count()
+        assert remaining == 0
+        assert conv.message_count == 0
+
+    def test_404_when_conversation_missing(self, client):
+        """不回归：会话不存在仍 404。"""
+        resp = client.delete("/api/chat/conversations/999/messages/1")
+        assert resp.status_code == 404

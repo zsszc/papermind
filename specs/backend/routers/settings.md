@@ -60,7 +60,7 @@
   - 磁盘写入：覆盖式重写 `config.yaml`（明文含 API Key——该文件已 gitignore，宪法第 14 条）；
   - **边界**：若用户从未创建 `config.yaml`（`Config` 回退加载了 `config.yaml.example`），`save()` 会**覆盖写 `config.yaml.example`**（config_path 指向谁就写谁）；
   - 日志：`logger.info("[settings] 配置已更新")`。
-- **异常**：任何异常（磁盘只读、YAML dump 失败等）→ `logger.error` + `HTTPException(500, detail=f"保存配置失败: {e}")`——**注意 detail 含异常原文**，HTTPException 不经全局脱敏处理，异常文本会返给客户端（与宪法第 13 条异常脱敏存在张力，现状记录）；此时内存中的 `_config` **可能已被部分修改但未落盘**，内存与磁盘短暂不一致（重启后按磁盘恢复）。
+- **异常**：任何异常（磁盘只读、YAML dump 失败等）→ `logger.error(..., exc_info=True)` + `HTTPException(500, detail="保存配置失败，请稍后再试")`——**通用文案不透传异常原文**（原文+堆栈仅入 `logs/app.log`，宪法第 13 条；**已修复（Batch7b-F8）**，修复前 detail 直给 `f"保存配置失败: {e}"`）；此时内存中的 `_config` **可能已被部分修改但未落盘**，内存与磁盘短暂不一致（重启后按磁盘恢复）。
 - **校验缺失**：`llm_api_key` 无法通过本端点**删除**（空串被忽略）；`llm_model` / `llm_base_url` 同理只能改不能清；对 key 格式（`sk-` 前缀等）无任何校验。
 
 ## 4. 边界条件与错误处理
@@ -75,7 +75,7 @@
 | PUT `llm_api_key: ""` | 忽略（无法经 API 清空 Key） |
 | PUT `llm_model: ""` / `llm_base_url: ""` | 忽略，保留旧值 |
 | PUT 值首尾带空白 | `strip()` 后入库与落盘 |
-| 磁盘写失败（只读、权限） | 500，detail 含异常原文；内存已改、磁盘未改，不一致至重启 |
+| 磁盘写失败（只读、权限） | 500，detail 为通用文案「保存配置失败，请稍后再试」，异常原文仅入日志（已修复 Batch7b-F8）；内存已改、磁盘未改，不一致至重启 |
 | `config.yaml` 不存在（用了 example 回退） | PUT 成功后 `config.yaml.example` 被覆盖写入真实配置 |
 | 并发 PUT | 无锁；后到的 save 全量覆盖先到的（单用户场景视为可接受） |
 
@@ -100,7 +100,7 @@
   - PUT 全链路（AC2、AC3、AC5）零测试：脱敏值回传保护、「含 `*` 不覆盖真 Key」这一关键安全行为无固化（**高**，一旦被重构破坏，前端保存设置即把真 Key 洗成 `****` 且无任何告警）
   - `_mask_key` 的边界（空、≤8 全星、>8 露前 4 后 4）无参数化测试（**中**）
   - PUT 422（缺必填 key）、空串忽略语义、strip 行为无测试（**中**）
-  - 保存失败路径（500 + detail 含异常原文、内存/磁盘不一致）无测试（**中**；detail 泄露异常原文与宪法第 13 条的张力亦无断言记录现状）
+  - ~~保存失败路径（500 + detail 含异常原文、内存/磁盘不一致）无测试~~ **已修复（Batch7b-F8）**：detail 改通用文案「保存配置失败，请稍后再试」、原文+堆栈仅入日志，`tests/test_settings_put.py::test_put_save_failure_sanitizes_detail` 固化（特征串/类型名不出现 + caplog 断言原文入日志）；内存/磁盘短暂不一致的边界语义保留
   - 「`config.yaml` 缺失时覆盖写 `config.yaml.example`」的边界无测试（**低**）
   - 全量重写 YAML 丢注释/键序的行为无测试（**低**）
 
@@ -109,4 +109,4 @@
 - **GET 必脱敏、PUT 拒收脱敏值**：配套闭环——前端表单可以安全地把 GET 到的 masked key 回填进输入框原样提交，真 Key 不会被 `*` 覆盖；这是本模块最重要的安全契约（宪法第 14 条）
 - **直改单例 + 全量 `yaml.dump` 回写**：实现最简、改后无需重启即生效；代价是配置文件注释与键序全部丢失，且 `config.yaml` 缺失时会污染 `config.yaml.example`——引入保留注释的 YAML 库（如 ruamel）前，以现状为准
 - **只开放 `llm` 三项**：embedding 模型等其余配置涉及本地模型加载等重资产，刻意不开放 API 修改；`SettingsUpdate` 加字段即可扩展，但须同步补 PUT 测试（当前零覆盖）
-- **异常 detail 直给原文**：`HTTPException` 绕过全局脱敏属已知现状（宪法第 13 条与「可操作错误信息」的取舍）；收紧时应先把 detail 改通用文案并补 AC 测试
+- **~~异常 detail 直给原文~~已收紧（Batch7b-F8）**：原「`HTTPException` 绕过全局脱敏属已知现状」的取舍按宪法第 13 条收口——detail 改通用文案、异常原文仅入日志（`exc_info=True`），脱敏测试已固化

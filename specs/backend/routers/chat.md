@@ -83,7 +83,7 @@
 - **输出**：204 No Content
 - **异常**：会话不存在 → 404；消息不存在于该会话 → 404 `"Message not found"`
 - **副作用**：`messages` 表批量删除并 commit
-- **已知契约缺陷**：**不回溯 `Conversation.message_count`**——删除后计数保持删除前的值，与真实消息数脱节（`updated_at` 因会话对象未触碰也不刷新，会话列表排序不变）
+- **后置条件（已修复 Batch7b-F11）**：删除后**回溯 `Conversation.message_count` = 实际剩余消息数**（`tests/test_chat.py::TestDeleteMessagesFrom` 3 用例固化：截断回溯/全删归 0/会话 404）；修复前不回溯、计数与真实消息数脱节。`updated_at` 经 ORM `onupdate` 随计数写入自动刷新
 
 ### 3.6 `regenerate_message(conversation_id, message_id, db)`（`POST /api/chat/conversations/{conversation_id}/messages/{message_id}/regenerate`）
 
@@ -184,7 +184,7 @@
 | 客户端流式中断 | CancelledError → assistant 不落库；用户消息已落库；`message_count` 比实际多 1 |
 | LLM 返回全空/纯空白 | 流式：assistant 不落库，仍发 finished 帧 |
 | 删除会话 | 消息级联删除；`memory_summaries` 短期记忆残留（不级联） |
-| 删除消息（from 语义） | 目标及其后全部删除；`message_count` 不回溯（缺陷） |
+| 删除消息（from 语义） | 目标及其后全部删除；`message_count` 回溯为实际剩余消息数（已修复 Batch7b-F11，修复前不回溯） |
 | regenerate 通过前置校验 | 原地替换内容与 citations（2026-08-04 修复前必因 NameError 失败） |
 | regenerate 目标为 user 消息 / 首条消息 / 前条非 user | 404 / 400 / 400 |
 | analyze-image 空文件 | 400 `"图片内容为空"` |
@@ -213,7 +213,7 @@
 - [ ] AC4：消息总数为 5 的倍数时 `update_short_term_memory` 被触发（mock 断言调用）；其抛异常时响应不受影响
 - [ ] AC5：`message_count` 在提交后等于 `history_total + 1`；流式取消后计数不回退（固化现状）
 - [ ] AC6：会话 CRUD——列表按 `updated_at` 降序；创建固定 `"新对话"`；history 消息升序且字段裁剪为 4 键；删除会话级联删除消息 → 204；不存在均 404
-- [ ] AC7：`delete_messages_from` 删除目标及其后全部消息；`message_count` 不更新（固化现状缺陷）
+- [ ] AC7：`delete_messages_from` 删除目标及其后全部消息；`message_count` 回溯为实际剩余消息数（已修复 Batch7b-F11，`TestDeleteMessagesFrom` 固化）
 - [ ] AC8：regenerate 前置校验 404/400 四分支；**通过校验后当前抛 NameError（缺陷固化用例，标注 xfail/已知缺陷）；修复后**：目标消息内容被替换、citations 为 2 键裁剪、取消时原内容保留
 - [ ] AC9：analyze-image 空文件 → 400；正常文件 SSE 帧序列 `delta* + finished`；服务层异常时带内错误串
 - [ ] AC10：`GET /api/chat/skills` 返回 6 个默认 Skill 的 3 键 dict 列表
@@ -225,7 +225,7 @@
 - **盲区**（按严重程度）：
   - **高**：`POST /api/chat` 全链路零覆盖——SSE 帧序列、自动建会话、用户消息落库时序、`message_count = history_total + 1`、非流式分支、404/422（AC1–AC5）
   - **高**：regenerate 的 **NameError 缺陷无任何测试暴露**——该端点自初始提交起实际不可用，前置校验四分支与成功/取消路径均无覆盖（AC8）
-  - **高**：会话 CRUD 与 `delete_messages_from` 的 from 截断语义、级联删除、message_count 不回溯缺陷，均无测试（AC6/AC7）
+  - **高**：会话 CRUD 的列表/创建/历史/删除仍无测试（AC6）；`delete_messages_from` 的 from 截断语义与 message_count 回溯**已修复并固化（Batch7b-F11，`TestDeleteMessagesFrom` 3 用例：截断回溯/全删归 0/会话 404）**
   - **中**：`update_short_term_memory` 的触发时机（5 的倍数）与双重兜底在路由层无测试（AC4，memory_manager 服务层另有覆盖）
   - **中**：analyze-image 的 400 与 SSE 帧、服务层带内错误串透传无测试（AC9）
   - **中**：`GET /api/chat/skills` 路由层无测试（AC10；服务层 `list_skills` 已由 test_skills.py 覆盖）

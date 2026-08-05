@@ -102,6 +102,8 @@ def delete_messages_from(
 
     for m in all_messages[target_index:]:
         db.delete(m)
+    # 回溯修正会话计数：message_count 须等于删除后实际剩余消息数（Batch7b-F11）
+    conv.message_count = target_index
     db.commit()
     return
 

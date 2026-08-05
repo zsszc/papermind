@@ -67,5 +67,6 @@ def update_settings(payload: SettingsUpdate):
         logger.info("[settings] 配置已更新")
         return {"ok": True}
     except Exception as e:
-        logger.error(f"[settings] 更新配置失败: {e}")
-        raise HTTPException(status_code=500, detail=f"保存配置失败: {e}")
+        # 宪法第 13 条：异常原文只进日志，响应 detail 用通用文案不透传
+        logger.error(f"[settings] 更新配置失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="保存配置失败，请稍后再试")
