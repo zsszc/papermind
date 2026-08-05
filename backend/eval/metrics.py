@@ -9,9 +9,12 @@
 - citation_coverage：答案引用中命中期望 chunk 的比例
 - keyword_hit_rate：答案覆盖参考答案要点的比例
 
+性能侧指标：
+- latency_stats：检索延迟样本的 P50 / P95 / 均值 / 样本数
+
 约定：
 - chunk id 形如 "p{paper_id}_c{chunk_index}"（字符串）；
-- 所有函数对空输入安全：空 relevant / 空关键词等边界一律返回 0.0；
+- 所有函数对空输入安全：空 relevant / 空关键词 / 空延迟样本等边界一律返回 0.0；
 - 本模块不导入 app 下任何模块，保证加载本身不触发模型加载或 LLM 调用。
 """
 
@@ -19,7 +22,7 @@ from __future__ import annotations
 
 import math
 import re
-from typing import Iterable, List, Sequence, Union
+from typing import Dict, Iterable, List, Sequence, Union
 
 # ground_truth 要点切分符：顿号、分号、逗号（中英文）
 _KEYWORD_SPLIT_RE = re.compile(r"[、，,；;]")
@@ -177,3 +180,37 @@ def contains_refusal(answer: str) -> bool:
     if not answer:
         return False
     return any(phrase in answer for phrase in REFUSAL_PHRASES)
+
+
+def latency_stats(latencies: Sequence[float]) -> Dict[str, float]:
+    """延迟统计：P50 / P95 / 均值 / 样本数。
+
+    百分位采用线性插值法（与 numpy.percentile 默认 method="linear" 一致）：
+    排序后 rank = p / 100 * (n - 1)，在相邻两个样本间按小数部分线性插值；
+    单样本时 P50 == P95 == 该值。
+
+    参数：
+        latencies: 延迟样本列表（单位由调用方决定，eval.run 传入毫秒）。
+
+    返回：
+        {"p50": float, "p95": float, "mean": float, "count": int}；
+        空列表或 None → {"p50": 0.0, "p95": 0.0, "mean": 0.0, "count": 0}。
+    """
+    samples = sorted(float(x) for x in (latencies or []))
+    n = len(samples)
+    if n == 0:
+        return {"p50": 0.0, "p95": 0.0, "mean": 0.0, "count": 0}
+
+    def _percentile(p: float) -> float:
+        rank = p / 100.0 * (n - 1)
+        lower = int(math.floor(rank))
+        upper = min(lower + 1, n - 1)
+        frac = rank - lower
+        return samples[lower] + frac * (samples[upper] - samples[lower])
+
+    return {
+        "p50": _percentile(50.0),
+        "p95": _percentile(95.0),
+        "mean": sum(samples) / n,
+        "count": n,
+    }

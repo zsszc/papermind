@@ -13,6 +13,8 @@
   仅关键词检索，并在报告与控制台中标注 degraded；
 - 统计 recall@k / MRR / NDCG@k 的均值并按 question_type 分组；
   负例（has_answer=false，无期望 chunk）不计入检索指标均值，单独计数；
+- 每次检索用 time.perf_counter() 计时（毫秒），逐条记入 item 的 latency_ms，
+  汇总经 metrics.latency_stats 得到 {p50, p95, mean, count} 写入报告顶层 latency 字段；
 - --with-llm 时走 llm_service 生成答案，计算 citation_coverage / keyword_hit_rate，
   并对负例检查是否出现「不知道/无法回答」类拒答表述；
 - 控制台打印汇总表格，JSON 报告写入 eval/reports/<timestamp>.json（目录自动创建）；
@@ -35,6 +37,7 @@ from eval.metrics import (
     citation_coverage,
     contains_refusal,
     keyword_hit_rate,
+    latency_stats,
     mrr,
     ndcg_at_k,
     recall_at_k,
@@ -226,12 +229,16 @@ def run_eval(args: argparse.Namespace) -> int:
         by_type: Dict[str, Dict[str, List[float]]] = defaultdict(
             lambda: {"recall": [], "mrr": [], "ndcg": []})
         gen_metrics = {"citation_coverage": [], "keyword_hit_rate": []}
+        retrieval_latencies: List[float] = []  # 每次检索的延迟（毫秒）
         negative_total = 0
         negative_refused = 0
 
         for idx, entry in enumerate(items, start=1):
             relevant_ids = resolve_relevant_chunks(db, entry)
+            search_t0 = time.perf_counter()
             results = retriever.search(entry["question"])
+            latency_ms = round((time.perf_counter() - search_t0) * 1000.0, 3)
+            retrieval_latencies.append(latency_ms)
             retrieved_ids = [r["chunk_id"] for r in results]
 
             record: Dict[str, Any] = {
@@ -240,6 +247,7 @@ def run_eval(args: argparse.Namespace) -> int:
                 "has_answer": entry["has_answer"],
                 "relevant_ids": relevant_ids,
                 "retrieved_ids": retrieved_ids,
+                "latency_ms": latency_ms,
             }
 
             if entry["has_answer"]:
@@ -305,6 +313,7 @@ def run_eval(args: argparse.Namespace) -> int:
             "degrade_reason": retriever.degrade_reason,
             "with_llm": args.with_llm,
             "elapsed_seconds": round(elapsed, 2),
+            "latency": latency_stats(retrieval_latencies),
             "overall": overall,
             "by_question_type": type_rows,
             "items": per_item,
@@ -321,6 +330,9 @@ def run_eval(args: argparse.Namespace) -> int:
 
         # 控制台输出
         print(f"\n[eval] 检索模式: {report['retrieval_mode']}，耗时 {elapsed:.1f}s")
+        lat = report["latency"]
+        print(f"[eval] 检索延迟(ms): p50={lat['p50']:.1f} "
+              f"p95={lat['p95']:.1f} mean={lat['mean']:.1f} (n={lat['count']})")
         _print_table(type_rows + [{"question_type": "ALL", "n": overall["n_positive"],
                                    "recall": overall[f"recall@{args.top_k}"],
                                    "mrr": overall["mrr"],
