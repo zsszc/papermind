@@ -12,9 +12,9 @@
 
 ### 2.1 包含
 
-- LangGraph StateGraph 的节点/边拓扑：`START → load_memory → retrieve → external_tools → build_messages → END`（Phase E 起为 4 节点；external_tools 为外部 MCP 工具补充检索节点，命中信号词且有可用工具时注入「外部检索补充」，未配置/异常时零行为变化）
+- LangGraph StateGraph 的节点/边拓扑：`START → load_memory → retrieve → graph_expand → external_tools → build_messages → END`（Phase G 起为 5 节点；graph_expand 为引用图谱扩展节点，开关 `retrieval.graph_expand` 默认 false——沿 paper_citations 1 跳扩展邻居文献代表 chunk 并与向量召回 RRF 融合，排除命中文献自身，任何异常透传不回归）
 - `AgentState` 状态 schema（输入字段 + 中间/输出字段）
-- 四个节点函数（`load_memory` / `retrieve` / `external_tools` / `build_messages`）的行为契约
+- 五个节点函数（`load_memory` / `retrieve` / `graph_expand` / `external_tools` / `build_messages`）的行为契约
 - 模块级常量（`SYSTEM_PROMPT` / `WEB_SEARCH_HINT` / `HISTORY_LIMIT` / `RETRIEVE_TOP_K`）
 - `build_rag_prompt()` 的 RAG 提示词拼装格式
 - 图的构建、编译与单例获取（`build_agent_graph` / `get_agent_graph`）

@@ -8,12 +8,14 @@ from urllib.parse import quote
 import aiofiles
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import StreamingResponse
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
 from app.database import get_db
 from app.models import Paper, Tag, Chunk, PaperAnnotation, ThesisCitation, ThesisFile
 from app.schemas import (
+    CitationGraphResponse,
     PaperCreate,
     PaperDetail,
     PaperListResponse,
@@ -468,6 +470,51 @@ def get_paper(paper_id: int, db: Session = Depends(get_db)):
     if not paper:
         raise HTTPException(status_code=404, detail="Paper not found")
     return paper
+
+
+@router.get("/{paper_id}/citation-graph", response_model=CitationGraphResponse)
+def get_citation_graph(paper_id: int, db: Session = Depends(get_db)):
+    """引用图谱端点（Phase G G2）：以该文献为中心的 1 跳子图（出边 + 入边）。
+
+    - nodes：中心文献 + 全部一跳邻居（id / title / year）；
+    - edges：所有与中心相连的引用边（citing → cited，均对应 papers.id）；
+    - paper_citations 表缺失或查询异常时降级为仅中心节点的空图（不抛 500）；
+    - 文献不存在返回 404。
+    """
+    paper = db.query(Paper).filter(Paper.id == paper_id).first()
+    if not paper:
+        raise HTTPException(status_code=404, detail="Paper not found")
+
+    edges: List[Dict[str, int]] = []
+    neighbor_ids: set = set()
+    try:
+        rows = db.execute(
+            text(
+                "SELECT citing_id, cited_id FROM paper_citations "
+                "WHERE citing_id = :pid OR cited_id = :pid"
+            ),
+            {"pid": paper_id},
+        ).fetchall()
+        edges = [{"citing": r.citing_id, "cited": r.cited_id} for r in rows]
+        for r in rows:
+            neighbor_ids.add(r.citing_id)
+            neighbor_ids.add(r.cited_id)
+    except Exception as e:
+        logger.warning(
+            f"[citation-graph] 引用边查询失败，降级为仅中心节点的空图: "
+            f"{type(e).__name__}: {e}"
+        )
+
+    neighbor_ids.discard(paper_id)
+    nodes: List[Dict[str, Any]] = [
+        {"id": paper.id, "title": paper.title, "year": paper.year}
+    ]
+    if neighbor_ids:
+        neighbors = db.query(Paper).filter(Paper.id.in_(neighbor_ids)).all()
+        nodes.extend(
+            {"id": p.id, "title": p.title, "year": p.year} for p in neighbors
+        )
+    return CitationGraphResponse(nodes=nodes, edges=edges)
 
 
 @router.put("/{paper_id}", response_model=PaperDetail)

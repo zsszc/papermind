@@ -281,3 +281,26 @@ class ThesisAnalyzeResponse(BaseModel):
     chapter_title: Optional[str]
     suggestions: str
     citations: List[ThesisCitationResponse] = []
+
+
+# ===== Phase G G2：引用图谱响应模型（本区由 G2 代理追加，合并冲突时保留本区整体）=====
+class CitationGraphNode(BaseModel):
+    """引用图谱节点：文献 id / 标题 / 年份。"""
+
+    id: int
+    title: Optional[str] = None
+    year: Optional[int] = None
+
+
+class CitationGraphEdge(BaseModel):
+    """引用图谱边：citing 引用 cited（均对应 papers.id）。"""
+
+    citing: int
+    cited: int
+
+
+class CitationGraphResponse(BaseModel):
+    """GET /api/papers/{id}/citation-graph 响应：以该文献为中心的 1 跳子图。"""
+
+    nodes: List[CitationGraphNode] = []
+    edges: List[CitationGraphEdge] = []

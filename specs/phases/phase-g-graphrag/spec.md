@@ -53,12 +53,12 @@
 
 ## 5. 验收标准（可测试）
 
-- [ ] AC1：解析/匹配/建边单测全绿；ensure_schema 迁移分支幂等
-- [ ] AC2：processor 接入后入库流程既有测试不回归；解析失败不影响入库
-- [ ] AC3：graph_expand 开/关两条路径用例；异常降级透传
-- [ ] AC4：citation-graph 端点 200 结构断言 + 404
-- [ ] AC5：eval graph on/off 对比入 trend（主代理门禁执行）
-- [ ] AC6：全套件全绿；零新增依赖
+- [x] AC1：解析/匹配/建边单测全绿；ensure_schema 迁移分支幂等
+- [x] AC2：processor 接入后入库流程既有测试不回归；解析失败不影响入库
+- [x] AC3：graph_expand 开/关两条路径用例；异常降级透传
+- [x] AC4：citation-graph 端点 200 结构断言 + 404
+- [x] AC5：eval graph on/off 对比——**2026-08-05 实证：on/off 数字完全相同（0.193），因为 eval  harness 走 search 检索函数、不经过 agent_graph 节点**，graph_expand 属对话链路。真 A/B 待 eval 支持图链路选项；节点行为已用真实引用边 ad-hoc 验证（p17 命中→邻居 p5/p7 注入、abstract 优先、排除语义、top_k 不变）
+- [x] AC6：全套件全绿（455 passed）；零新增依赖（difflib stdlib）
 
 ## 6. 现有测试覆盖与盲区
 

@@ -84,8 +84,10 @@ class TestGraphStructure:
         }
         assert (START, "load_memory") in edges
         assert ("load_memory", "retrieve") in edges
-        # Phase E E2：retrieve 与 build_messages 之间插入 external_tools 节点
-        assert ("retrieve", "external_tools") in edges
+        # Phase G G2：retrieve 之后插入 graph_expand 节点
+        assert ("retrieve", "graph_expand") in edges
+        assert ("graph_expand", "external_tools") in edges
+        # Phase E E2：graph_expand 与 build_messages 之间为 external_tools 节点
         assert ("external_tools", "build_messages") in edges
         assert ("build_messages", END) in edges
 

@@ -414,7 +414,8 @@ class TestGraphTopology:
 
     def test_external_tools_edge_position(self):
         edges = {(e.source, e.target) for e in get_agent_graph().get_graph().edges}
-        assert ("retrieve", "external_tools") in edges
+        # Phase G G2 后：retrieve → graph_expand → external_tools → build_messages
+        assert ("graph_expand", "external_tools") in edges
         assert ("external_tools", "build_messages") in edges
         assert ("retrieve", "build_messages") not in edges
         assert ("build_messages", END) in edges

@@ -174,7 +174,13 @@
   - 无独立锁，串行性依赖上游「同一 paper 只有一个核心处理任务」。
 - **副作用**：DB 更新（papers、tags、paper_tags）；一次 LLM 同步调用（增强）+ 至多一次 LLM 调用（打标）。
 
-### 3.20 路由注册顺序约定
+### 3.20 `GET /{paper_id}/citation-graph` — `get_citation_graph(paper_id, db)`（Phase G 新增）
+
+- **输出**：`CitationGraphResponse`——以该文献为中心的 1 跳引用子图：`nodes`（中心文献 + 一跳邻居，`{id, title, year}`）、`edges`（与中心相连的全部引用边 `{citing, cited}`，方向 citing → cited）
+- **降级**：`paper_citations` 表缺失或查询异常 → 仅中心节点的空图（记 `[citation-graph]` warning，不抛 500）
+- **异常**：文献不存在 → 404
+
+### 3.21 路由注册顺序约定
 
 代码注释要求「固定路径必须放在 `/{paper_id}` 之前」。实际约束更窄：`/{paper_id}` 是**单段**路径，只有同为单段的固定路径会冲突——`/import`、`/stats/overview` 确实定义在前（第 268、385 行 vs 第 446 行）；`/batch/*`、`/tags/*` 为双段路径，虽定义在 `/{paper_id}` 之后也不冲突。新增**单段**固定路径时必须置于 `/{paper_id}` 之前。
 

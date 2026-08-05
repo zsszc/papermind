@@ -2,10 +2,13 @@
 
 将 POST /api/chat 的前置编排链路建模为节点图：
 
-    load_memory → retrieve → external_tools → build_messages
+    load_memory → retrieve → graph_expand → external_tools → build_messages
 
 - load_memory：加载会话历史消息与用户背景记忆，生成基础 system prompt
 - retrieve：向量库检索相关文献片段（Embedding 不可用时自动回退为空）
+- graph_expand：引用图谱扩展检索（Phase G G2；开关 retrieval.graph_expand
+  默认 false，开启时沿 paper_citations 1 跳扩展代表 chunk 并与向量召回
+  RRF 融合，top_k 不变；无引用边/任何异常透传不回归）
 - external_tools：外部 MCP 工具补充检索（Phase E E2；命中信号词且有可用
   arxiv.* 工具才触发，任何异常降级为纯本地路径，总耗时 10s 预算）
 - build_messages：组装最终发给 LLM 的消息列表（system + history + RAG +
@@ -27,11 +30,12 @@ import threading
 from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
 from langgraph.graph import END, START, StateGraph
+from sqlalchemy import bindparam, case, text
 from sqlalchemy.orm import Session
 
 from app.core.config import config
 from app.core.logger import logger
-from app.models import Message
+from app.models import Chunk, Message, Paper
 from app.services.memory_manager import MemoryManager
 from app.services.retrieval import get_vector_store
 from app.services.skills import build_skill_prompt
@@ -64,6 +68,12 @@ EXTERNAL_TOOL_BUDGET_SECONDS = 10
 # 注入的历史消息条数上限与检索 top_k（与原 chat.py 保持一致）
 HISTORY_LIMIT = 10
 RETRIEVE_TOP_K = 5
+
+# Phase G G2：图谱扩展每篇文献代表 chunk 上限（spec 3.2）与 chunk 级 RRF 常数 k
+#（与 search.py _reciprocal_rank_fusion 的 k=60 对齐）；跳数走配置位
+# retrieval.graph_expand_hops（默认 1 跳）
+GRAPH_EXPAND_MAX_CHUNKS_PER_PAPER = 2
+GRAPH_EXPAND_RRF_K = 60
 
 # 引用标记正则：[^n^]，n 为整数（允许负数形式以便识别后剔除，编号为 1-based）
 _CITATION_MARKER_PATTERN = re.compile(r"\[\^(-?\d+)\^\]")
@@ -216,6 +226,141 @@ def retrieve(state: AgentState) -> Dict[str, Any]:
         except Exception as e:
             logger.error(f"[agent_graph] 检索失败: {e}")
     return {"context_chunks": chunks}
+
+
+# ---------- 引用图谱扩展（Phase G G2） ----------
+
+
+def _expand_citation_neighbors(db: Session, hit_ids: set, hops: int) -> set:
+    """沿 paper_citations 边做 hops 跳扩展（出边+入边双向），返回不含命中集本身的邻居 id。
+
+    paper_citations 表结构归 G1（id / citing_id / cited_id / created_at），
+    此处按契约用绑定参数原生 SQL 查询（宪法第 11 条）；表不存在等异常由调用方兜底。
+    """
+    stmt = text(
+        "SELECT cited_id AS pid FROM paper_citations WHERE citing_id IN :ids "
+        "UNION "
+        "SELECT citing_id AS pid FROM paper_citations WHERE cited_id IN :ids"
+    ).bindparams(bindparam("ids", expanding=True))
+    seen = set(hit_ids)
+    frontier = set(hit_ids)
+    for _ in range(max(1, hops)):
+        rows = db.execute(stmt, {"ids": list(frontier)}).fetchall()
+        new_ids = {r.pid for r in rows} - seen
+        if not new_ids:
+            break
+        seen |= new_ids
+        frontier = new_ids
+    return seen - set(hit_ids)
+
+
+def _representative_chunks(db: Session, paper_ids: set) -> List[Dict[str, Any]]:
+    """每篇扩展文献取至多 GRAPH_EXPAND_MAX_CHUNKS_PER_PAPER 个代表 chunk：
+    abstract chunk 优先，其次按 chunk_index 升序补齐（spec 3.2）。
+
+    返回字段与 retrieval.py 向量检索结果同构（source=graph 标记来源）；
+    chunk_id 对齐向量库 p{pid}_c{chunk_index} 不变式（abstract 为 c-1），
+    供 RRF 去重键使用。
+    """
+    abstract_first = case((Chunk.chunk_type == "abstract", 0), else_=1)
+    rows = (
+        db.query(Chunk, Paper.title, Paper.authors, Paper.year)
+        .join(Paper, Paper.id == Chunk.paper_id)
+        .filter(Chunk.paper_id.in_(paper_ids))
+        .order_by(Chunk.paper_id, abstract_first, Chunk.chunk_index)
+        .all()
+    )
+    chunks: List[Dict[str, Any]] = []
+    per_paper: Dict[int, int] = {}
+    for chunk_row, title, authors, year in rows:
+        count = per_paper.get(chunk_row.paper_id, 0)
+        if count >= GRAPH_EXPAND_MAX_CHUNKS_PER_PAPER:
+            continue
+        per_paper[chunk_row.paper_id] = count + 1
+        chunks.append(
+            {
+                "chunk_id": f"p{chunk_row.paper_id}_c{chunk_row.chunk_index}",
+                "paper_id": chunk_row.paper_id,
+                "title": title,
+                "authors": authors,
+                "year": year,
+                "content": chunk_row.content,
+                "page_number": chunk_row.page_number,
+                "chunk_type": chunk_row.chunk_type,
+                "score": 0.0,
+                "source": "graph",
+            }
+        )
+    return chunks
+
+
+def _rrf_chunk_key(item: Dict[str, Any]) -> Any:
+    """chunk 级 RRF 去重键：优先 chunk_id，缺失时回退 (paper_id, page_number, content)。"""
+    cid = item.get("chunk_id")
+    if cid is not None:
+        return ("chunk_id", cid)
+    return ("meta", item.get("paper_id"), item.get("page_number"), item.get("content"))
+
+
+def _rrf_fuse_chunks(
+    vector_chunks: List[Dict[str, Any]],
+    graph_chunks: List[Dict[str, Any]],
+    top_k: int,
+    k: int = GRAPH_EXPAND_RRF_K,
+) -> List[Dict[str, Any]]:
+    """chunk 级 RRF 融合（与 search.py _reciprocal_rank_fusion 同构，键由 paper_id 换为 chunk）。
+
+    向量路先计入：同分时保留向量序（dict 插入序 + sorted 稳定性）；同一 chunk
+    两路同现时分数叠加、保留首见元数据；合并后截断 top_k（spec：top_k 不变）。
+    """
+    scores: Dict[Any, float] = {}
+    metas: Dict[Any, Dict[str, Any]] = {}
+
+    def _add(results: List[Dict[str, Any]]) -> None:
+        for rank, item in enumerate(results):
+            key = _rrf_chunk_key(item)
+            scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank + 1)
+            if key not in metas:
+                metas[key] = item
+
+    _add(vector_chunks)
+    _add(graph_chunks)
+    sorted_keys = sorted(scores.keys(), key=lambda kk: scores[kk], reverse=True)
+    return [metas[kk] for kk in sorted_keys[:top_k]]
+
+
+def graph_expand(state: AgentState) -> Dict[str, Any]:
+    """节点2.6（Phase G G2）：引用图谱扩展检索，位置在 retrieve 之后、external_tools 之前。
+
+    开关 retrieval.graph_expand（config.yaml，默认 false，每次调用时读取）：
+    关闭时返回空 dict，状态零变化（字节级不回归）。开启时：
+    ① 取 retrieve 命中的去重 paper_id 集合；
+    ② 沿 paper_citations 边扩展（retrieval.graph_expand_hops 配置位，默认 1 跳）；
+    ③ 每篇扩展文献取至多 2 个代表 chunk（abstract 优先，否则首 chunk）；
+    ④ 与向量召回做 chunk 级 RRF 融合，合并后 top_k 仍为 RETRIEVE_TOP_K。
+
+    降级契约：无命中 / 无引用边 / 任何异常 → 透传 retrieve 结果不变，不阻断对话。
+    """
+    if not config.get("retrieval.graph_expand", False):
+        return {}
+    chunks = state.get("context_chunks") or []
+    try:
+        hit_ids = {c.get("paper_id") for c in chunks if c.get("paper_id") is not None}
+        if not hit_ids:
+            return {"context_chunks": chunks}
+        hops = int(config.get("retrieval.graph_expand_hops", 1) or 1)
+        expanded_ids = _expand_citation_neighbors(state["db"], hit_ids, hops)
+        if not expanded_ids:
+            return {"context_chunks": chunks}
+        graph_chunks = _representative_chunks(state["db"], expanded_ids)
+        if not graph_chunks:
+            return {"context_chunks": chunks}
+        return {"context_chunks": _rrf_fuse_chunks(chunks, graph_chunks, RETRIEVE_TOP_K)}
+    except Exception as e:
+        logger.warning(
+            f"[graph_expand] 图谱扩展失败，透传向量召回结果: {type(e).__name__}: {e}"
+        )
+        return {"context_chunks": chunks}
 
 
 # ---------- MCP client manager 单例（Phase E E2） ----------
@@ -379,15 +524,17 @@ def build_messages(state: AgentState) -> Dict[str, Any]:
 
 
 def build_agent_graph():
-    """构建并编译对话编排图：load_memory → retrieve → external_tools → build_messages。"""
+    """构建并编译对话编排图：load_memory → retrieve → graph_expand → external_tools → build_messages。"""
     graph = StateGraph(AgentState)
     graph.add_node("load_memory", load_memory)
     graph.add_node("retrieve", retrieve)
+    graph.add_node("graph_expand", graph_expand)
     graph.add_node("external_tools", external_tools)
     graph.add_node("build_messages", build_messages)
     graph.add_edge(START, "load_memory")
     graph.add_edge("load_memory", "retrieve")
-    graph.add_edge("retrieve", "external_tools")
+    graph.add_edge("retrieve", "graph_expand")
+    graph.add_edge("graph_expand", "external_tools")
     graph.add_edge("external_tools", "build_messages")
     graph.add_edge("build_messages", END)
     return graph.compile()
