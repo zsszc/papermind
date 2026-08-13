@@ -103,7 +103,9 @@ test('Python 解释器软链不得逃出发布资源目录', () => {
   try {
     const python = path.join(root, 'backend/venv/bin/python')
     fs.rmSync(python)
-    fs.symlinkSync('/opt/miniconda3/bin/python3', python)
+    const python3 = path.join(root, 'backend/venv/bin/python3')
+    fs.symlinkSync('/opt/miniconda3/bin/python3', python3)
+    fs.symlinkSync('python3', python)
     const errors = scanArtifact(root, { asarEntries: validAsarEntries })
     assert.ok(errors.some((error) => error.includes('Python 软链逃出制品')))
   } finally {

@@ -53,12 +53,11 @@ function validatePythonRuntime(resourcesRoot) {
   if (!found) return '缺少 Python 运行时: backend/venv/{bin,Scripts}/python'
 
   const absolutePath = path.join(resourcesRoot, found)
-  if (!fs.lstatSync(absolutePath).isSymbolicLink()) return null
-  const linkTarget = fs.readlinkSync(absolutePath)
-  const resolvedTarget = path.resolve(path.dirname(absolutePath), linkTarget)
-  const relativeTarget = path.relative(resourcesRoot, resolvedTarget)
-  if (path.isAbsolute(linkTarget) || relativeTarget.startsWith('..') || path.isAbsolute(relativeTarget)) {
-    return `Python 软链逃出制品: ${found} -> ${linkTarget}`
+  const resolvedTarget = fs.realpathSync(absolutePath)
+  const canonicalRoot = fs.realpathSync(resourcesRoot)
+  const relativeTarget = path.relative(canonicalRoot, resolvedTarget)
+  if (relativeTarget.startsWith('..') || path.isAbsolute(relativeTarget)) {
+    return `Python 软链逃出制品: ${found} -> ${resolvedTarget}`
   }
   return null
 }
