@@ -8,5 +8,5 @@
 - [x] T5 RED：CLI 双次可复现与无绝对路径测试失败。
 - [x] T6 GREEN：接入 `--fixture`、报告 benchmark 字段和离线 CI。
 - [x] T7：运行公开 count/BM25 消融并冻结 Recall@5 ≥ 0.85 Gate。
-- [ ] T8：运行后端全测、pip check、前端 lint/build。
-- [ ] T9：生成测试报告、更新计划台账、分批提交并推送。
+- [x] T8：运行后端全测、pip check、前端 lint/build。
+- [x] T9：生成测试报告、更新计划台账、分批提交并推送。

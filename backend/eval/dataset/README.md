@@ -43,7 +43,7 @@ fixture 模式只使用内存 SQLite，不连接 `data/papers.db`，也不加载
 | `qa_id` | string | 全局唯一 id，如 `recomil-001` |
 | `question` | string | 用户问题，中文为主，可少量英文 |
 | `ground_truth` | string | 参考答案要点，用于生成质量评测（LLM-as-judge / 人工比对） |
-| `relevant_chunks` | list[object] | 期望命中的 chunk 定位信息，见下 |
+| `relevant_chunks` / `relevant_evidence` | list[object] | 旧动态定位或稳定证据定位，两者必须且只能提供一个 |
 | `question_type` | string | `factoid` / `summary` / `comparison` / `method_detail` / `experiment_data` / `out_of_scope` |
 | `source` | string | `demo_paper` / `synthetic` / `imported_paper` |
 | `has_answer` | bool | `false` 表示“库中无答案”的负例，用于测试幻觉；负例 `relevant_chunks` 必须为空 |

@@ -92,12 +92,12 @@ Kimi API (kimi-k2.6) —— 对话 / 概括 / 联网搜索 / 图片分析
 │   │   ├── models.py       # ORM 模型 + FTS5 虚拟表 DDL
 │   │   ├── schemas.py      # Pydantic 请求/响应模型
 │   │   └── main.py         # FastAPI 入口（lifespan、CORS、/mcp 挂载、/static 白名单）
-│   ├── eval/               # RAG 评测：dataset/（种子 QA）、metrics.py、run.py
-│   ├── tests/              # pytest 套件（154 用例，内存 SQLite + TestClient）
+│   ├── eval/               # RAG 评测：公开 fixture、稳定/私人 QA、metrics.py、run.py
+│   ├── tests/              # pytest 套件（505 用例，内存 SQLite + TestClient）
 │   ├── venv/               # Python 3.12 虚拟环境（会被 electron-builder 打包）
 │   ├── pyproject.toml      # 依赖声明 + pytest/ruff 配置
 │   └── requirements.txt    # 锁定依赖（与 pyproject 保持一致）
-├── .github/workflows/      # ci.yml（pytest+lint+build）、eval.yml（手动评测）
+├── .github/workflows/      # ci.yml（pytest+lint+build）、eval.yml（公开离线评测）
 ├── Dockerfile / docker-compose.yml / .dockerignore   # 一键部署（见 docs/DEPLOY.md）
 ├── docs/                   # DEPLOY.md 等运维文档
 ├── frontend/
@@ -192,7 +192,7 @@ cd ../electron && npm run build    # 产物在 frontend/out/（dmg/zip/exe）
 
 ## 8. 测试与评测
 
-### 单元/集成测试（pytest，154 个用例）
+### 单元/集成测试（pytest，505 个用例）
 
 ```bash
 cd backend
@@ -207,12 +207,18 @@ env -u PYTHONPATH venv/bin/python -m pytest tests/ -v   # 注意必须 env -u PY
 cd backend
 env -u PYTHONPATH venv/bin/python -m eval.run                 # 检索评测（默认关键词降级也可用）
 env -u PYTHONPATH venv/bin/python -m eval.run --with-llm      # 含生成侧（真实调用 Kimi，慎用）
+env -u PYTHONPATH venv/bin/python -m eval.run \
+  --fixture eval/fixtures/rag_public_v1.json \
+  --dataset eval/dataset/qa_public_v1.jsonl \
+  --keyword-only --lexical-profile bm25 --threshold 0.85      # 公开离线 Gate
 ```
 
 - `eval/dataset/qa_seed.jsonl`：25 条种子 QA（含 3 条幻觉负例），schema 见 `eval/dataset/README.md`
-- `eval/metrics.py`：recall@k / MRR / NDCG@k / citation_coverage / keyword_hit_rate
+- `eval/dataset/qa_public_v1.jsonl` + `eval/fixtures/rag_public_v1.json`：原创 CC0 合成公开基准，12 条 QA/3 篇论文，稳定 DOI + evidence quote qrels
+- `eval/metrics.py`：recall@k / MRR / NDCG@k / citation precision-recall-F1 / keyword_hit_rate
 - 报告写入 `eval/reports/`（已 gitignore）；recall@5 低于阈值（默认 0.5）退出码非 0，供 CI 门禁
-- **当前基线**（仅 1 篇示例论文）：keyword-only recall@5=0.447，hybrid recall@5=0.477/MRR=0.557——导入更多真实论文后需重新定标
+- **公开稳定基线**：count 与 BM25 Recall@5 均为 0.900；MRR 分别 0.775/0.783，NDCG@5 分别 0.806/0.813；CI Gate 为 Recall@5 ≥ 0.85
+- 私人真实库观察值不可与公开基准混算趋势；公开集用于链路正确性和回归，不替代真实论文质量评测
 
 ### 改动后至少应验证
 
@@ -253,4 +259,4 @@ env -u PYTHONPATH venv/bin/python -m eval.run --with-llm      # 含生成侧（�
 
 ---
 
-> 最后更新：2026-07-28，P0–P5 工程化/安全/Agent 2.0/评测升级完成后同步（替代 2026-07-20 版）。
+> 最后更新：2026-08-13，Batch 13 公开可复现评测基准完成后同步。
