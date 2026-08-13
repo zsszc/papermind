@@ -13,6 +13,7 @@ from app.services.llm import llm_service
 from app.services.backup import auto_backup, cleanup_old_backups
 from app.routers import papers, search, chat, thesis, memory, export, settings, static
 from app.core.settings import apply_env_overrides, validate_startup_config
+from app.core.capability import CapabilityMiddleware
 
 
 def _schedule_daily_backup():
@@ -79,6 +80,7 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
+app.add_middleware(CapabilityMiddleware)
 
 app.include_router(papers.router, prefix="/api/papers", tags=["papers"])
 app.include_router(search.router, prefix="/api/search", tags=["search"])
@@ -114,8 +116,11 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 @app.get("/api/health")
 async def health_check():
+    import os
+
     return {
         "status": "ok",
         "version": config.get("app.version", "1.0.0"),
         "llm_ready": getattr(app.state, "llm_ready", False),
+        "instance_id": os.environ.get("PAPERMIND_INSTANCE_ID") or None,
     }
