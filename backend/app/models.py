@@ -215,6 +215,7 @@ def ensure_papers_fts(engine):
         logger.info("[fts] papers_fts 虚拟表检查/重建完成")
     except Exception as e:
         logger.warning(f"[fts] papers_fts 初始化失败: {e}", exc_info=True)
+        raise
 
 
 @event.listens_for(Paper.__table__, "after_create")

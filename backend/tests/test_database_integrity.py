@@ -3,7 +3,10 @@
 import sqlite3
 from types import SimpleNamespace
 
+import pytest
+
 from app.database import _set_sqlite_pragma
+from app.main import _preflight_database
 from app.models import Conversation, MemorySummary, Paper, PaperCitation
 from app.routers import papers as papers_router
 
@@ -28,6 +31,50 @@ def test_sqlite_connect_pragma_enables_foreign_keys():
         connection.close()
 
     assert enabled == 1
+
+
+def test_startup_preflight_skips_new_database(tmp_path):
+    report = _preflight_database(tmp_path / "missing.db")
+
+    assert report == {
+        "exists": False,
+        "quick_check_ok": True,
+        "foreign_key_violation_count": 0,
+        "orphan_paper_tags_count": 0,
+    }
+
+
+def test_startup_preflight_rejects_corrupt_database(tmp_path):
+    database = tmp_path / "corrupt.db"
+    database.write_bytes(b"not a sqlite database")
+
+    with pytest.raises(sqlite3.DatabaseError):
+        _preflight_database(database)
+
+
+def test_startup_preflight_reports_foreign_keys_without_blocking(tmp_path):
+    database = tmp_path / "library.db"
+    with sqlite3.connect(database) as conn:
+        conn.executescript(
+            """
+            PRAGMA foreign_keys=OFF;
+            CREATE TABLE papers (id INTEGER PRIMARY KEY);
+            CREATE TABLE tags (id INTEGER PRIMARY KEY);
+            CREATE TABLE paper_tags (
+                paper_id INTEGER REFERENCES papers(id),
+                tag_id INTEGER REFERENCES tags(id)
+            );
+            INSERT INTO tags VALUES (1);
+            INSERT INTO paper_tags VALUES (999, 1);
+            """
+        )
+
+    report = _preflight_database(database)
+
+    assert report["exists"] is True
+    assert report["quick_check_ok"] is True
+    assert report["foreign_key_violation_count"] == 1
+    assert report["orphan_paper_tags_count"] == 1
 
 
 def test_delete_paper_removes_incoming_and_outgoing_citation_edges(

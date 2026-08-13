@@ -11,6 +11,7 @@ from app.core.logger import logger
 from app.models import ensure_papers_fts
 from app.services.llm import llm_service
 from app.services.backup import auto_backup, cleanup_old_backups
+from app.services.data_integrity import audit_database
 from app.routers import papers, search, chat, thesis, memory, export, settings, static
 from app.core.settings import apply_env_overrides, validate_startup_config
 from app.core.capability import CapabilityMiddleware
@@ -39,12 +40,38 @@ def _schedule_daily_backup():
     t.start()
 
 
+def _preflight_database(database_path):
+    """在任何 schema 写入前只读检查现存 SQLite。"""
+    from pathlib import Path
+    import sqlite3
+
+    database_path = Path(database_path)
+    if not database_path.exists():
+        return {
+            "exists": False,
+            "quick_check_ok": True,
+            "foreign_key_violation_count": 0,
+            "orphan_paper_tags_count": 0,
+        }
+    report = audit_database(database_path)
+    if not report["quick_check_ok"]:
+        raise sqlite3.DatabaseError("SQLite 主库未通过 quick_check")
+    return {"exists": True, **report}
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 分层配置：环境变量覆盖 + 启动校验
     apply_env_overrides(config)
     validate_startup_config(config)
 
+    integrity = _preflight_database(config.data_dir / "papers.db")
+    if integrity["foreign_key_violation_count"]:
+        logger.warning(
+            "[startup] SQLite 存在外键违反: count=%s, orphan_paper_tags=%s",
+            integrity["foreign_key_violation_count"],
+            integrity["orphan_paper_tags_count"],
+        )
     Base.metadata.create_all(bind=engine)
     ensure_schema()
     ensure_papers_fts(engine)
