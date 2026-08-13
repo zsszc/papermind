@@ -68,15 +68,18 @@ function ensureArchive(runtime) {
   fs.mkdirSync(cacheRoot, { recursive: true })
   const archive = path.join(cacheRoot, runtime.filename)
   if (fs.existsSync(archive) && sha256File(archive) === runtime.sha256) return archive
+  const temporaryArchive = `${archive}.part`
+  fs.rmSync(temporaryArchive, { force: true })
   run('curl', [
     '-L', '--fail', '--show-error', '--retry', '8', '--retry-all-errors',
-    '--continue-at', '-', '--output', archive, runtime.url,
+    '--output', temporaryArchive, runtime.url,
   ])
-  const actual = sha256File(archive)
+  const actual = sha256File(temporaryArchive)
   if (actual !== runtime.sha256) {
-    fs.rmSync(archive, { force: true })
+    fs.rmSync(temporaryArchive, { force: true })
     throw new Error(`Python 运行时 SHA-256 不匹配: ${actual}`)
   }
+  fs.renameSync(temporaryArchive, archive)
   return archive
 }
 
