@@ -252,7 +252,7 @@ def _query_technical_terms(text: str, *, bilingual: bool = False) -> List[str]:
 
 
 def _bm25_chunk_search(
-    db, query: str, limit: int = 20, *, bilingual: bool = False
+    db, query: str, limit: Optional[int] = 20, *, bilingual: bool = False
 ) -> List[Dict[str, Any]]:
     """基于技术锚点的轻量 BM25 chunk 检索（Batch 12 观察 profile）。"""
     from app.models import Chunk
@@ -298,7 +298,48 @@ def _bm25_chunk_search(
                 "source": "keyword-bm25",
             })
     scored.sort(key=lambda item: (-item["score"], item["chunk_id"]))
-    return scored[:limit]
+    return scored if limit is None else scored[:limit]
+
+
+_CHUNK_ID_FULL_RE = re.compile(r"^p(-?\d+)_c(-?\d+)$")
+
+
+def _rerank_bm25_neighbors(
+    scored: List[Dict[str, Any]], *, neighbor_weight: float = 0.5
+) -> List[Dict[str, Any]]:
+    """用同论文相邻块的 BM25 分数增强连续证据。
+
+    分数严格为 ``S + weight * (S(prev) + S(next))``，相邻块由
+    同一论文的 ``chunk_index ± 1`` 确定。返回新字典，不改写基线
+    profile 的原始结果。
+    """
+    base_scores: Dict[tuple[int, int], float] = {}
+    chunk_keys: Dict[str, tuple[int, int]] = {}
+    for item in scored:
+        chunk_id = str(item.get("chunk_id", ""))
+        match = _CHUNK_ID_FULL_RE.fullmatch(chunk_id)
+        if match is None:
+            continue
+        paper_id, chunk_index = (int(value) for value in match.groups())
+        chunk_keys[chunk_id] = (paper_id, chunk_index)
+        base_scores[(paper_id, chunk_index)] = float(item.get("score", 0.0))
+
+    reranked: List[Dict[str, Any]] = []
+    for item in scored:
+        updated = dict(item)
+        key = chunk_keys.get(str(item.get("chunk_id", "")))
+        score = float(item.get("score", 0.0))
+        if key is not None:
+            paper_id, chunk_index = key
+            previous = base_scores.get((paper_id, chunk_index - 1), 0.0)
+            following = base_scores.get((paper_id, chunk_index + 1), 0.0)
+            score += neighbor_weight * (previous + following)
+        updated["score"] = score
+        updated["source"] = "keyword-bm25-bilingual-neighbor"
+        reranked.append(updated)
+
+    reranked.sort(key=lambda item: (-item["score"], item["chunk_id"]))
+    return reranked
 
 def _keyword_chunk_search(
     db,
@@ -314,6 +355,9 @@ def _keyword_chunk_search(
 
     返回按得分降序的 chunk 列表，元素含 chunk_id / paper_id / content / score。
     """
+    if lexical_profile == "bm25-bilingual-neighbor":
+        scored = _bm25_chunk_search(db, query, None, bilingual=True)
+        return _rerank_bm25_neighbors(scored)[:limit]
     if lexical_profile in {"bm25", "bm25-bilingual"}:
         return _bm25_chunk_search(
             db, query, limit, bilingual=lexical_profile == "bm25-bilingual"
@@ -771,10 +815,13 @@ def build_parser() -> argparse.ArgumentParser:
                         help="强制仅关键词检索（不加载语义模型，速度快）")
     parser.add_argument(
         "--lexical-profile",
-        choices=("count", "bm25", "bm25-bilingual"),
+        choices=(
+            "count", "bm25", "bm25-bilingual", "bm25-bilingual-neighbor"
+        ),
         default="count",
         help=("chunk 词法检索策略；bm25-bilingual 增加可审计中英术语"
-              "扩展，默认 count 保持历史行为"),
+              "扩展；bm25-bilingual-neighbor 额外增加同论文相邻块分数，"
+              "默认 count 保持历史行为"),
     )
     parser.add_argument("--with-llm", action="store_true",
                         help="加跑生成侧指标（会真实调用 LLM API，默认关闭）")
