@@ -143,6 +143,22 @@ def _qrels_sha256(items: List[Dict[str, Any]]) -> str:
     return _sha256_bytes(payload)
 
 
+def _select_split(
+    items: List[Dict[str, Any]], split: str
+) -> List[Dict[str, Any]]:
+    """按私有基准分区筛选条目。
+
+    公开旧数据集没有 split 字段，因此只有显式指定分区时才过滤；
+    若该分区为空则立即失败，避免生成看似有效的空报告。
+    """
+    if split == "all":
+        return items
+    selected = [item for item in items if item.get("split") == split]
+    if not selected:
+        raise ValueError(f"split={split} 没有可评测条目")
+    return selected
+
+
 def _resolve_qrels_or_raise(db, items: List[Dict[str, Any]]) -> Dict[str, List[str]]:
     """预解析 qrels；正例无法解析时立即失败，避免混入模型质量分数。"""
     resolved: Dict[str, List[str]] = {}
@@ -415,7 +431,11 @@ def run_eval(args: argparse.Namespace) -> int:
     """执行评测，返回进程退出码。"""
     items = load_dataset(args.dataset)
     validate_dataset(items)
-    print(f"[eval] 数据集 {args.dataset} 共 {len(items)} 条")
+    items = _select_split(items, args.split)
+    print(
+        f"[eval] 数据集 {args.dataset} 共 {len(items)} 条"
+        + (f"（split={args.split}）" if args.split != "all" else "")
+    )
 
     fixture_database = None
     fixture_metadata: Dict[str, Any] = {}
@@ -569,6 +589,7 @@ def run_eval(args: argparse.Namespace) -> int:
             "pipeline": {
                 "profile": retriever.mode,
                 "lexical_profile": args.lexical_profile,
+                "split": args.split,
                 "top_k": args.top_k,
             },
             "diagnostics": {
@@ -666,6 +687,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--top-k", type=int, default=5,
                         help="检索截断位置 k（默认 5，即 recall@5 / NDCG@5）")
+    parser.add_argument(
+        "--split",
+        choices=("all", "train", "dev", "holdout"),
+        default="all",
+        help="只评测指定私有基准分区（默认 all）",
+    )
     parser.add_argument("--threshold", type=float, default=0.5,
                         help="recall@k 达标阈值，低于则退出码为 1（默认 0.5）")
     parser.add_argument("--keyword-only", action="store_true",

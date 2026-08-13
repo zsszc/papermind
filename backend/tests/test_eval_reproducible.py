@@ -3,6 +3,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from eval import run
 
 
@@ -62,6 +64,24 @@ def test_parser_rejects_hybrid_fixture_mode():
     parser = run.build_parser()
     args = parser.parse_args(["--fixture", FIXTURE, "--dataset", DATASET])
     assert run._validate_fixture_args(args) == "fixture 评测必须显式使用 --keyword-only"
+
+
+def test_private_split_filter_keeps_only_requested_partition():
+    items = [
+        {"qa_id": "train-1", "split": "train"},
+        {"qa_id": "dev-1", "split": "dev"},
+        {"qa_id": "holdout-1", "split": "holdout"},
+    ]
+
+    assert run._select_split(items, "all") == items
+    assert run._select_split(items, "dev") == [items[1]]
+    with pytest.raises(ValueError, match="没有可评测条目"):
+        run._select_split(items[:1], "holdout")
+
+
+def test_parser_accepts_private_split():
+    args = run.build_parser().parse_args(["--split", "dev"])
+    assert args.split == "dev"
 
 
 def test_qrels_hash_changes_when_evidence_changes():
