@@ -93,25 +93,35 @@ def _build_benchmark_metadata(db, dataset_path: Path) -> Dict[str, Any]:
     corpus manifest 以 chunk 的稳定定位字段与正文 SHA 组成；报告只保存最终
     manifest SHA，不保存私有论文正文或逐条正文摘要。
     """
+    from app.core.config import config
     from app.models import Chunk, Paper
+    from eval.private_benchmark import paper_uid
 
     dataset_path = Path(dataset_path)
     chunks = db.query(Chunk).order_by(Chunk.paper_id, Chunk.chunk_index).all()
-    manifest = [
+    papers = {paper.id: paper for paper in db.query(Paper).all()}
+    uid_by_id: Dict[int, str] = {}
+    for paper_id, paper in papers.items():
+        try:
+            uid_by_id[paper_id] = paper_uid(paper, config.runtime_root)
+        except ValueError:
+            # 公开内存 fixture 不携带真实 PDF；其 DOI 仍提供稳定身份。
+            uid_by_id[paper_id] = f"fixture-paper:{paper_id}"
+    manifest = sorted([
         {
-            "paper_id": row.paper_id,
+            "paper_uid": uid_by_id[row.paper_id],
             "chunk_index": row.chunk_index,
             "content_sha256": _sha256_bytes((row.content or "").encode("utf-8")),
         }
         for row in chunks
-    ]
+    ], key=lambda item: (item["paper_uid"], item["chunk_index"]))
     manifest_bytes = json.dumps(
         manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
     return {
         "dataset_sha256": _sha256_bytes(dataset_path.read_bytes()),
         "corpus_manifest_sha256": _sha256_bytes(manifest_bytes),
-        "n_papers": db.query(Paper).count(),
+        "n_papers": len(papers),
         "n_chunks": len(chunks),
     }
 

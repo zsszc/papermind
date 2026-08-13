@@ -78,6 +78,33 @@ def test_qrels_hash_changes_when_evidence_changes():
     assert run._qrels_sha256(original) != run._qrels_sha256(changed)
 
 
+def test_corpus_fingerprint_does_not_depend_on_database_paper_id(db, tmp_path):
+    from app.models import Chunk, Paper
+
+    dataset = tmp_path / "qa.jsonl"
+    dataset.write_text("{}\n", encoding="utf-8")
+    paper = Paper(
+        id=9, title="stable", doi="10.1/stable", filename="x.pdf",
+        file_path="papers/x.pdf", processed="done",
+    )
+    db.add(paper)
+    db.add(Chunk(paper_id=9, chunk_index=0, content="same content"))
+    db.commit()
+    first = run._build_benchmark_metadata(db, dataset)["corpus_manifest_sha256"]
+
+    db.query(Chunk).delete()
+    db.query(Paper).delete()
+    db.add(Paper(
+        id=99, title="stable", doi="https://doi.org/10.1/STABLE.", filename="y.pdf",
+        file_path="papers/y.pdf", processed="done",
+    ))
+    db.add(Chunk(paper_id=99, chunk_index=0, content="same content"))
+    db.commit()
+    second = run._build_benchmark_metadata(db, dataset)["corpus_manifest_sha256"]
+
+    assert first == second
+
+
 def test_eval_workflow_uses_public_fixture_and_frozen_gates():
     workflow = (
         Path(__file__).resolve().parents[2] / ".github" / "workflows" / "eval.yml"
