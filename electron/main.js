@@ -1,5 +1,6 @@
 const { app, BrowserWindow } = require('electron')
 const path = require('path')
+const { pathToFileURL } = require('url')
 const { spawn } = require('child_process')
 const fs = require('fs')
 const {
@@ -9,6 +10,12 @@ const {
   isProcessRunning,
   sanitizeBackendEnv,
 } = require('./backend-lifecycle')
+const {
+  createSecureWebPreferences,
+  focusExistingWindow,
+  installPermissionGuards,
+  installWindowGuards,
+} = require('./security-policy')
 
 // 将主进程日志写入应用数据目录，便于排查后端启动问题
 function getLogPath() {
@@ -56,17 +63,19 @@ function getProjectPaths() {
 }
 
 function createWindow() {
+  const { distPath } = getProjectPaths()
   mainWindow = new BrowserWindow({
     width: 1400,
     height: 900,
     minWidth: 1000,
     minHeight: 700,
     title: 'PaperMind',
-    webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
-      contextIsolation: true,
-      nodeIntegration: false,
-    },
+    webPreferences: createSecureWebPreferences(path.join(__dirname, 'preload.js')),
+  })
+  installPermissionGuards(mainWindow.webContents.session)
+  installWindowGuards(mainWindow.webContents, {
+    isDev,
+    productionEntryUrl: pathToFileURL(distPath).href,
   })
 
   if (isDev) {
@@ -219,16 +228,23 @@ function killBackend() {
   }, 3000)
 }
 
-app.whenReady().then(createWindow)
+const hasSingleInstanceLock = app.requestSingleInstanceLock()
 
-app.on('window-all-closed', () => {
-  killBackend()
-  if (process.platform !== 'darwin') app.quit()
-})
+if (!hasSingleInstanceLock) {
+  app.quit()
+} else {
+  app.on('second-instance', () => focusExistingWindow(mainWindow))
+  app.whenReady().then(createWindow)
 
-app.on('activate', () => {
-  if (BrowserWindow.getAllWindows().length === 0) createWindow()
-})
+  app.on('window-all-closed', () => {
+    killBackend()
+    if (process.platform !== 'darwin') app.quit()
+  })
 
-app.on('before-quit', killBackend)
-app.on('will-quit', killBackend)
+  app.on('activate', () => {
+    if (BrowserWindow.getAllWindows().length === 0) createWindow()
+  })
+
+  app.on('before-quit', killBackend)
+  app.on('will-quit', killBackend)
+}
