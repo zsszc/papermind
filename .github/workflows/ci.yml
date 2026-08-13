@@ -1,9 +1,10 @@
 # PaperMind 持续集成（CI）
 #
 # 触发条件：push 或 Pull Request 目标分支为 main。
-# 包含两个并行 job：
+# 包含三个并行 job：
 #   - backend ：Python 3.12，安装后端依赖并运行 pytest
-#   - frontend：Node 20，npm ci 后执行 lint 与 build
+#   - frontend：Node 20，npm ci 后执行 test、lint 与 build
+#   - electron：Node 20，跳过二进制下载后执行 node:test 与语法检查
 # pip / npm 均开启缓存以加速后续构建。
 
 name: CI
@@ -66,6 +67,40 @@ jobs:
         working-directory: frontend
         run: npm run lint
 
+      - name: 前端单元/组件测试
+        working-directory: frontend
+        run: npm test
+
       - name: 构建产物（vite build）
         working-directory: frontend
         run: npm run build
+
+  electron:
+    name: Electron 生命周期 Harness
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node 20（启用 npm 缓存）
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: electron/package-lock.json
+
+      - name: 安装锁定依赖（跳过 Electron 二进制下载）
+        working-directory: electron
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+        run: npm ci --ignore-scripts
+
+      - name: 运行生命周期测试
+        working-directory: electron
+        run: npm test
+
+      - name: 主进程语法检查
+        working-directory: electron
+        run: |
+          node --check main.js
+          node --check backend-lifecycle.js
