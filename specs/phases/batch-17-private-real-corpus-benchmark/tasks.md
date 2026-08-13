@@ -7,6 +7,6 @@
 - [x] T4 GREEN：扩展稳定 UID qrels resolver。
 - [x] T5 RED：全文分层素材、reviewed/coverage/split Gate 测试失败。
 - [x] T6 GREEN：实现候选与正式集审计工具。
-- [ ] T7：生成并审查 50–100 条真实论文 QA，冻结 private v1。
-- [ ] T8：运行 count/BM25/hybrid 基线与单变量实验。
-- [ ] T9：全量回归、报告、台账、分批提交并推送。
+- [x] T7：生成并审查 50–100 条真实论文 QA，冻结 private v1。
+- [x] T8：运行 count/BM25/hybrid 基线与单变量实验。
+- [x] T9：全量回归、报告、台账、分批提交并推送。
