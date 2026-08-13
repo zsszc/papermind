@@ -6,5 +6,5 @@
 - [x] T3 RED：Electron health/wait/restart/kill 决策测试失败。
 - [x] T4 GREEN：实现纯 lifecycle 模块并由 main.js 复用。
 - [x] T5：CI 加入 frontend test 与 electron node:test。
-- [ ] T6：运行全部门禁与安全审计。
-- [ ] T7：生成测试报告、更新台账、提交推送。
+- [x] T6：运行全部门禁与安全审计；升级 Vitest 4.1.10 修复新增 critical。
+- [x] T7：生成测试报告、更新台账、提交推送。

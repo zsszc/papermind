@@ -201,6 +201,16 @@ env -u PYTHONPATH venv/bin/python -m pytest tests/ -v   # 注意必须 env -u PY
 
 测试栈：内存 SQLite + FastAPI TestClient（不触发 lifespan，离线快速）。覆盖：health/settings、安全（静态穿越/CORS/异常脱敏）、FTS5 清洗、上传限制、Skill 注册表、Memory 统一 API、评测数据集、指标计算、Agent 图编排、MCP 工具。约定：不触发真实 LLM/embedding 调用（mock），后台线程 mock 掉。
 
+### 前端与 Electron Harness
+
+```bash
+cd frontend && npm test          # Vitest + jsdom + Testing Library（SSE / ErrorBoundary）
+cd ../electron && npm test       # node:test（health / wait / restart / kill 生命周期）
+```
+
+前端测试依赖包含 MSW，新增网络交互测试不得连接真实后端；Electron 生命周期纯模块不得
+`require('electron')`，确保 CI 无 GUI 也能运行。当前前端 5 个测试、Electron 6 个测试。
+
 ### RAG 评测（backend/eval/）
 
 ```bash
