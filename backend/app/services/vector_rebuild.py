@@ -182,25 +182,38 @@ def build_parser():
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
-    """管理命令入口；默认不存在隐式换入路径。"""
-    import json
-
+def _resolve_cli_paths(
+    target_value: str | None, stage_value: str | None
+) -> tuple[Path, Path]:
+    """先规范化 CLI 路径，再执行同父目录安全检查。"""
     from app.core.config import config
-    from app.database import SessionLocal
-    from app.services.embedding import EmbeddingService
 
-    args = build_parser().parse_args(argv)
-    target = Path(args.target) if args.target else config.runtime_root / "vector_db"
+    target = (
+        Path(target_value).expanduser().resolve()
+        if target_value
+        else (config.runtime_root / "vector_db").resolve()
+    )
     stage = (
-        Path(args.stage)
-        if args.stage
+        Path(stage_value).expanduser().resolve()
+        if stage_value
         else target.with_name(
             f".{target.name}.stage-{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
         )
     )
     if stage.parent != target.parent:
         raise ValueError("临时向量库必须与目标目录同父目录")
+    return target, stage
+
+
+def main(argv: list[str] | None = None) -> int:
+    """管理命令入口；默认不存在隐式换入路径。"""
+    import json
+
+    from app.database import SessionLocal
+    from app.services.embedding import EmbeddingService
+
+    args = build_parser().parse_args(argv)
+    target, stage = _resolve_cli_paths(args.target, args.stage)
     with SessionLocal() as db:
         result = build_staged_vector_store(
             db,

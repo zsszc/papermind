@@ -144,3 +144,14 @@ def test_cli_requires_explicit_activate_flag():
 
     activated = build_parser().parse_args(["--activate"])
     assert activated.activate is True
+
+
+def test_cli_paths_are_resolved_before_same_parent_check(tmp_path):
+    from app.services.vector_rebuild import _resolve_cli_paths
+
+    target, stage = _resolve_cli_paths(
+        str(tmp_path / "vector_db"), str(tmp_path / "nested" / ".." / ".stage")
+    )
+
+    assert target == (tmp_path / "vector_db").resolve()
+    assert stage == (tmp_path / ".stage").resolve()
