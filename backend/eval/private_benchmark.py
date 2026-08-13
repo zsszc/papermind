@@ -106,3 +106,48 @@ def public_summary(manifest: dict[str, Any]) -> dict[str, Any]:
         "chunks": manifest["chunks"],
         "missing_source_file_count": len(manifest["missing_source_files"]),
     }
+
+
+def validate_private_dataset(
+    items: list[dict[str, Any]],
+    *,
+    min_items: int = 50,
+    min_papers: int = 12,
+) -> dict[str, Any]:
+    """校验正式私有集的审稿、稳定 UID、覆盖率与论文级 split 隔离。"""
+    from eval.dataset import validate_dataset
+
+    validate_dataset(items)
+    errors: list[str] = []
+    split_by_paper: dict[str, str] = {}
+    split_counts: Counter[str] = Counter()
+    papers: set[str] = set()
+    allowed_splits = {"train", "dev", "holdout"}
+
+    for item in items:
+        qa_id = item.get("qa_id", "?")
+        if item.get("reviewed") is not True:
+            errors.append(f"qa_id={qa_id}: 未完成人工审稿")
+        split = item.get("split")
+        if split not in allowed_splits:
+            errors.append(f"qa_id={qa_id}: split 必须是 train/dev/holdout")
+            continue
+        split_counts[split] += 1
+        for evidence in item.get("relevant_evidence", []):
+            uid = evidence["paper_uid"]
+            papers.add(uid)
+            previous = split_by_paper.setdefault(uid, split)
+            if previous != split:
+                errors.append(f"paper_uid={uid}: 同一论文跨 split（{previous}/{split}）")
+
+    if len(items) < min_items:
+        errors.append(f"正式集条数不足: {len(items)} < {min_items}")
+    if len(papers) < min_papers:
+        errors.append(f"覆盖论文不足: {len(papers)} < {min_papers}")
+    if errors:
+        raise ValueError("私有评测集校验失败:\n" + "\n".join(f"  - {e}" for e in errors))
+    return {
+        "items": len(items),
+        "papers": len(papers),
+        "splits": dict(sorted(split_counts.items())),
+    }

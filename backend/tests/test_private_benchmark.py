@@ -7,7 +7,12 @@ import pytest
 
 from app.models import Chunk, Paper
 from eval.dataset import resolve_relevant_chunks, validate_dataset
-from eval.private_benchmark import audit_corpus, normalize_doi, public_summary
+from eval.private_benchmark import (
+    audit_corpus,
+    normalize_doi,
+    public_summary,
+    validate_private_dataset,
+)
 
 
 def _add_paper(db, tmp_path, *, title, content, doi=None, duplicate=False):
@@ -137,3 +142,45 @@ def test_private_eval_paths_are_gitignored():
     ignore = (root / ".gitignore").read_text(encoding="utf-8")
     assert "backend/eval/private/" in ignore
     assert "backend/eval/dataset/qa_candidates.jsonl" in ignore
+
+
+def _private_item(qa_id, uid, split="train", reviewed=True):
+    return {
+        "qa_id": qa_id,
+        "question": "问题",
+        "ground_truth": "答案",
+        "relevant_evidence": [{
+            "paper_uid": uid,
+            "quote": "This is a uniquely identifying evidence quote.",
+        }],
+        "question_type": "factoid",
+        "source": "imported_paper",
+        "has_answer": True,
+        "reviewed": reviewed,
+        "split": split,
+    }
+
+
+def test_private_dataset_requires_review_stable_uid_coverage_and_paper_split():
+    valid = [
+        _private_item("q1", "sha256:" + "a" * 64, "train"),
+        _private_item("q2", "doi:10.1/example", "dev"),
+    ]
+    summary = validate_private_dataset(valid, min_items=2, min_papers=2)
+    assert summary["items"] == 2
+    assert summary["papers"] == 2
+    assert summary["splits"] == {"dev": 1, "train": 1}
+
+    with pytest.raises(ValueError, match="人工审稿"):
+        validate_private_dataset(
+            [_private_item("q1", "sha256:" + "a" * 64, reviewed=False)],
+            min_items=1,
+            min_papers=1,
+        )
+    with pytest.raises(ValueError, match="跨 split"):
+        validate_private_dataset([
+            _private_item("q1", "sha256:" + "a" * 64, "train"),
+            _private_item("q2", "sha256:" + "a" * 64, "holdout"),
+        ], min_items=2, min_papers=1)
+    with pytest.raises(ValueError, match="覆盖论文"):
+        validate_private_dataset(valid, min_items=2, min_papers=3)

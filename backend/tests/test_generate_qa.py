@@ -43,6 +43,20 @@ def _fake_chunks(pid: int = 4, text: str = PAPER_TEXT):
     return [Chunk(paper_id=pid, chunk_index=0, content=text)]
 
 
+def test_build_material_samples_beginning_middle_and_end_under_budget():
+    chunks = [
+        Chunk(paper_id=4, chunk_index=index, content=(f"MARKER-{index} " + "x" * 500))
+        for index in range(9)
+    ]
+
+    material = generate_qa.build_material(_fake_paper(), chunks, budget=900)
+
+    assert "MARKER-0" in material
+    assert "MARKER-4" in material
+    assert "MARKER-8" in material
+    assert len(material) <= 900
+
+
 def _valid_payload() -> str:
     """一条合法的双条目 LLM 输出（摘录均逐字命中 PAPER_TEXT）。"""
     return json.dumps({"items": [

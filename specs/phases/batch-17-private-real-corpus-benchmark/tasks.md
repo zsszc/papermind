@@ -5,8 +5,8 @@
 - [x] T2 GREEN：实现私有 corpus manifest 与去标识化摘要。
 - [x] T3 RED：SHA-256 UID、DOI 规范化和唯一 evidence 测试失败。
 - [x] T4 GREEN：扩展稳定 UID qrels resolver。
-- [ ] T5 RED：全文分层素材、reviewed/coverage/split Gate 测试失败。
-- [ ] T6 GREEN：实现候选与正式集审计工具。
+- [x] T5 RED：全文分层素材、reviewed/coverage/split Gate 测试失败。
+- [x] T6 GREEN：实现候选与正式集审计工具。
 - [ ] T7：生成并审查 50–100 条真实论文 QA，冻结 private v1。
 - [ ] T8：运行 count/BM25/hybrid 基线与单变量实验。
 - [ ] T9：全量回归、报告、台账、分批提交并推送。

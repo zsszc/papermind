@@ -76,14 +76,30 @@ def build_material(paper: Any, chunks: List[Any], budget: Optional[int] = None) 
     if abstract:
         parts.append(f"摘要: {abstract}")
     used = sum(len(p) for p in parts)
-    for ch in chunks:
+    nonempty = [ch for ch in chunks if (ch.content or "").strip()]
+    if not nonempty:
+        return "\n\n".join(parts)
+
+    # 全文确定性分层：先覆盖首/中/尾，再按均匀位置补充。不能只从开头顺序截断，
+    # 否则真实论文的实验结果与结论长期无法进入候选生成素材。
+    wanted = [0, len(nonempty) // 2, len(nonempty) - 1]
+    wanted.extend(round(i * (len(nonempty) - 1) / 6) for i in range(1, 6))
+    selected = []
+    for index in wanted:
+        if index not in selected:
+            selected.append(index)
+    remaining_budget = max(0, budget - used - 4 * len(selected))
+    per_chunk = max(1, remaining_budget // len(selected)) if selected else 0
+    for index in selected:
+        ch = nonempty[index]
         content = (ch.content or "").strip()
-        if not content:
-            continue
-        if used + len(content) > budget:
+        available = budget - used - 2
+        if available <= 0:
             break
-        parts.append(content)
-        used += len(content)
+        excerpt = content[:min(per_chunk, available)]
+        if excerpt:
+            parts.append(excerpt)
+            used += len(excerpt) + 2
     return "\n\n".join(parts)
 
 
