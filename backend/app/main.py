@@ -71,6 +71,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# 能力边界先注册、CORS 后注册，使 CORS 位于最外层；这样令牌被拒绝的 401
+# 仍能被 file:// 渲染进程读取，而不是退化成不可诊断的浏览器网络错误。
+app.add_middleware(CapabilityMiddleware)
+
 # CORS 严格化：仅放行本地前端开发源，不携带凭证。
 # "null" 是 Electron 生产包以 file:// 加载前端时 fetch 携带的 Origin，必须显式放行。
 app.add_middleware(
@@ -80,7 +84,6 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
-app.add_middleware(CapabilityMiddleware)
 
 app.include_router(papers.router, prefix="/api/papers", tags=["papers"])
 app.include_router(search.router, prefix="/api/search", tags=["search"])

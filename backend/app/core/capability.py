@@ -10,12 +10,17 @@ TOKEN_ENV = "PAPERMIND_API_TOKEN"
 TOKEN_HEADER = b"x-papermind-token"
 
 
-def _request_token(scope: dict) -> str:
+def _request_token(scope: dict) -> bytes:
     """从原始 ASGI header 中提取能力令牌，避免引入请求体缓冲。"""
     for name, value in scope.get("headers", []):
         if name.lower() == TOKEN_HEADER:
-            return value.decode("utf-8", errors="ignore")
-    return ""
+            return value
+    return b""
+
+
+def has_valid_capability(scope: dict, expected: str) -> bool:
+    """直接比较原始字节，畸形或非 ASCII header 也只能得到拒绝结果。"""
+    return hmac.compare_digest(_request_token(scope), expected.encode("utf-8"))
 
 
 class CapabilityMiddleware:
@@ -30,8 +35,7 @@ class CapabilityMiddleware:
             return
 
         expected = os.environ.get(TOKEN_ENV, "")
-        supplied = _request_token(scope)
-        if expected and not hmac.compare_digest(supplied, expected):
+        if expected and not has_valid_capability(scope, expected):
             response = JSONResponse(
                 status_code=401,
                 content={

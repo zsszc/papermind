@@ -2,10 +2,17 @@
 
 import secrets
 
+from app.core.capability import has_valid_capability
+
 
 TOKEN_ENV = "PAPERMIND_API_TOKEN"
 INSTANCE_ENV = "PAPERMIND_INSTANCE_ID"
 HEADER = "X-PaperMind-Token"
+
+
+def test_non_ascii_raw_header_is_rejected_without_exception():
+    scope = {"headers": [(b"x-papermind-token", b"\xff\xfe")]}
+    assert has_valid_capability(scope, "expected-token") is False
 
 
 def test_development_without_token_remains_compatible(client, monkeypatch):
@@ -30,6 +37,7 @@ def test_capability_accepts_only_constant_time_matching_token(client, monkeypatc
 
     assert accepted.status_code == 200
     assert accepted.json()["instance_id"] == "instance-test-1"
+    assert token not in accepted.text
     for rejected in (missing, wrong):
         assert rejected.status_code == 401
         assert rejected.json() == {
@@ -37,6 +45,15 @@ def test_capability_accepts_only_constant_time_matching_token(client, monkeypatc
             "error_code": "invalid_capability",
         }
         assert token not in rejected.text
+
+
+def test_unauthorized_response_keeps_electron_cors_headers(client, monkeypatch):
+    monkeypatch.setenv(TOKEN_ENV, secrets.token_urlsafe(32))
+
+    response = client.get("/api/health", headers={"Origin": "null"})
+
+    assert response.status_code == 401
+    assert response.headers["access-control-allow-origin"] == "null"
 
 
 def test_options_preflight_does_not_require_capability(client, monkeypatch):
@@ -65,6 +82,7 @@ def test_static_and_docs_share_the_same_capability_boundary(client, monkeypatch,
 
     assert client.get("/static/papers/sample.txt").status_code == 401
     assert client.get("/docs").status_code == 401
+    assert client.get("/mcp/sse").status_code == 401
     response = client.get("/static/papers/sample.txt", headers={HEADER: token})
     assert response.status_code == 200
     assert response.text == "private-paper"
