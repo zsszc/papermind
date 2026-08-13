@@ -74,6 +74,7 @@ def _apply_schema_migrations():
             conn.commit()
     except Exception as e:
         logger.warning(f"[schema] 轻量级迁移失败: {e}", exc_info=True)
+        raise
 
 
 # 新表迁移 DDL（Phase G / G1）：与 models.PaperCitation 保持一致的列定义。
@@ -108,6 +109,7 @@ def ensure_paper_citations_table(target_engine=None):
         logger.info("[schema] paper_citations 表检查/创建完成")
     except Exception as e:
         logger.warning(f"[schema] paper_citations 迁移失败: {e}", exc_info=True)
+        raise
 
 
 def ensure_schema():

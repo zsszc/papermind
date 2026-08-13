@@ -1,9 +1,6 @@
 import csv
 import io
-import os
-import zipfile
 from datetime import datetime
-from pathlib import Path
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -13,7 +10,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models import Paper
 from app.core.config import config
-from app.services.backup import auto_backup, cleanup_old_backups
+from app.services.backup import auto_backup, cleanup_old_backups, create_backup
 
 router = APIRouter()
 
@@ -149,32 +146,12 @@ def export_papers_bib(format: str = "GB/T 7714", db: Session = Depends(get_db)):
 @router.post("/backup")
 def export_backup():
     """打包全量数据为 zip 备份。"""
-    project_root = config.runtime_root
-    dirs_to_backup = ["data", "papers", "notes", "summaries", "my-thesis", "vector_db", "skills", "logs"]
-
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"papermind_backup_{timestamp}.zip"
-
-    def iter_zip():
-        buffer = io.BytesIO()
-        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-            for dirname in dirs_to_backup:
-                src_dir = project_root / dirname
-                if not src_dir.exists():
-                    continue
-                for file_path in src_dir.rglob("*"):
-                    if file_path.is_file():
-                        arcname = str(file_path.relative_to(project_root))
-                        zf.write(file_path, arcname)
-        buffer.seek(0)
-        while True:
-            chunk = buffer.read(8192)
-            if not chunk:
-                break
-            yield chunk
+    backup_data = create_backup(include_config=False)
 
     return StreamingResponse(
-        iter_zip(),
+        io.BytesIO(backup_data),
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )

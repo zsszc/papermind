@@ -5,7 +5,7 @@
 - 存量数据在迁移后完整保留；
 - 幂等（重复执行不报错、不重复加列）；
 - 登记表中的表不存在时整张表静默跳过；
-- 迁移过程任何异常被吞掉只写 WARNING 日志，不阻断启动（降级路径）。
+- 迁移过程任何异常写 WARNING 后向上抛出，阻断不完整 schema 启动。
 
 隔离手段：用 monkeypatch 把 ``app.database.engine`` 替换为指向 tmp_path 的
 临时库引擎，绝不触碰真实的 data/papers.db。
@@ -190,14 +190,15 @@ class TestMigrationSemantics:
         conn.close()
         assert tables == []
 
-    def test_migration_failure_swallowed_and_logged(self, tmp_path, monkeypatch, caplog):
-        """锁定：迁移失败（如数据库文件损坏）只写 WARNING 日志并吞掉异常，不阻断启动。"""
+    def test_migration_failure_propagates_and_logs(self, tmp_path, monkeypatch, caplog):
+        """迁移失败必须 fail-close，不得伪装成启动成功。"""
         db_path = tmp_path / "corrupt.db"
         db_path.write_bytes(b"this is not a sqlite database file")
         monkeypatch.setattr(database_module, "engine", _make_engine(db_path))
 
         with caplog.at_level(logging.WARNING, logger="papermind"):
-            ensure_schema()  # 不应向上抛异常
+            with pytest.raises(Exception):
+                ensure_schema()
 
         assert any(
             "[schema] 轻量级迁移失败" in r.message and r.levelno == logging.WARNING

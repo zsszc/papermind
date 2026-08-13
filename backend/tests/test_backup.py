@@ -5,6 +5,7 @@
 """
 
 import io
+import sqlite3
 import zipfile
 
 import pytest
@@ -23,6 +24,9 @@ def fake_project(tmp_path, monkeypatch):
         encoding="utf-8",
     )
     monkeypatch.setattr(backup, "get_project_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        type(backup.config), "data_dir", property(lambda self: tmp_path / "data")
+    )
     return tmp_path
 
 
@@ -50,6 +54,9 @@ class TestConfigRedaction:
         (tmp_path / "data").mkdir()
         (tmp_path / "data" / "x.txt").write_text("d", encoding="utf-8")
         monkeypatch.setattr(backup, "get_project_root", lambda: tmp_path)
+        monkeypatch.setattr(
+            type(backup.config), "data_dir", property(lambda self: tmp_path / "data")
+        )
         data = backup.create_backup(dirs=["data"], include_vector=False)
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
             assert "config.yaml" not in zf.namelist()
@@ -59,11 +66,86 @@ class TestConfigRedaction:
 def test_include_db_backs_up_database_outside_data_subdir(tmp_path, monkeypatch):
     """Electron 兼容：数据库位于运行时根时仍以 data/papers.db 入包。"""
     database = tmp_path / "papers.db"
-    database.write_bytes(b"sqlite-test")
+    conn = sqlite3.connect(database)
+    conn.execute("CREATE TABLE sample (value TEXT)")
+    conn.execute("INSERT INTO sample VALUES ('sqlite-test')")
+    conn.commit()
+    conn.close()
     monkeypatch.setattr(backup, "get_project_root", lambda: tmp_path)
     monkeypatch.setattr(type(backup.config), "data_dir", property(lambda self: tmp_path))
 
     data = backup.create_backup(dirs=["missing"], include_db=True, include_vector=False)
 
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
-        assert zf.read("data/papers.db") == b"sqlite-test"
+        extracted = tmp_path / "extracted.db"
+        extracted.write_bytes(zf.read("data/papers.db"))
+        conn = sqlite3.connect(extracted)
+        assert conn.execute("SELECT value FROM sample").fetchone() == ("sqlite-test",)
+        conn.close()
+
+
+def test_backup_uses_consistent_snapshot_for_uncheckpointed_wal(tmp_path, monkeypatch):
+    """WAL 中已提交的数据必须进入独立且可校验的主库快照。"""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    database = data_dir / "papers.db"
+    conn = sqlite3.connect(database)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA wal_autocheckpoint=0")
+    conn.execute("CREATE TABLE sample (value TEXT)")
+    conn.execute("INSERT INTO sample VALUES ('latest')")
+    conn.commit()
+
+    monkeypatch.setattr(backup, "get_project_root", lambda: tmp_path)
+    monkeypatch.setattr(type(backup.config), "data_dir", property(lambda self: data_dir))
+    packed = backup.create_backup(dirs=["data"], include_vector=False)
+    conn.close()
+
+    with zipfile.ZipFile(io.BytesIO(packed)) as zf:
+        assert "data/papers.db" in zf.namelist()
+        assert "data/papers.db-wal" not in zf.namelist()
+        assert "data/papers.db-shm" not in zf.namelist()
+        extracted = tmp_path / "wal-extracted.db"
+        extracted.write_bytes(zf.read("data/papers.db"))
+
+    restored = sqlite3.connect(extracted)
+    assert restored.execute("PRAGMA quick_check").fetchone() == ("ok",)
+    assert restored.execute("SELECT value FROM sample").fetchone() == ("latest",)
+    restored.close()
+
+
+def test_include_db_false_excludes_database_and_sidecars(tmp_path, monkeypatch):
+    """include_db=False 在 data 目录入包时也必须排除 DB/WAL/SHM。"""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "papers.db").write_bytes(b"db")
+    (data_dir / "papers.db-wal").write_bytes(b"wal")
+    (data_dir / "papers.db-shm").write_bytes(b"shm")
+    (data_dir / "keep.txt").write_text("keep", encoding="utf-8")
+    monkeypatch.setattr(backup, "get_project_root", lambda: tmp_path)
+    monkeypatch.setattr(type(backup.config), "data_dir", property(lambda self: data_dir))
+
+    packed = backup.create_backup(
+        dirs=["data"], include_db=False, include_vector=False
+    )
+
+    with zipfile.ZipFile(io.BytesIO(packed)) as zf:
+        assert zf.namelist() == ["data/keep.txt"]
+
+
+def test_auto_backup_does_not_leave_final_file_when_atomic_write_fails(
+    tmp_path, monkeypatch
+):
+    """原子写失败时不得留下看似完整的最终 ZIP。"""
+    monkeypatch.setattr(backup, "get_project_root", lambda: tmp_path)
+    monkeypatch.setattr(backup, "create_backup", lambda: b"zip")
+
+    def fail_replace(source, target):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(backup.os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="replace failed"):
+        backup.auto_backup(tmp_path / "backups")
+
+    assert list((tmp_path / "backups").iterdir()) == []
