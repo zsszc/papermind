@@ -1,4 +1,4 @@
-import { Component } from 'react'
+import React, { Component } from 'react'
 import { Result, Button } from 'antd'
 
 // 全局错误边界：捕获子树渲染/生命周期异常，避免整页白屏。
