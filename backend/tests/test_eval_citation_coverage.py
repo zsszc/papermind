@@ -62,6 +62,13 @@ def eval_env(tmp_path, monkeypatch):
     # run_eval 内部 `from app.database import SessionLocal`，patch 之
     monkeypatch.setattr("app.database.SessionLocal", Session)
 
+    async def healthy_llm():
+        return {"ok": True, "model": "fake-eval-model"}
+
+    monkeypatch.setattr(
+        "app.services.llm.llm_service.health_check", healthy_llm
+    )
+
     entries = [
         {
             "qa_id": "pos1",
@@ -71,6 +78,7 @@ def eval_env(tmp_path, monkeypatch):
             "question_type": "factoid",
             "source": "synthetic",
             "has_answer": True,
+            "split": "dev",
         },
         {
             "qa_id": "pos2",
@@ -80,6 +88,7 @@ def eval_env(tmp_path, monkeypatch):
             "question_type": "experiment_data",
             "source": "synthetic",
             "has_answer": True,
+            "split": "dev",
         },
         {
             "qa_id": "neg1",
@@ -89,6 +98,7 @@ def eval_env(tmp_path, monkeypatch):
             "question_type": "out_of_scope",
             "source": "synthetic",
             "has_answer": False,
+            "split": "dev",
         },
     ]
     dataset_path = tmp_path / "ds.jsonl"
@@ -97,6 +107,7 @@ def eval_env(tmp_path, monkeypatch):
         encoding="utf-8",
     )
     report_dir = tmp_path / "reports"
+    monkeypatch.setattr(run, "PRIVATE_EVAL_ROOT", tmp_path)
     yield dataset_path, report_dir
     engine.dispose()
 
@@ -106,7 +117,7 @@ def _question_of(messages) -> str:
     return messages[-1]["content"].rsplit("问题：", 1)[-1]
 
 
-def _fake_llm_answer(messages) -> str:
+def _fake_llm_answer(messages, **kwargs) -> str:
     """fake LLM：pos1 引对 chunk、p1_c0；pos2 引错 chunk、p1_c0；负例拒答。"""
     question = _question_of(messages)
     if "肿瘤" in question:
@@ -116,16 +127,21 @@ def _fake_llm_answer(messages) -> str:
     return "不知道"
 
 
-def _run_and_load_report(eval_env, extra_args):
+def _run_and_load_report(eval_env, extra_args, *, expected_rc=0):
     dataset_path, report_dir = eval_env
     rc = run.main([
         "--dataset", str(dataset_path),
         "--keyword-only",
         "--report-dir", str(report_dir),
         "--threshold", "0",
+        "--split", "dev",
+        "--qa-id", "pos1",
+        "--qa-id", "pos2",
+        "--qa-id", "neg1",
+        "--max-llm-calls", "3",
         *extra_args,
     ])
-    assert rc == 0
+    assert rc == expected_rc
     files = sorted(report_dir.glob("*.json"))
     assert len(files) == 1, "应恰好写入一份报告"
     return json.loads(files[0].read_text(encoding="utf-8"))
@@ -160,6 +176,15 @@ class TestWithLlmCitationCoverage:
 
         assert report["overall"]["citation_coverage"] == pytest.approx(
             report["generation"]["citation_coverage"])
+        generation = report["generation"]
+        assert generation["valid"] is True
+        assert generation["model"] == "fake-eval-model"
+        assert generation["selected_qa_ids"] == ["pos1", "pos2", "neg1"]
+        assert generation["max_llm_calls"] == 3
+        assert generation["attempted"] == 3
+        assert generation["succeeded"] == 3
+        assert generation["error_count"] == 0
+        assert generation["errors"] == []
 
     def test_report_separates_citation_precision_recall_and_f1(
             self, eval_env, monkeypatch):
@@ -190,19 +215,49 @@ class TestWithLlmCitationCoverage:
 
     def test_llm_error_string_counts_as_zero(self, eval_env, monkeypatch):
         """LLM 带内错误串被当 answer 记录：无引用可提取，该条按 0 计。"""
-        def fake_error(messages):
+        def fake_error(messages, **kwargs):
             if "库中不存在" in _question_of(messages):
                 return "不知道"
             return "[调用 LLM 出错: Kimi API 响应超时]"
 
         monkeypatch.setattr(
             "app.services.llm.llm_service.chat_completion_sync", fake_error)
-        report = _run_and_load_report(eval_env, ["--with-llm"])
+        report = _run_and_load_report(
+            eval_env, ["--with-llm"], expected_rc=1
+        )
 
         assert report["overall"]["citation_coverage"] == pytest.approx(0.0)
+        assert report["generation"]["valid"] is False
+        assert report["generation"]["attempted"] == 3
+        assert report["generation"]["succeeded"] == 1
+        assert report["generation"]["error_count"] == 2
         items = {it["qa_id"]: it for it in report["items"]}
         assert items["pos1"]["citation_coverage"] == pytest.approx(0.0)
         assert items["pos1"]["citations"] == []
+
+    def test_llm_exception_is_counted_and_report_is_invalid(
+            self, eval_env, monkeypatch):
+        def fake_exception(messages, **kwargs):
+            if "实验结果" in _question_of(messages):
+                raise RuntimeError("secret provider detail")
+            return _fake_llm_answer(messages, **kwargs)
+
+        monkeypatch.setattr(
+            "app.services.llm.llm_service.chat_completion_sync", fake_exception
+        )
+        report = _run_and_load_report(
+            eval_env, ["--with-llm"], expected_rc=1
+        )
+
+        generation = report["generation"]
+        assert generation["valid"] is False
+        assert generation["attempted"] == 3
+        assert generation["succeeded"] == 2
+        assert generation["error_count"] == 1
+        assert generation["errors"] == [
+            {"qa_id": "pos2", "error": "RuntimeError"}
+        ]
+        assert "secret provider detail" not in repr(report)
 
     def test_without_with_llm_overall_lacks_field(self, eval_env, monkeypatch):
         """非 --with-llm 运行：overall 无 citation_coverage，且不调 LLM。"""

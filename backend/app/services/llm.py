@@ -272,6 +272,7 @@ class LLMService:
         json_mode: bool = False,
         timeout: Optional[int] = None,
         trace_metadata: Optional[Dict[str, Any]] = None,
+        max_tokens: Optional[int] = None,
     ) -> str:
         """chat_completion 的同步入口：供后台线程（无事件循环）使用。
 
@@ -285,7 +286,7 @@ class LLMService:
             kwargs = {
                 "model": self.model,
                 "messages": messages,
-                "max_tokens": self.max_tokens,
+                "max_tokens": self.max_tokens if max_tokens is None else max_tokens,
                 "temperature": self._get_temperature(),
                 "timeout": call_timeout,
             }

@@ -149,6 +149,14 @@ class TestEnabledWrapper:
         assert kwargs["metadata"]["conversation_id"] == 7
         assert kwargs["metadata"]["stream"] is False
 
+    def test_chat_completion_sync_allows_bounded_max_tokens(self, monkeypatch):
+        svc = _make_service(monkeypatch, public_key="pk-lf-test", secret_key="sk-lf-test")
+        svc.sync_client.chat.completions.create = MagicMock(return_value=_fake_response())
+
+        assert svc.chat_completion_sync(_MESSAGES, max_tokens=512) == "你好"
+        kwargs = svc.sync_client.chat.completions.create.call_args.kwargs
+        assert kwargs["max_tokens"] == 512
+
     @pytest.mark.asyncio
     async def test_chat_stream_observation_kwargs_and_passthrough(self, monkeypatch):
         """流式：观测字段正确，且 yield 的增量与现状逐字节一致。"""

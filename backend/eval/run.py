@@ -32,6 +32,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import json
 import math
@@ -62,6 +63,7 @@ _CHUNK_ID_RE = re.compile(r"\[(p\d+_c-?\d+)\]")
 
 # 评测报告默认输出目录（backend/eval/reports/）
 DEFAULT_REPORT_DIR = Path(__file__).resolve().parent / "reports"
+PRIVATE_EVAL_ROOT = Path(__file__).resolve().parent / "private"
 
 REPORT_SCHEMA_VERSION = "2.0"
 
@@ -443,6 +445,7 @@ class Retriever:
         keyword_only: bool = False,
         lexical_profile: str = "count",
         vector_dir: Optional[Path] = None,
+        retrieval_profile: str = "hybrid",
     ):
         self.db = db
         self.top_k = top_k
@@ -450,6 +453,7 @@ class Retriever:
         self.degrade_reason = ""
         self._store = None
         self.lexical_profile = lexical_profile
+        self.retrieval_profile = retrieval_profile
         self.last_query_mode = "keyword-only" if keyword_only else "hybrid"
         self.last_query_degraded = bool(keyword_only)
         self.last_query_error: Optional[str] = None
@@ -477,6 +481,10 @@ class Retriever:
 
     @property
     def mode(self) -> str:
+        if self.retrieval_profile == "semantic-production" and not self.degraded:
+            return "semantic-production"
+        if self.retrieval_profile == "semantic-production":
+            return "semantic-production(degraded)"
         return "keyword-only(degraded)" if self.degraded else "hybrid"
 
     def search(self, query: str) -> List[Dict[str, Any]]:
@@ -484,6 +492,21 @@ class Retriever:
         self.last_query_mode = "keyword-only" if self.degraded else "hybrid"
         self.last_query_degraded = self.degraded
         self.last_query_error = None
+        if self.retrieval_profile == "semantic-production":
+            self.last_query_mode = self.mode
+            self.last_query_degraded = self.degraded
+            if self.degraded:
+                self.runtime_degraded_count += 1
+                return []
+            try:
+                assert self._store is not None
+                return self._store.search(query=query, top_k=5)
+            except Exception as e:
+                self.last_query_mode = "semantic-production(runtime-degraded)"
+                self.last_query_degraded = True
+                self.last_query_error = type(e).__name__
+                self.runtime_degraded_count += 1
+                return []
         keyword_results = _keyword_chunk_search(
             self.db,
             query,
@@ -527,7 +550,21 @@ def _generate_answer(question: str, contexts: List[Dict[str, Any]]) -> str:
         {"role": "system", "content": _GEN_SYSTEM_PROMPT},
         {"role": "user", "content": f"资料：\n{context_text}\n\n问题：{question}"},
     ]
-    return llm_service.chat_completion_sync(messages)
+    return llm_service.chat_completion_sync(messages, max_tokens=512)
+
+
+def _is_llm_error_answer(answer: str) -> bool:
+    """识别 LLMService 的带内错误契约，防止错误被计为有效答案。"""
+    return (answer or "").lstrip().startswith("[调用 LLM 出错:")
+
+
+def _generation_error_kind(answer: str) -> Optional[str]:
+    """返回可审计的生成错误类型；有效答案返回 None。"""
+    if not (answer or "").strip():
+        return "empty_response"
+    if _is_llm_error_answer(answer):
+        return "llm_error_response"
+    return None
 
 
 def _extract_citations(answer: str) -> List[str]:
@@ -560,11 +597,51 @@ def _print_table(rows: List[Dict[str, Any]], k: int) -> None:
         print("  ".join(c.ljust(w) for c, w in zip(cells, widths)))
 
 
-def run_eval(args: argparse.Namespace) -> int:
-    """执行评测，返回进程退出码。"""
+def _prepare_eval_items(
+    args: argparse.Namespace,
+) -> tuple[List[Dict[str, Any]], Optional[str]]:
+    """加载、校验并按 split/QA 白名单筛选，不触发任何外部调用。"""
     items = load_dataset(args.dataset)
     validate_dataset(items)
     items = _select_split(items, args.split)
+    if args.qa_id:
+        requested = list(dict.fromkeys(args.qa_id))
+        by_id = {item["qa_id"]: item for item in items}
+        missing = [qa_id for qa_id in requested if qa_id not in by_id]
+        if missing:
+            return [], "--qa-id 不属于指定 split: " + ", ".join(missing)
+        items = [by_id[qa_id] for qa_id in requested]
+    if args.with_llm and len(items) > args.max_llm_calls:
+        return [], (
+            f"选中 {len(items)} 条 QA，超过 --max-llm-calls="
+            f"{args.max_llm_calls} 硬预算"
+        )
+    return items, None
+
+
+def _llm_health_preflight() -> Dict[str, Any]:
+    """在任何生成调用前做一次同步 CLI 探活。"""
+    from app.services.llm import llm_service
+
+    return asyncio.run(llm_service.health_check())
+
+
+def run_eval(args: argparse.Namespace) -> int:
+    """执行评测，返回进程退出码。"""
+    items, item_error = _prepare_eval_items(args)
+    if item_error:
+        print(f"[eval] 参数错误: {item_error}", file=sys.stderr)
+        return 2
+    llm_status: Optional[Dict[str, Any]] = None
+    if args.with_llm:
+        try:
+            llm_status = _llm_health_preflight()
+        except Exception:
+            print("[eval] LLM 健康预检异常，未发起生成调用", file=sys.stderr)
+            return 2
+        if not llm_status.get("ok"):
+            print("[eval] LLM 健康预检失败，未发起生成调用", file=sys.stderr)
+            return 2
     print(
         f"[eval] 数据集 {args.dataset} 共 {len(items)} 条"
         + (f"（split={args.split}）" if args.split != "all" else "")
@@ -598,6 +675,7 @@ def run_eval(args: argparse.Namespace) -> int:
             keyword_only=args.keyword_only,
             lexical_profile=args.lexical_profile,
             vector_dir=Path(args.vector_dir) if args.vector_dir else None,
+            retrieval_profile=args.retrieval_profile,
         )
         print(f"[eval] 检索模式: {retriever.mode}"
               + (f"（{retriever.degrade_reason}）" if retriever.degraded else ""))
@@ -614,6 +692,9 @@ def run_eval(args: argparse.Namespace) -> int:
         retrieval_latencies: List[float] = []  # 每次检索的延迟（毫秒）
         negative_total = 0
         negative_refused = 0
+        generation_attempted = 0
+        generation_succeeded = 0
+        generation_errors: List[Dict[str, str]] = []
 
         for idx, entry in enumerate(items, start=1):
             relevant_ids = resolved_qrels[entry["qa_id"]]
@@ -650,8 +731,24 @@ def run_eval(args: argparse.Namespace) -> int:
                 negative_total += 1
 
             if args.with_llm:
-                answer = _generate_answer(entry["question"], results)
+                generation_attempted += 1
+                try:
+                    answer = _generate_answer(entry["question"], results)
+                    error_kind = _generation_error_kind(answer)
+                    if error_kind:
+                        generation_errors.append({
+                            "qa_id": entry["qa_id"], "error": error_kind
+                        })
+                    else:
+                        generation_succeeded += 1
+                except Exception as e:
+                    answer = ""
+                    generation_errors.append({
+                        "qa_id": entry["qa_id"], "error": type(e).__name__
+                    })
                 record["answer"] = answer
+                if _generation_error_kind(answer):
+                    record["generation_error"] = generation_errors[-1]["error"]
                 if entry["has_answer"]:
                     cited = _extract_citations(answer)
                     precision = citation_precision(cited, relevant_ids)
@@ -727,7 +824,7 @@ def run_eval(args: argparse.Namespace) -> int:
                 "comparison_key": comparison_key,
             },
             "pipeline": {
-                "profile": retriever.mode,
+                "profile": args.retrieval_profile,
                 "effective_profile": effective_profile,
                 "lexical_profile": args.lexical_profile,
                 "split": args.split,
@@ -770,6 +867,14 @@ def run_eval(args: argparse.Namespace) -> int:
                 "citation_coverage": recall_mean,
             })
             report["generation"] = {
+                "valid": not generation_errors,
+                "model": (llm_status or {}).get("model"),
+                "selected_qa_ids": [item["qa_id"] for item in items],
+                "max_llm_calls": args.max_llm_calls,
+                "attempted": generation_attempted,
+                "succeeded": generation_succeeded,
+                "error_count": len(generation_errors),
+                "errors": generation_errors,
                 "citation_precision": precision_mean,
                 "citation_recall": recall_mean,
                 "citation_f1": f1_mean,
@@ -812,7 +917,10 @@ def run_eval(args: argparse.Namespace) -> int:
               f"阈值={args.threshold} -> {'PASS' if passed else 'FAIL'}")
         if not runtime_valid:
             print("[eval] hybrid 运行期发生语义检索降级，本次质量门禁无效")
-        return 0 if passed else 1
+        generation_valid = (
+            not args.with_llm or report["generation"]["valid"]
+        )
+        return 0 if passed and generation_valid else 1
     finally:
         db.close()
         if fixture_database is not None:
@@ -842,6 +950,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--keyword-only", action="store_true",
                         help="强制仅关键词检索（不加载语义模型，速度快）")
     parser.add_argument(
+        "--retrieval-profile",
+        choices=("hybrid", "semantic-production"),
+        default="hybrid",
+        help="评测检索管线；semantic-production 严格仅跑生产语义 top5",
+    )
+    parser.add_argument(
         "--vector-dir",
         default=None,
         help="hybrid 评测必须显式指定的隔离 Chroma 快照目录",
@@ -858,20 +972,54 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--with-llm", action="store_true",
                         help="加跑生成侧指标（会真实调用 LLM API，默认关闭）")
+    parser.add_argument(
+        "--qa-id", action="append", default=[],
+        help="受控生成评测的 QA 白名单（可重复指定）",
+    )
+    parser.add_argument(
+        "--max-llm-calls", type=int, default=0,
+        help="真实生成调用硬上限；--with-llm 时必须大于等于白名单数",
+    )
     parser.add_argument("--report-dir", default=str(DEFAULT_REPORT_DIR),
                         help="JSON 报告输出目录（默认 eval/reports/）")
     return parser
 
 
-def _validate_fixture_args(args: argparse.Namespace) -> Optional[str]:
-    """返回 fixture CLI 参数错误；合法时返回 None。"""
+def _validate_cli_args(args: argparse.Namespace) -> Optional[str]:
+    """返回 CLI 安全契约错误；合法时返回 None。"""
     if args.fixture and not args.keyword_only:
         return "fixture 评测必须显式使用 --keyword-only"
     if args.fixture and args.with_llm:
         return "fixture 评测不得使用 --with-llm"
+    if args.with_llm and args.split != "dev":
+        return "--with-llm 必须显式使用 --split dev"
+    if args.with_llm and not args.qa_id:
+        return "--with-llm 必须至少指定一个 --qa-id"
+    if args.with_llm and args.max_llm_calls <= 0:
+        return "--with-llm 必须指定正数 --max-llm-calls"
+    if args.with_llm:
+        report_dir = Path(args.report_dir).resolve()
+        private_root = PRIVATE_EVAL_ROOT.resolve()
+        dataset_path = Path(args.dataset).resolve() if args.dataset else None
+        if dataset_path is None or not dataset_path.is_relative_to(private_root):
+            return "--with-llm 的 dataset 必须位于 eval/private 内"
+        if not report_dir.is_relative_to(private_root):
+            return "--with-llm 的 --report-dir 必须位于 eval/private 内"
+    if args.retrieval_profile == "semantic-production":
+        if args.keyword_only:
+            return "semantic-production 不得使用 --keyword-only"
+        if args.top_k != 5:
+            return "semantic-production 必须使用 top-k=5"
+        if not args.vector_dir:
+            return "semantic-production 必须显式指定 --vector-dir"
     if not args.keyword_only and not args.vector_dir:
         return "hybrid 评测必须显式指定 --vector-dir 隔离向量快照"
     return None
+
+
+def _validate_fixture_args(args: argparse.Namespace) -> Optional[str]:
+    """保留旧名供下游测试与调用方兼容。"""
+    return _validate_cli_args(args)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -881,9 +1029,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         from eval.dataset import DEFAULT_SEED_PATH
 
         args.dataset = DEFAULT_SEED_PATH
-    fixture_error = _validate_fixture_args(args)
-    if fixture_error:
-        print(f"[eval] 参数错误: {fixture_error}", file=sys.stderr)
+    cli_error = _validate_cli_args(args)
+    if cli_error:
+        print(f"[eval] 参数错误: {cli_error}", file=sys.stderr)
         return 2
     return run_eval(args)
 
