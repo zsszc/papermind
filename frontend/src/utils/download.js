@@ -12,8 +12,9 @@ export async function downloadUrl(rawUrl, {
   fetchImpl = fetch,
   documentRef = document,
   urlApi = URL,
+  headers,
 } = {}) {
-  const response = await fetchImpl(rawUrl, { credentials: 'omit' })
+  const response = await fetchImpl(rawUrl, { credentials: 'omit', headers })
   if (!response.ok) throw new Error(`HTTP ${response.status}`)
 
   const objectUrl = urlApi.createObjectURL(await response.blob())

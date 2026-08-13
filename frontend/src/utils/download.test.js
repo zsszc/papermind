@@ -21,11 +21,12 @@ describe('downloadUrl', () => {
       fetchImpl,
       documentRef,
       urlApi,
+      headers: { 'X-PaperMind-Token': 'test-token' },
     })
 
     expect(fetchImpl).toHaveBeenCalledWith(
       'http://127.0.0.1:8000/static/papers/a%20b.pdf',
-      { credentials: 'omit' },
+      { credentials: 'omit', headers: { 'X-PaperMind-Token': 'test-token' } },
     )
     expect(link.href).toBe('blob:download')
     expect(link.download).toBe('a b.pdf')

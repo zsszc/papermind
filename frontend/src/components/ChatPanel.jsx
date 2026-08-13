@@ -43,7 +43,7 @@ import {
   regenerateMessage,
   analyzeImage,
 } from '../api'
-import { getApiBaseUrl } from '../utils/apiUrl'
+import { apiFetch } from '../utils/apiUrl'
 import { readSSEStream } from '../utils/sse'
 import { colors, componentStyles } from '../theme'
 // ResizableVertical 不再用于聊天面板，改为消息区滚动 + 底部固定输入
@@ -330,7 +330,7 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
     const doSend = async (retryCount = 0) => {
       abortCtrlRef.current = new AbortController()
       try {
-        const response = await fetch(`${getApiBaseUrl()}/api/chat`, {
+        const response = await apiFetch('/api/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({

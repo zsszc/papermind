@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, useMemo } from 'react'
 import { Document, Page, pdfjs } from 'react-pdf'
 import 'react-pdf/dist/Page/AnnotationLayer.css'
 import 'react-pdf/dist/Page/TextLayer.css'
@@ -31,6 +31,7 @@ import {
 } from '../api'
 import { colors } from '../theme'
 import { downloadUrl } from '../utils/download'
+import { getCapabilityHeaders, getProtectedResource } from '../utils/apiUrl'
 
 pdfjs.GlobalWorkerOptions.workerSrc = new URL(
   'pdfjs-dist/build/pdf.worker.min.mjs',
@@ -61,6 +62,7 @@ function PdfViewer({ url, paperId, initialPage = 1 }) {
   const [annoModalOpen, setAnnoModalOpen] = useState(false)
   const [annoNote, setAnnoNote] = useState('')
   const containerRef = useRef(null)
+  const protectedResource = useMemo(() => getProtectedResource(url), [url])
 
   useEffect(() => {
     if (initialPage >= 1) setPageNumber(initialPage)
@@ -155,7 +157,7 @@ function PdfViewer({ url, paperId, initialPage = 1 }) {
 
   const handleDownload = async () => {
     try {
-      await downloadUrl(url)
+      await downloadUrl(url, { headers: getCapabilityHeaders() })
     } catch {
       message.error('PDF 下载失败，请稍后重试')
     }
@@ -239,7 +241,7 @@ function PdfViewer({ url, paperId, initialPage = 1 }) {
           </div>
         )}
         <Document
-          file={url}
+          file={protectedResource}
           onLoadSuccess={onDocumentLoadSuccess}
           onLoadError={(err) => {
             setLoading(false)

@@ -33,7 +33,7 @@ import {
 } from '../api'
 import PdfViewer from '../components/PdfViewer'
 import ResizablePanels from '../components/ResizablePanels'
-import { getApiBaseUrl } from '../utils/apiUrl'
+import { getApiUrl } from '../utils/apiUrl'
 import { colors, componentStyles } from '../theme'
 
 const { TextArea } = Input
@@ -205,7 +205,7 @@ function PaperDetail({ paperId, onBack, initialPage }) {
 
   if (!paper) return null
 
-  const pdfUrl = `${getApiBaseUrl()}/api/papers/${paperId}/pdf`
+  const pdfUrl = getApiUrl(`/api/papers/${paperId}/pdf`)
 
   const tagOptions = allTags.map((t) => ({
     value: t.name,

@@ -1,11 +1,12 @@
 import axios from 'axios'
 import { message } from 'antd'
-import { getApiBaseUrl } from './utils/apiUrl'
+import { apiFetch, applyApiRequestConfig } from './utils/apiUrl'
 
 const api = axios.create({
-  baseURL: `${getApiBaseUrl()}/api`,
   timeout: 30000,
 })
+
+api.interceptors.request.use(applyApiRequestConfig)
 
 // 统一错误处理：后端返回的 detail 优先展示
 api.interceptors.response.use(
@@ -76,11 +77,11 @@ export const getHistory = (id) => api.get(`/chat/conversations/${id}/history`)
 export const deleteMessagesFrom = (conversationId, messageId) =>
   api.delete(`/chat/conversations/${conversationId}/messages/${messageId}`)
 export const regenerateMessage = (conversationId, messageId) =>
-  fetch(`${getApiBaseUrl()}/api/chat/conversations/${conversationId}/messages/${messageId}/regenerate`, {
+  apiFetch(`/api/chat/conversations/${conversationId}/messages/${messageId}/regenerate`, {
     method: 'POST',
   })
 export const sendChatMessage = (data) =>
-  fetch(`${getApiBaseUrl()}/api/chat`, {
+  apiFetch('/api/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data),
@@ -90,7 +91,7 @@ export const analyzeImage = (file, question) => {
   const form = new FormData()
   form.append('file', file)
   form.append('question', question || '')
-  return fetch(`${getApiBaseUrl()}/api/chat/analyze-image`, {
+  return apiFetch('/api/chat/analyze-image', {
     method: 'POST',
     body: form,
   })

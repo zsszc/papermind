@@ -13,7 +13,7 @@ import {
 } from 'antd'
 import { FileSearchOutlined, ClearOutlined, PauseCircleOutlined } from '@ant-design/icons'
 import { listThesis, getThesis, getChapterText } from '../api'
-import { getApiBaseUrl } from '../utils/apiUrl'
+import { apiFetch } from '../utils/apiUrl'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { colors, componentStyles } from '../theme'
@@ -84,8 +84,8 @@ function WritingDesk({ onSelectPaper }) {
     setCitations([])
     abortCtrlRef.current = new AbortController()
     try {
-      const response = await fetch(
-        `${getApiBaseUrl()}/api/thesis/${selectedThesis}/suggest-citations?paragraph=${encodeURIComponent(paragraph)}`,
+      const response = await apiFetch(
+        `/api/thesis/${selectedThesis}/suggest-citations?paragraph=${encodeURIComponent(paragraph)}`,
         {
           method: 'POST',
           signal: abortCtrlRef.current.signal,

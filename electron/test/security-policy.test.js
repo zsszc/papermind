@@ -107,6 +107,7 @@ test('前端入口声明 Electron CSP 安全边界', () => {
   assert.match(html, /default-src 'self'/)
   assert.match(html, /object-src 'none'/)
   assert.match(html, /frame-src 'none'/)
-  assert.match(html, /connect-src[^;]*http:\/\/127\.0\.0\.1:8000/)
+  assert.match(html, /connect-src[^;]*http:\/\/127\.0\.0\.1:\*/)
+  assert.doesNotMatch(html, /connect-src[^;]*http:\/\/\*/)
   assert.doesNotMatch(html, /script-src[^;]*unsafe-inline/)
 })
