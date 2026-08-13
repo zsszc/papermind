@@ -45,6 +45,11 @@ import {
 } from '../api'
 import { apiFetch } from '../utils/apiUrl'
 import { readSSEStream } from '../utils/sse'
+import {
+  beginChatOperation,
+  finishChatOperation,
+  updateMessageByIdentity,
+} from '../utils/chatOperation'
 import { colors, componentStyles } from '../theme'
 // ResizableVertical 不再用于聊天面板，改为消息区滚动 + 底部固定输入
 
@@ -186,17 +191,16 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
 
-  // 注意：浮窗关闭时组件会卸载，但不要中断正在进行的 SSE 请求，
-  // 否则联网搜索等长耗时流式回答会在关闭浮窗后被自动取消。
-  // 如需停止，用户可点击“停止”按钮或组件真正卸载前手动调用 handleStop。
+  // 浮窗“关闭”只是 display:none，组件仍存活；视图切换才会真正卸载。
+  // 卸载后必须取消请求，避免无界后台 SSE 与对已卸载实例的状态更新。
   useEffect(() => {
     return () => {
-      // 仅在重新加载历史/切换会话等内部清理时中断；
-      // 组件卸载时保留后台请求，避免关闭浮窗导致搜索中断。
+      abortCtrlRef.current?.abort()
     }
   }, [])
 
   const loadHistory = useCallback(async (id) => {
+    abortCtrlRef.current?.abort()
     try {
       const res = await getHistory(id)
       setCurrentId(id)
@@ -207,7 +211,8 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
     }
   }, [])
 
-  const handleNewConversation = useCallback(async () => {
+  const handleNewConversation = useCallback(async ({ cancelActive = true } = {}) => {
+    if (cancelActive) abortCtrlRef.current?.abort()
     try {
       const res = await createConversation()
       const newConv = res.data
@@ -226,6 +231,7 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
   const handleDeleteConversation = useCallback(
     async (e, id) => {
       e?.stopPropagation()
+      if (currentId === id) abortCtrlRef.current?.abort()
       try {
         await deleteConversation(id)
         message.success('会话已删除')
@@ -245,90 +251,82 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
   const handleSend = useCallback(async () => {
     if (!input.trim() && !selectedImage) return
 
-    let activeConvId = currentId
-    if (!activeConvId) {
-      activeConvId = await handleNewConversation()
-      if (!activeConvId) return
-    }
+    const controller = new AbortController()
+    // ref 是同步门禁，可阻止 React loading state 重渲染前的快速双击。
+    if (!beginChatOperation(abortCtrlRef, controller)) return
 
-    const userContent = input.trim() || '请分析这张图片'
-    const currentImage = selectedImage
-    const currentImagePreview = imagePreview
-
-    setInput('')
-    setSelectedImage(null)
-    setImagePreview(null)
-
-    const userTempId = generateTempId()
-    const assistantTempId = generateTempId()
-    setMessages((prev) => [
-      ...prev,
-      { role: 'user', content: userContent, tempId: userTempId, image: currentImagePreview },
-      { role: 'assistant', content: '', tempId: assistantTempId },
-    ])
-    setLoading(true)
-    setCitations([])
-
-    // 如果有图片，走图片分析接口
-    if (currentImage) {
-      abortCtrlRef.current = new AbortController()
-      try {
-        const response = await analyzeImage(currentImage, userContent)
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`)
-        }
-
-        let assistantContent = ''
-        await readSSEStream(
-          response,
-          (delta) => {
-            assistantContent += delta
-            setMessages((prev) => {
-              const next = [...prev]
-              const last = next[next.length - 1]
-              if (last && last.role === 'assistant') {
-                next[next.length - 1] = { ...last, content: assistantContent }
-              }
-              return next
-            })
-          },
-          () => {},
-          // 后端通过 SSE 下发的 error 事件：提示并结束 loading（finally 中统一收尾）
-          (errorMsg) => {
-            message.error('图片分析失败：' + errorMsg)
-            setMessages((prev) => {
-              const last = prev[prev.length - 1]
-              if (last && last.role === 'assistant') {
-                const next = [...prev]
-                next[next.length - 1] = { ...last, content: last.content || '[图片分析失败，请稍后重试]' }
-                return next
-              }
-              return prev
-            })
-          }
-        )
-      } catch (err) {
-        if (err.name !== 'AbortError') {
-          message.error('图片分析失败：' + (err.message || '未知错误'))
-          setMessages((prev) => {
-            const last = prev[prev.length - 1]
-            if (last && last.role === 'assistant') {
-              const next = [...prev]
-              next[next.length - 1] = { ...last, content: '[图片分析失败，请稍后重试]' }
-              return next
-            }
-            return prev
-          })
-        }
-      } finally {
-        setLoading(false)
-        abortCtrlRef.current = null
+    let assistantTempId = null
+    try {
+      let activeConvId = currentId
+      if (!activeConvId) {
+        activeConvId = await handleNewConversation({ cancelActive: false })
+        if (!activeConvId) return
       }
-      return
-    }
 
-    const doSend = async (retryCount = 0) => {
-      abortCtrlRef.current = new AbortController()
+      const userContent = input.trim() || '请分析这张图片'
+      const currentImage = selectedImage
+      const currentImagePreview = imagePreview
+
+      setInput('')
+      setSelectedImage(null)
+      setImagePreview(null)
+
+      const userTempId = generateTempId()
+      assistantTempId = generateTempId()
+      setMessages((prev) => [
+        ...prev,
+        { role: 'user', content: userContent, tempId: userTempId, image: currentImagePreview },
+        { role: 'assistant', content: '', tempId: assistantTempId },
+      ])
+      setLoading(true)
+      setCitations([])
+
+      // 如果有图片，走图片分析接口
+      if (currentImage) {
+        try {
+          const response = await analyzeImage(currentImage, userContent, { signal: controller.signal })
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`)
+          }
+
+          let assistantContent = ''
+          await readSSEStream(
+            response,
+            (delta) => {
+              assistantContent += delta
+              setMessages((prev) => updateMessageByIdentity(
+                prev,
+                { tempId: assistantTempId },
+                { content: assistantContent }
+              ))
+            },
+            () => {},
+            // 后端通过 SSE 下发的 error 事件：提示并结束 loading（finally 中统一收尾）
+            (errorMsg) => {
+              message.error('图片分析失败：' + errorMsg)
+              setMessages((prev) => {
+                const target = prev.find((item) => item.tempId === assistantTempId)
+                return updateMessageByIdentity(
+                  prev,
+                  { tempId: assistantTempId },
+                  { content: target?.content || '[图片分析失败，请稍后重试]' }
+                )
+              })
+            }
+          )
+        } catch (err) {
+          if (err.name !== 'AbortError') {
+            message.error('图片分析失败：' + (err.message || '未知错误'))
+            setMessages((prev) => updateMessageByIdentity(
+              prev,
+              { tempId: assistantTempId },
+              { content: '[图片分析失败，请稍后重试]' }
+            ))
+          }
+        }
+        return
+      }
+
       try {
         const response = await apiFetch('/api/chat', {
           method: 'POST',
@@ -340,7 +338,7 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
             enable_web_search: enableWebSearch,
             skill: activeSkill,
           }),
-          signal: abortCtrlRef.current.signal,
+          signal: controller.signal,
         })
 
         if (!response.ok) {
@@ -353,72 +351,61 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
           response,
           (delta) => {
             assistantContent += delta
-            setMessages((prev) => {
-              const next = [...prev]
-              const last = next[next.length - 1]
-              if (last && last.role === 'assistant') {
-                next[next.length - 1] = { ...last, content: assistantContent }
-              }
-              return next
-            })
+            setMessages((prev) => updateMessageByIdentity(
+              prev,
+              { tempId: assistantTempId },
+              { content: assistantContent }
+            ))
           },
           (finalCitations) => {
             if (finalCitations?.length) {
               setCitations(finalCitations)
             }
           },
-          // 后端通过 SSE 下发的 error 事件：提示并结束 loading（finally 中统一收尾），不触发重试
+          // 后端通过 SSE 下发的 error 事件：提示并结束 loading（finally 中统一收尾）
           (errorMsg) => {
             message.error('对话失败：' + errorMsg)
             setMessages((prev) => {
-              const last = prev[prev.length - 1]
-              if (last && last.role === 'assistant') {
-                const next = [...prev]
-                next[next.length - 1] = { ...last, content: last.content || '[请求失败，请稍后重试]' }
-                return next
-              }
-              return prev
+              const target = prev.find((item) => item.tempId === assistantTempId)
+              return updateMessageByIdentity(
+                prev,
+                { tempId: assistantTempId },
+                { content: target?.content || '[请求失败，请稍后重试]' }
+              )
             })
           }
         )
-
         fetchConversations()
       } catch (err) {
         if (err.name === 'AbortError') {
-          setMessages((prev) => {
-            const next = [...prev]
-            const last = next[next.length - 1]
-            if (last && last.role === 'assistant') {
-              next[next.length - 1] = { ...last, isInterrupted: true }
-            }
-            return next
-          })
-        } else if (retryCount < 1) {
-          message.warning('请求失败，正在自动重试...')
-          await doSend(retryCount + 1)
-          return
+          setMessages((prev) => updateMessageByIdentity(
+            prev,
+            { tempId: assistantTempId },
+            { isInterrupted: true }
+          ))
         } else {
+          // POST /api/chat 已在 SSE 前落用户消息，任何自动重放都可能重复落库/计费。
           message.error('对话请求失败：' + (err.message || '未知错误'))
-          setMessages((prev) => {
-            const last = prev[prev.length - 1]
-            if (last && last.role === 'assistant') {
-              const next = [...prev]
-              next[next.length - 1] = { ...last, content: '[请求失败，请稍后重试]' }
-              return next
-            }
-            return prev
-          })
-        }
-      } finally {
-        if (retryCount < 1) {
-          setLoading(false)
-          abortCtrlRef.current = null
+          setMessages((prev) => updateMessageByIdentity(
+            prev,
+            { tempId: assistantTempId },
+            { content: '[请求失败，请稍后重试]' }
+          ))
         }
       }
+    } finally {
+      if (finishChatOperation(abortCtrlRef, controller)) setLoading(false)
     }
-
-    await doSend()
-  }, [input, currentId, handleNewConversation, fetchConversations, readSSEStream])
+  }, [
+    input,
+    selectedImage,
+    imagePreview,
+    currentId,
+    handleNewConversation,
+    fetchConversations,
+    enableWebSearch,
+    activeSkill,
+  ])
 
   const handleStop = useCallback(() => {
     abortCtrlRef.current?.abort()
@@ -428,11 +415,11 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
     async (index) => {
       const msg = messages[index]
       if (!msg || msg.role !== 'user' || !msg.id) return
-      setInput(msg.content)
-      // 截断到该 user 消息之前，并同步删除后端历史
-      setMessages((prev) => prev.slice(0, index))
       try {
         await deleteMessagesFrom(currentId, msg.id)
+        // 服务端成功后再提交本地截断，失败时保留原历史。
+        setInput(msg.content)
+        setMessages((prev) => prev.slice(0, index))
       } catch (err) {
         message.error('编辑消息失败')
       }
@@ -445,14 +432,15 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
       const msg = messages[index]
       if (!msg || msg.role !== 'assistant' || !msg.id) return
 
+      const controller = new AbortController()
+      if (!beginChatOperation(abortCtrlRef, controller)) return
+
       setRegeneratingMsgId(msg.id)
       setLoading(true)
       setCitations([])
 
-      abortCtrlRef.current = new AbortController()
-
       try {
-        const response = await regenerateMessage(currentId, msg.id)
+        const response = await regenerateMessage(currentId, msg.id, { signal: controller.signal })
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}`)
         }
@@ -462,11 +450,11 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
           response,
           (delta) => {
             newContent += delta
-            setMessages((prev) => {
-              const next = [...prev]
-              next[index] = { ...next[index], content: newContent, isInterrupted: false }
-              return next
-            })
+            setMessages((prev) => updateMessageByIdentity(
+              prev,
+              { id: msg.id },
+              { content: newContent, isInterrupted: false }
+            ))
           },
           (finalCitations) => {
             if (finalCitations?.length) {
@@ -484,9 +472,10 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
           message.error('重新生成失败：' + (err.message || '未知错误'))
         }
       } finally {
-        setLoading(false)
-        setRegeneratingMsgId(null)
-        abortCtrlRef.current = null
+        if (finishChatOperation(abortCtrlRef, controller)) {
+          setLoading(false)
+          setRegeneratingMsgId(null)
+        }
       }
     },
     [currentId, messages, fetchConversations, readSSEStream]
@@ -519,7 +508,7 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
         icon={<PlusOutlined />}
         block
         style={{ ...componentStyles.buttonPrimary, marginBottom: 12 }}
-        onClick={handleNewConversation}
+        onClick={() => handleNewConversation()}
       >
         新会话
       </Button>

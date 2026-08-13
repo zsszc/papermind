@@ -1,11 +1,12 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { readSSEStream } from './sse'
+import { IncompleteSSEError, SSEProtocolError, SSETimeoutError, readSSEStream } from './sse'
 
 function responseFromChunks(chunks) {
   const encoder = new TextEncoder()
   let index = 0
   const cancel = vi.fn()
+  const releaseLock = vi.fn()
   return {
     body: {
       getReader: () => ({
@@ -14,9 +15,11 @@ function responseFromChunks(chunks) {
           return { done: false, value: encoder.encode(chunks[index++]) }
         }),
         cancel,
+        releaseLock,
       }),
     },
     cancel,
+    releaseLock,
   }
 }
 
@@ -35,6 +38,8 @@ describe('readSSEStream', () => {
     expect(onDelta.mock.calls.flat()).toEqual(['你', '好'])
     expect(onFinish).toHaveBeenCalledTimes(1)
     expect(onFinish).toHaveBeenCalledWith([{ paper_id: 1 }])
+    expect(response.cancel).toHaveBeenCalledOnce()
+    expect(response.releaseLock).toHaveBeenCalledOnce()
   })
 
   it('错误事件结束流并调用错误回调', async () => {
@@ -49,7 +54,9 @@ describe('readSSEStream', () => {
 
     expect(onError).toHaveBeenCalledWith('服务繁忙')
     expect(onDelta).not.toHaveBeenCalled()
-    expect(onFinish).toHaveBeenCalledOnce()
+    expect(onFinish).not.toHaveBeenCalled()
+    expect(response.cancel).toHaveBeenCalledOnce()
+    expect(response.releaseLock).toHaveBeenCalledOnce()
   })
 
   it('非法 JSON 只 warning，继续处理下一事件', async () => {
@@ -59,7 +66,9 @@ describe('readSSEStream', () => {
     const warning = vi.fn()
     const onDelta = vi.fn()
 
-    await readSSEStream(response, onDelta, vi.fn(), undefined, { warning })
+    await expect(
+      readSSEStream(response, onDelta, vi.fn(), undefined, { warning })
+    ).rejects.toBeInstanceOf(IncompleteSSEError)
 
     expect(warning).toHaveBeenCalledOnce()
     expect(onDelta).toHaveBeenCalledWith('继续')
@@ -73,11 +82,100 @@ describe('readSSEStream', () => {
         getReader: () => ({
           read: vi.fn(async () => { throw abortError }),
           cancel,
+          releaseLock: vi.fn(),
         }),
       },
     }
 
     await expect(readSSEStream(response, vi.fn(), vi.fn())).rejects.toBe(abortError)
     expect(cancel).toHaveBeenCalledOnce()
+  })
+
+  it('响应体缺失时拒绝读取', async () => {
+    await expect(readSSEStream({ body: null }, vi.fn(), vi.fn())).rejects.toBeInstanceOf(
+      SSEProtocolError
+    )
+  })
+
+  it('未收到 finished 就 EOF 时报不完整流，不调用 finish', async () => {
+    const response = responseFromChunks(['data: {"delta":"半个答案"}\n\n'])
+    const onFinish = vi.fn()
+
+    await expect(readSSEStream(response, vi.fn(), onFinish)).rejects.toBeInstanceOf(
+      IncompleteSSEError
+    )
+
+    expect(onFinish).not.toHaveBeenCalled()
+    expect(response.releaseLock).toHaveBeenCalledOnce()
+  })
+
+  it('error 与 finished 同帧时 error 优先，两个回调互斥', async () => {
+    const response = responseFromChunks([
+      'data: {"error":"失败","finished":true,"citations":[{"paper_id":1}]}\n\n',
+    ])
+    const onFinish = vi.fn()
+    const onError = vi.fn()
+
+    await readSSEStream(response, vi.fn(), onFinish, onError)
+
+    expect(onError).toHaveBeenCalledOnce()
+    expect(onFinish).not.toHaveBeenCalled()
+  })
+
+  it('首事件超过预算时抛出可区分的超时并释放 reader', async () => {
+    vi.useFakeTimers()
+    const cancel = vi.fn()
+    const releaseLock = vi.fn()
+    const response = {
+      body: { getReader: () => ({ read: vi.fn(() => new Promise(() => {})), cancel, releaseLock }) },
+    }
+    const pending = readSSEStream(response, vi.fn(), vi.fn(), vi.fn(), {
+      firstEventTimeoutMs: 50,
+      idleTimeoutMs: 100,
+      totalTimeoutMs: 1000,
+    })
+    const rejection = expect(pending).rejects.toMatchObject({
+      name: 'SSETimeoutError', kind: '首事件',
+    })
+
+    await vi.advanceTimersByTimeAsync(50)
+    await rejection
+    expect(cancel).toHaveBeenCalledOnce()
+    expect(releaseLock).toHaveBeenCalledOnce()
+    vi.useRealTimers()
+  })
+
+  it('持续收到数据会续租空闲预算，但仍受总时长限制', async () => {
+    vi.useFakeTimers()
+    const encoder = new TextEncoder()
+    let reads = 0
+    const response = {
+      body: {
+        getReader: () => ({
+          read: vi.fn(() => {
+            reads += 1
+            if (reads <= 2) {
+              return new Promise((resolve) => setTimeout(
+                () => resolve({ done: false, value: encoder.encode(`data: {"delta":"${reads}"}\n\n`) }),
+                40
+              ))
+            }
+            return new Promise(() => {})
+          }),
+          cancel: vi.fn(),
+          releaseLock: vi.fn(),
+        }),
+      },
+    }
+    const pending = readSSEStream(response, vi.fn(), vi.fn(), vi.fn(), {
+      firstEventTimeoutMs: 50,
+      idleTimeoutMs: 50,
+      totalTimeoutMs: 110,
+    })
+    const rejection = expect(pending).rejects.toBeInstanceOf(SSETimeoutError)
+
+    await vi.advanceTimersByTimeAsync(120)
+    await rejection
+    vi.useRealTimers()
   })
 })
