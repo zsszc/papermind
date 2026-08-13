@@ -24,7 +24,7 @@ extraResources:
       - "!**/*.pyc"
       - "!**/.DS_Store"
       - "!package-lock.json"
-      - "!*=*"
+      - "!=2.6.0"
   - from: ../config.yaml.example
     to: config.yaml.example
 mac:

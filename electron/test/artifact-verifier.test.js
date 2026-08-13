@@ -12,12 +12,14 @@ function createFixture() {
   for (const relativePath of [
     'frontend/dist/index.html',
     'backend/app/main.py',
-    'backend/venv/bin/python',
   ]) {
     const target = path.join(root, relativePath)
     fs.mkdirSync(path.dirname(target), { recursive: true })
     fs.writeFileSync(target, '')
   }
+  const python = path.join(root, 'backend/venv/bin/python')
+  fs.mkdirSync(path.dirname(python), { recursive: true })
+  fs.writeFileSync(python, '#!/bin/sh\n')
   fs.writeFileSync(path.join(root, 'app.asar'), '')
   fs.writeFileSync(path.join(root, 'config.yaml.example'), 'llm:\n  api_key: ""\n')
   return root
@@ -90,6 +92,20 @@ test('公开配置模板中的疑似真实 API Key 会阻断发布', () => {
     )
     const errors = scanArtifact(root, { asarEntries: validAsarEntries })
     assert.ok(errors.some((error) => error.includes('疑似密钥')))
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+
+test('Python 解释器软链不得逃出发布资源目录', () => {
+  const root = createFixture()
+  try {
+    const python = path.join(root, 'backend/venv/bin/python')
+    fs.rmSync(python)
+    fs.symlinkSync('/opt/miniconda3/bin/python3', python)
+    const errors = scanArtifact(root, { asarEntries: validAsarEntries })
+    assert.ok(errors.some((error) => error.includes('Python 软链逃出制品')))
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }

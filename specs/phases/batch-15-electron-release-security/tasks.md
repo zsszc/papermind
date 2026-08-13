@@ -5,6 +5,6 @@
 - [x] T2 GREEN：实现安全策略、CSP 与主进程接线。
 - [x] T3 RED：制品必需文件、禁止路径和密钥模式测试失败。
 - [x] T4 GREEN：实现制品扫描器并收紧 builder 资源规则。
-- [ ] T5：升级 Electron 43 / builder 26，清零官方 audit。
+- [x] T5：升级 Electron 43 / builder 26，清零官方 audit。
 - [ ] T6：实际构建 unpacked 应用并通过制品扫描。
 - [ ] T7：全量回归、测试报告、计划台账、提交并推送。

@@ -30,6 +30,7 @@ import {
   deleteAnnotation,
 } from '../api'
 import { colors } from '../theme'
+import { downloadUrl } from '../utils/download'
 
 pdfjs.GlobalWorkerOptions.workerSrc = new URL(
   'pdfjs-dist/build/pdf.worker.min.mjs',
@@ -152,6 +153,14 @@ function PdfViewer({ url, paperId, initialPage = 1 }) {
     }
   }
 
+  const handleDownload = async () => {
+    try {
+      await downloadUrl(url)
+    } catch {
+      message.error('PDF 下载失败，请稍后重试')
+    }
+  }
+
   const pageAnnotations = annotations.filter((a) => a.page_number === pageNumber)
 
   return (
@@ -199,7 +208,7 @@ function PdfViewer({ url, paperId, initialPage = 1 }) {
             批注
           </Button>
         </Tooltip>
-        <Button size="small" icon={<DownloadOutlined />} href={url} target="_blank">
+        <Button size="small" icon={<DownloadOutlined />} onClick={handleDownload}>
           下载
         </Button>
       </Space>
@@ -224,9 +233,9 @@ function PdfViewer({ url, paperId, initialPage = 1 }) {
           <div style={{ padding: 40 }}>
             <Text type="danger">{error}</Text>
             <br />
-            <a href={url} target="_blank" rel="noopener noreferrer">
+            <Button type="link" onClick={handleDownload}>
               点击下载查看
-            </a>
+            </Button>
           </div>
         )}
         <Document

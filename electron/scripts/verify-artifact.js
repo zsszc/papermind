@@ -43,12 +43,24 @@ function walkFiles(root, relative = '') {
 }
 
 
-function hasPythonRuntime(resourcesRoot) {
-  return [
+function validatePythonRuntime(resourcesRoot) {
+  const candidates = [
     'backend/venv/bin/python',
     'backend/venv/bin/python3',
     'backend/venv/Scripts/python.exe',
-  ].some((relativePath) => fs.existsSync(path.join(resourcesRoot, relativePath)))
+  ]
+  const found = candidates.find((relativePath) => fs.existsSync(path.join(resourcesRoot, relativePath)))
+  if (!found) return '缺少 Python 运行时: backend/venv/{bin,Scripts}/python'
+
+  const absolutePath = path.join(resourcesRoot, found)
+  if (!fs.lstatSync(absolutePath).isSymbolicLink()) return null
+  const linkTarget = fs.readlinkSync(absolutePath)
+  const resolvedTarget = path.resolve(path.dirname(absolutePath), linkTarget)
+  const relativeTarget = path.relative(resourcesRoot, resolvedTarget)
+  if (path.isAbsolute(linkTarget) || relativeTarget.startsWith('..') || path.isAbsolute(relativeTarget)) {
+    return `Python 软链逃出制品: ${found} -> ${linkTarget}`
+  }
+  return null
 }
 
 
@@ -66,7 +78,8 @@ function scanArtifact(resourcesRoot, { asarEntries } = {}) {
   for (const requiredPath of REQUIRED_PATHS) {
     if (!fileSet.has(requiredPath)) errors.push(`缺少运行文件: ${requiredPath}`)
   }
-  if (!hasPythonRuntime(resourcesRoot)) errors.push('缺少 Python 运行时: backend/venv/{bin,Scripts}/python')
+  const pythonError = validatePythonRuntime(resourcesRoot)
+  if (pythonError) errors.push(pythonError)
 
   for (const relativePath of files) {
     if (FORBIDDEN_PATHS.some((pattern) => pattern.test(relativePath))) {
