@@ -25,6 +25,8 @@ vector_db/
 logs/
 cache/
 backend/eval/reports/
+backend/eval/private/
+backend/eval/dataset/qa_candidates.jsonl
 
 # 模型缓存
 *.bin
