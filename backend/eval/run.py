@@ -446,6 +446,7 @@ class Retriever:
         lexical_profile: str = "count",
         vector_dir: Optional[Path] = None,
         retrieval_profile: str = "hybrid",
+        semantic_rerank: Optional[bool] = None,
     ):
         self.db = db
         self.top_k = top_k
@@ -454,6 +455,12 @@ class Retriever:
         self._store = None
         self.lexical_profile = lexical_profile
         self.retrieval_profile = retrieval_profile
+        self.semantic_rerank = semantic_rerank
+        self.rerank_diagnostics: Dict[str, Any] = {
+            "requested": semantic_rerank,
+            "effective": False,
+            "error": None,
+        }
         self.last_query_mode = "keyword-only" if keyword_only else "hybrid"
         self.last_query_degraded = bool(keyword_only)
         self.last_query_error: Optional[str] = None
@@ -500,7 +507,20 @@ class Retriever:
                 return []
             try:
                 assert self._store is not None
-                return self._store.search(query=query, top_k=5)
+                results = self._store.search(
+                    query=query,
+                    top_k=5,
+                    rerank=self.semantic_rerank,
+                    rerank_diagnostics=self.rerank_diagnostics,
+                )
+                if (
+                    self.semantic_rerank is True
+                    and not self.rerank_diagnostics["effective"]
+                ):
+                    self.last_query_degraded = True
+                    self.last_query_error = self.rerank_diagnostics["error"]
+                    self.runtime_degraded_count += 1
+                return results
             except Exception as e:
                 self.last_query_mode = "semantic-production(runtime-degraded)"
                 self.last_query_degraded = True
@@ -676,6 +696,10 @@ def run_eval(args: argparse.Namespace) -> int:
             lexical_profile=args.lexical_profile,
             vector_dir=Path(args.vector_dir) if args.vector_dir else None,
             retrieval_profile=args.retrieval_profile,
+            semantic_rerank=(
+                args.semantic_rerank == "on"
+                if args.semantic_rerank is not None else None
+            ),
         )
         print(f"[eval] 检索模式: {retriever.mode}"
               + (f"（{retriever.degrade_reason}）" if retriever.degraded else ""))
@@ -827,12 +851,14 @@ def run_eval(args: argparse.Namespace) -> int:
                 "profile": args.retrieval_profile,
                 "effective_profile": effective_profile,
                 "lexical_profile": args.lexical_profile,
+                "semantic_rerank": args.semantic_rerank,
                 "split": args.split,
                 "top_k": args.top_k,
             },
             "diagnostics": {
                 "unresolved_qrels": [],
                 "runtime_degraded_count": retriever.runtime_degraded_count,
+                "rerank": retriever.rerank_diagnostics,
             },
             "gate": {
                 "passed": passed,
@@ -961,6 +987,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="hybrid 评测必须显式指定的隔离 Chroma 快照目录",
     )
     parser.add_argument(
+        "--semantic-rerank",
+        choices=("off", "on"),
+        default=None,
+        help="semantic-production 必须显式选择的生产语义重排开关",
+    )
+    parser.add_argument(
         "--lexical-profile",
         choices=(
             "count", "bm25", "bm25-bilingual", "bm25-bilingual-neighbor"
@@ -1012,6 +1044,10 @@ def _validate_cli_args(args: argparse.Namespace) -> Optional[str]:
             return "semantic-production 必须使用 top-k=5"
         if not args.vector_dir:
             return "semantic-production 必须显式指定 --vector-dir"
+        if args.semantic_rerank is None:
+            return "semantic-production 必须显式指定 --semantic-rerank off/on"
+    elif args.semantic_rerank is not None:
+        return "--semantic-rerank 仅适用于 semantic-production"
     if not args.keyword_only and not args.vector_dir:
         return "hybrid 评测必须显式指定 --vector-dir 隔离向量快照"
     return None

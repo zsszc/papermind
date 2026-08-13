@@ -1,4 +1,5 @@
 import threading
+from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 import chromadb
@@ -84,12 +85,40 @@ class VectorStore:
         query: str,
         top_k: int = 10,
         filters: Optional[Dict[str, Any]] = None,
+        rerank: Optional[bool] = None,
+        rerank_diagnostics: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         # 缓存语义检索结果，减少 Embedding 计算与 ChromaDB 查询
-        cache_key = f"semantic_search:{hash(query)}:{top_k}:{hash(str(sorted((filters or {}).items())))}"
+        rerank_enabled = self._rerank_enabled() if rerank is None else rerank
+        rerank_model = str(config.get("retrieval.rerank_model", ""))
+        vector_identity = str(
+            Path(getattr(self, "vector_dir", "unbound-vector-store")).resolve()
+        )
+        cache_key = ":".join((
+            "semantic_search",
+            str(hash(query)),
+            str(top_k),
+            str(hash(str(sorted((filters or {}).items())))),
+            str(hash(vector_identity)),
+            "rerank-on" if rerank_enabled else "rerank-off",
+            str(hash(rerank_model if rerank_enabled else "")),
+        ))
         cached = cache.get(cache_key)
         if cached is not None:
-            return cached
+            cached_output = cached
+            cached_rerank_effective = rerank_enabled
+            if isinstance(cached, dict) and "results" in cached:
+                cached_output = cached["results"]
+                cached_rerank_effective = bool(
+                    cached.get("rerank_effective", False)
+                )
+            if rerank_diagnostics is not None:
+                rerank_diagnostics.update({
+                    "requested": rerank_enabled,
+                    "effective": cached_rerank_effective,
+                    "error": None,
+                })
+            return cached_output
 
         query_embedding = self.embedding_service.embed_query(query)
         n_results = max(top_k * 2, 20)
@@ -122,11 +151,30 @@ class VectorStore:
 
         # B1：rerank 开启时对前 _RERANK_POOL_SIZE 个候选精排；reranker 不可用/打分失败
         # 时降级为原始排序（不抛异常），详见 _apply_rerank
-        if self._rerank_enabled():
-            output = self._apply_rerank(query, output)
+        diagnostics = {
+            "requested": rerank_enabled,
+            "effective": False,
+            "error": None,
+        }
+        if rerank_enabled:
+            output, rerank_error = self._apply_rerank(query, output)
+            diagnostics["effective"] = rerank_error is None
+            diagnostics["error"] = rerank_error
+        if rerank_diagnostics is not None:
+            rerank_diagnostics.update(diagnostics)
 
         output = output[:top_k]
-        cache.set(cache_key, output, ttl=60)
+        # 重排失败的回退结果不缓存；否则下次命中缓存时无法
+        # 区分「重排真正生效」与「上次失败后的原始排序」。
+        if not rerank_enabled or diagnostics["effective"]:
+            cache.set(
+                cache_key,
+                {
+                    "results": output,
+                    "rerank_effective": diagnostics["effective"],
+                },
+                ttl=60,
+            )
         return output
 
     @staticmethod
@@ -135,7 +183,9 @@ class VectorStore:
         return bool(config.get("retrieval.rerank", False))
 
     @staticmethod
-    def _apply_rerank(query: str, output: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _apply_rerank(
+        query: str, output: List[Dict[str, Any]]
+    ) -> tuple[List[Dict[str, Any]], Optional[str]]:
         """对前 _RERANK_POOL_SIZE 个候选计算 (query, chunk) 相关性分数并重排。
 
         降级契约（不抛异常、不 500）：
@@ -145,29 +195,29 @@ class VectorStore:
         池外候选（第 21 个起）保持原始顺序追加在重排池之后。
         """
         if not output:
-            return output
+            return output, None
         reranker = RerankerService()
         if not reranker.available():
             logger.warning("[reranker] 模型不可用，跳过重排，返回原始排序")
-            return output
+            return output, "model_unavailable"
         pool = output[:_RERANK_POOL_SIZE]
         pairs = [(query, item["content"]) for item in pool]
         try:
             scores = reranker._score(pairs)
         except Exception as e:
             logger.warning(f"[reranker] 重排打分失败，返回原始排序: {e}")
-            return output
+            return output, "scoring_failed"
         if len(scores) != len(pool):
             logger.warning(
                 f"[reranker] 重排分数数({len(scores)})与候选数({len(pool)})不一致，返回原始排序"
             )
-            return output
+            return output, "score_count_mismatch"
         # sorted 稳定：同分候选保持原始相对顺序
         reranked = [
             item
             for _, item in sorted(zip(scores, pool), key=lambda x: x[0], reverse=True)
         ]
-        return reranked + output[_RERANK_POOL_SIZE:]
+        return reranked + output[_RERANK_POOL_SIZE:], None
 
     def delete_by_paper_id(self, paper_id: int):
         try:

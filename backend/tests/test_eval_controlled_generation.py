@@ -165,11 +165,16 @@ def test_generate_answer_caps_output_at_512_tokens(monkeypatch):
 
 def test_semantic_production_calls_only_vector_store_top5(monkeypatch):
     calls = []
+    def search(**kwargs):
+        calls.append(kwargs.copy())
+        kwargs["rerank_diagnostics"].update({
+            "requested": False, "effective": False, "error": None
+        })
+        return [{"chunk_id": "p1_c0", "score": 1.0}]
+
     store = SimpleNamespace(
         available=lambda: True,
-        search=lambda **kwargs: calls.append(kwargs) or [
-            {"chunk_id": "p1_c0", "score": 1.0}
-        ],
+        search=search,
     )
     monkeypatch.setattr(run, "_open_eval_vector_store", lambda _: store)
     monkeypatch.setattr(
@@ -189,13 +194,19 @@ def test_semantic_production_calls_only_vector_store_top5(monkeypatch):
 
     retriever = run.Retriever(
         db=object(), top_k=9, vector_dir=Path("snapshot"),
-        retrieval_profile="semantic-production",
+        retrieval_profile="semantic-production", semantic_rerank=False,
     )
     result = retriever.search("question")
 
     assert result[0]["chunk_id"] == "p1_c0"
-    assert calls == [{"query": "question", "top_k": 5}]
+    assert calls[0]["query"] == "question"
+    assert calls[0]["top_k"] == 5
+    assert calls[0]["rerank"] is False
+    assert isinstance(calls[0]["rerank_diagnostics"], dict)
     assert retriever.mode == "semantic-production"
+    assert retriever.rerank_diagnostics == {
+        "requested": False, "effective": False, "error": None
+    }
 
 
 def test_semantic_production_requires_top5_and_vector_snapshot(tmp_path):
@@ -207,3 +218,43 @@ def test_semantic_production_requires_top5_and_vector_snapshot(tmp_path):
 
     assert "--vector-dir" in run._validate_cli_args(missing_vector)
     assert "top-k=5" in run._validate_cli_args(wrong_topk)
+
+
+def test_semantic_production_requires_explicit_rerank_choice(tmp_path):
+    missing = _args(
+        "--retrieval-profile", "semantic-production",
+        "--vector-dir", str(tmp_path),
+    )
+    explicit_off = _args(
+        "--retrieval-profile", "semantic-production",
+        "--vector-dir", str(tmp_path), "--semantic-rerank", "off",
+    )
+
+    assert "--semantic-rerank" in run._validate_cli_args(missing)
+    assert run._validate_cli_args(explicit_off) is None
+
+
+def test_semantic_production_rerank_failure_marks_runtime_invalid(monkeypatch):
+    def search(**kwargs):
+        kwargs["rerank_diagnostics"].update({
+            "requested": True,
+            "effective": False,
+            "error": "model_unavailable",
+        })
+        return [{"chunk_id": "p1_c0", "score": 1.0}]
+
+    store = SimpleNamespace(available=lambda: True, search=search)
+    monkeypatch.setattr(run, "_open_eval_vector_store", lambda _: store)
+    retriever = run.Retriever(
+        db=object(), top_k=5, vector_dir=Path("snapshot"),
+        retrieval_profile="semantic-production", semantic_rerank=True,
+    )
+
+    retriever.search("question")
+
+    assert retriever.rerank_diagnostics == {
+        "requested": True,
+        "effective": False,
+        "error": "model_unavailable",
+    }
+    assert retriever.runtime_degraded_count == 1

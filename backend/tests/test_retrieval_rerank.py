@@ -33,8 +33,10 @@ class _FakeCollection:
 
     def __init__(self, n: int):
         self._n = n
+        self.query_calls = 0
 
     def query(self, query_embeddings, n_results, include, where=None):
+        self.query_calls += 1
         n = min(self._n, n_results)
         return {
             "ids": [[f"p1_c{i}" for i in range(n)]],
@@ -68,6 +70,7 @@ def _make_store(n_candidates: int) -> VectorStore:
     store = VectorStore.__new__(VectorStore)
     store.collection = _FakeCollection(n_candidates)
     store.embedding_service = _FakeEmbedding()
+    store.vector_dir = "/tmp/papermind-test-vector"
     return store
 
 
@@ -194,6 +197,109 @@ class TestRerankerService:
 
 
 class TestVectorStoreRerank:
+    def test_explicit_off_overrides_config_and_never_touches_model(
+        self, rerank_on, monkeypatch
+    ):
+        store = _make_store(3)
+        diagnostics = {}
+        monkeypatch.setattr(
+            "app.services.retrieval.RerankerService",
+            lambda: (_ for _ in ()).throw(AssertionError("显式 off 不得触发模型")),
+        )
+
+        out = store.search(
+            QUERY, top_k=2, rerank=False, rerank_diagnostics=diagnostics
+        )
+
+        assert [item["chunk_id"] for item in out] == ["p1_c0", "p1_c1"]
+        assert diagnostics == {
+            "requested": False, "effective": False, "error": None
+        }
+
+    def test_explicit_on_overrides_config_and_reports_effective(
+        self, rerank_off, monkeypatch
+    ):
+        store = _make_store(3)
+        diagnostics = {}
+        monkeypatch.setattr(RerankerService, "available", lambda self: True)
+        monkeypatch.setattr(
+            RerankerService, "_score", _score_table({0: 0.1, 1: 0.9, 2: 0.2})
+        )
+
+        out = store.search(
+            QUERY, top_k=2, rerank=True, rerank_diagnostics=diagnostics
+        )
+
+        assert [item["chunk_id"] for item in out] == ["p1_c1", "p1_c2"]
+        assert diagnostics == {
+            "requested": True, "effective": True, "error": None
+        }
+
+    def test_explicit_on_unavailable_reports_fail_closed_status(
+        self, rerank_off, monkeypatch
+    ):
+        store = _make_store(3)
+        diagnostics = {}
+        monkeypatch.setattr(RerankerService, "available", lambda self: False)
+
+        store.search(
+            QUERY, top_k=2, rerank=True, rerank_diagnostics=diagnostics
+        )
+
+        assert diagnostics == {
+            "requested": True,
+            "effective": False,
+            "error": "model_unavailable",
+        }
+
+    def test_explicit_on_scoring_failure_reports_error_and_is_not_cached(
+        self, rerank_off, monkeypatch
+    ):
+        store = _make_store(3)
+        monkeypatch.setattr(RerankerService, "available", lambda self: True)
+        monkeypatch.setattr(
+            RerankerService,
+            "_score",
+            lambda self, pairs: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+
+        first = {}
+        second = {}
+        store.search(QUERY, top_k=2, rerank=True, rerank_diagnostics=first)
+        store.search(QUERY, top_k=2, rerank=True, rerank_diagnostics=second)
+
+        assert first == {
+            "requested": True,
+            "effective": False,
+            "error": "scoring_failed",
+        }
+        assert second == first
+        assert store.collection.query_calls == 2
+
+    def test_cache_key_separates_vector_dir_rerank_and_model(
+        self, rerank_off, monkeypatch
+    ):
+        first = _make_store(3)
+        second = _make_store(3)
+        second.vector_dir = "/tmp/papermind-other-vector"
+
+        first.search(QUERY, top_k=2, rerank=False)
+        first.search(QUERY, top_k=2, rerank=False)
+        second.search(QUERY, top_k=2, rerank=False)
+        assert first.collection.query_calls == 1
+        assert second.collection.query_calls == 1
+
+        monkeypatch.setattr(RerankerService, "available", lambda self: True)
+        monkeypatch.setattr(
+            RerankerService, "_score", _score_table({0: 0.3, 1: 0.2, 2: 0.1})
+        )
+        first.search(QUERY, top_k=2, rerank=True)
+        assert first.collection.query_calls == 2
+
+        config._config["retrieval"]["rerank_model"] = "another-model"
+        first.search(QUERY, top_k=2, rerank=True)
+        assert first.collection.query_calls == 3
+
     def test_rerank_reorders_candidates_and_truncates_top_k(
         self, rerank_on, monkeypatch
     ):
