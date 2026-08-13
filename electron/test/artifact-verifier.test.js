@@ -39,6 +39,7 @@ const validAsarEntries = [
   '/preload.js',
   '/backend-lifecycle.js',
   '/security-policy.js',
+  '/runtime-identity.js',
 ]
 
 

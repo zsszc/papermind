@@ -15,6 +15,7 @@ const REQUIRED_ASAR_ENTRIES = [
   '/preload.js',
   '/backend-lifecycle.js',
   '/security-policy.js',
+  '/runtime-identity.js',
 ]
 
 const FORBIDDEN_PATHS = [

@@ -1,19 +1,63 @@
 const http = require('http')
 
 
+function buildBackendUrl(port) {
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('后端端口非法')
+  return `http://127.0.0.1:${port}`
+}
+
+
 function isBackendAlive({
   timeoutMs = 2000,
-  url = 'http://127.0.0.1:8000/api/health',
+  port = 8000,
+  token = '',
+  instanceId,
   httpGet = http.get,
 } = {}) {
   return new Promise((resolve) => {
     let settled = false
+    const deadline = setTimeout(() => {
+      request?.abort?.()
+      finish(false)
+    }, timeoutMs)
     const finish = (alive) => {
       if (settled) return
       settled = true
+      clearTimeout(deadline)
       resolve(alive)
     }
-    const request = httpGet(url, (response) => finish(response.statusCode === 200))
+    let request
+    try {
+      request = httpGet({
+        hostname: '127.0.0.1',
+        port,
+        path: '/api/health',
+        headers: token ? { 'X-PaperMind-Token': token } : {},
+      }, (response) => {
+        let body = ''
+        response.on('error', () => finish(false))
+        response.on('data', (chunk) => {
+          if (Buffer.byteLength(body) + chunk.length > 16 * 1024) {
+            response.destroy?.()
+            finish(false)
+            return
+          }
+          body += chunk.toString()
+        })
+        response.on('end', () => {
+          if (response.statusCode !== 200 || !instanceId) return finish(false)
+          try {
+            const data = JSON.parse(body)
+            finish(data.status === 'ok' && data.instance_id === instanceId)
+          } catch {
+            finish(false)
+          }
+        })
+      })
+    } catch {
+      finish(false)
+      return
+    }
     request.on('error', () => finish(false))
     request.setTimeout(timeoutMs, () => {
       request.abort()
@@ -69,16 +113,43 @@ function isProcessRunning(processHandle) {
 }
 
 
-function sanitizeBackendEnv(sourceEnv, dataDir) {
+function createProcessTracker() {
+  let current = null
+  const intentionallyStopped = new WeakSet()
+  return {
+    getCurrent: () => current,
+    setCurrent: (processHandle) => { current = processHandle },
+    clearIfCurrent: (processHandle) => {
+      if (current !== processHandle) return false
+      current = null
+      return true
+    },
+    markStopped: (processHandle) => {
+      if (processHandle && typeof processHandle === 'object') intentionallyStopped.add(processHandle)
+    },
+    wasStopped: (processHandle) => intentionallyStopped.has(processHandle),
+  }
+}
+
+
+function sanitizeBackendEnv(sourceEnv, dataDir, { token = '', instanceId = '' } = {}) {
   const env = { ...sourceEnv }
   delete env.PYTHONPATH
   delete env.PYTHONHOME
+  delete env.PAPERMIND_API_TOKEN
+  delete env.PAPERMIND_INSTANCE_ID
   env.PAPERMIND_DATA_DIR = dataDir
+  if (token) env.PAPERMIND_API_TOKEN = token
+  else delete env.PAPERMIND_API_TOKEN
+  if (instanceId) env.PAPERMIND_INSTANCE_ID = instanceId
+  else delete env.PAPERMIND_INSTANCE_ID
   return env
 }
 
 
 module.exports = {
+  buildBackendUrl,
+  createProcessTracker,
   isBackendAlive,
   waitForBackend,
   shouldRestartBackend,
