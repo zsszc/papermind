@@ -12,66 +12,91 @@ import {
   Spin,
 } from 'antd'
 import { FileSearchOutlined, ClearOutlined, PauseCircleOutlined } from '@ant-design/icons'
-import { listThesis, getThesis, getChapterText } from '../api'
-import { apiFetch } from '../utils/apiUrl'
+import { listThesis, getThesis, getChapterText, suggestCitations } from '../api'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { colors, componentStyles } from '../theme'
+import { readWritingDeskState, writeWritingDeskState } from './writingDeskDraft'
 
 const { TextArea } = Input
 const { Title } = Typography
 const { Option } = Select
 
-const STORAGE_KEY = 'writing-desk-state'
-
 function WritingDesk({ onSelectPaper }) {
+  const initialStateRef = useRef(null)
+  if (initialStateRef.current === null) initialStateRef.current = readWritingDeskState()
   const [thesisList, setThesisList] = useState([])
-  const [selectedThesis, setSelectedThesis] = useState(null)
-  const [paragraph, setParagraph] = useState('')
+  const [selectedThesis, setSelectedThesis] = useState(initialStateRef.current.selectedThesis)
+  const [drafts, setDrafts] = useState(initialStateRef.current.drafts)
+  const [paragraph, setParagraph] = useState(
+    initialStateRef.current.drafts[initialStateRef.current.selectedThesis] || ''
+  )
   const [suggestions, setSuggestions] = useState('')
   const [citations, setCitations] = useState([])
   const [loading, setLoading] = useState(false)
   const [chapterTree, setChapterTree] = useState([])
   const [treeLoading, setTreeLoading] = useState(false)
   const abortCtrlRef = useRef(null)
+  const suggestRequestRef = useRef(0)
+  const thesisRequestRef = useRef(0)
+  const chapterRequestRef = useRef(0)
+  const selectedThesisRef = useRef(selectedThesis)
+  const draftStateRef = useRef({ selectedThesis, drafts })
+
+  selectedThesisRef.current = selectedThesis
 
   useEffect(() => {
     listThesis().then((res) => {
       const items = res.data.items || []
       setThesisList(items)
 
-      try {
-        const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}')
-        if (saved.selectedThesis && items.some((t) => t.id === saved.selectedThesis)) {
-          setSelectedThesis(saved.selectedThesis)
-          if (saved.paragraph) setParagraph(saved.paragraph)
-        }
-      } catch {
-        // ignore
+      if (
+        initialStateRef.current.selectedThesis
+        && !items.some((t) => t.id === initialStateRef.current.selectedThesis)
+      ) {
+        setSelectedThesis(null)
+        setParagraph('')
       }
-    })
+    }).catch(() => message.error('加载论文列表失败'))
   }, [])
 
   useEffect(() => {
-    localStorage.setItem(
-      STORAGE_KEY,
-      JSON.stringify({ selectedThesis, paragraph })
-    )
-  }, [selectedThesis, paragraph])
+    draftStateRef.current = { selectedThesis, drafts }
+    const timer = setTimeout(() => {
+      writeWritingDeskState(localStorage, draftStateRef.current)
+    }, 400)
+    return () => clearTimeout(timer)
+  }, [selectedThesis, drafts])
+
+  useEffect(() => () => {
+    suggestRequestRef.current += 1
+    abortCtrlRef.current?.abort()
+    writeWritingDeskState(localStorage, draftStateRef.current)
+  }, [])
 
   useEffect(() => {
     if (!selectedThesis) {
       setChapterTree([])
       return
     }
+    const requestId = ++thesisRequestRef.current
     setTreeLoading(true)
     getThesis(selectedThesis)
       .then((res) => {
+        if (requestId !== thesisRequestRef.current) return
         const chapters = res.data.chapter_structure || []
         const treeData = buildTreeData(chapters)
         setChapterTree(treeData)
       })
-      .finally(() => setTreeLoading(false))
+      .catch(() => {
+        if (requestId === thesisRequestRef.current) message.error('加载章节结构失败')
+      })
+      .finally(() => {
+        if (requestId === thesisRequestRef.current) setTreeLoading(false)
+      })
+    return () => {
+      thesisRequestRef.current += 1
+    }
   }, [selectedThesis])
 
   const handleSuggest = async () => {
@@ -79,33 +104,34 @@ function WritingDesk({ onSelectPaper }) {
       message.warning('请选择论文并输入段落')
       return
     }
+    abortCtrlRef.current?.abort()
+    const requestId = suggestRequestRef.current + 1
+    suggestRequestRef.current = requestId
     setLoading(true)
     setSuggestions('')
     setCitations([])
     abortCtrlRef.current = new AbortController()
     try {
-      const response = await apiFetch(
-        `/api/thesis/${selectedThesis}/suggest-citations?paragraph=${encodeURIComponent(paragraph)}`,
-        {
-          method: 'POST',
-          signal: abortCtrlRef.current.signal,
-        }
-      )
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`)
-      }
-      const data = await response.json()
+      const response = await suggestCitations(selectedThesis, paragraph, {
+        signal: abortCtrlRef.current.signal,
+        skipGlobalError: true,
+      })
+      if (requestId !== suggestRequestRef.current) return
+      const data = response.data
       setSuggestions(data.suggestions || '')
       setCitations(data.citations || [])
     } catch (err) {
-      if (err.name === 'AbortError') {
+      if (requestId !== suggestRequestRef.current) return
+      if (err.name === 'AbortError' || err.name === 'CanceledError' || err.code === 'ERR_CANCELED') {
         setSuggestions('（已停止生成）')
       } else {
         message.error('引用建议失败')
       }
     } finally {
-      setLoading(false)
-      abortCtrlRef.current = null
+      if (requestId === suggestRequestRef.current) {
+        setLoading(false)
+        abortCtrlRef.current = null
+      }
     }
   }
 
@@ -113,19 +139,52 @@ function WritingDesk({ onSelectPaper }) {
     abortCtrlRef.current?.abort()
   }
 
+  const cancelSuggest = () => {
+    suggestRequestRef.current += 1
+    abortCtrlRef.current?.abort()
+    abortCtrlRef.current = null
+    setLoading(false)
+  }
+
+  const handleThesisChange = (thesisId) => {
+    cancelSuggest()
+    chapterRequestRef.current += 1
+    setSelectedThesis(thesisId)
+    setParagraph(drafts[thesisId] || '')
+    setSuggestions('')
+    setCitations([])
+  }
+
+  const handleParagraphChange = (value) => {
+    setParagraph(value)
+    if (selectedThesis) {
+      setDrafts((current) => ({ ...current, [selectedThesis]: value }))
+    }
+  }
+
   const handleSelectChapter = useCallback(
     (_, { node }) => {
       const chapterIndex = node?.chapterIndex
       if (chapterIndex == null || !selectedThesis) return
+      const thesisId = selectedThesis
+      const requestId = ++chapterRequestRef.current
       setTreeLoading(true)
-      getChapterText(selectedThesis, chapterIndex)
+      getChapterText(thesisId, chapterIndex)
         .then((res) => {
-          setParagraph(res.data.text || '')
+          if (
+            requestId !== chapterRequestRef.current
+            || selectedThesisRef.current !== thesisId
+          ) return
+          handleParagraphChange(res.data.text || '')
         })
-        .catch(() => message.error('加载章节内容失败'))
-        .finally(() => setTreeLoading(false))
+        .catch(() => {
+          if (requestId === chapterRequestRef.current) message.error('加载章节内容失败')
+        })
+        .finally(() => {
+          if (requestId === chapterRequestRef.current) setTreeLoading(false)
+        })
     },
-    [selectedThesis]
+    [selectedThesis, drafts]
   )
 
   return (
@@ -143,7 +202,7 @@ function WritingDesk({ onSelectPaper }) {
             <Select
               placeholder="选择论文"
               style={{ width: '100%', marginBottom: 12 }}
-              onChange={setSelectedThesis}
+              onChange={handleThesisChange}
               value={selectedThesis}
             >
               {thesisList.map((t) => (
@@ -176,7 +235,7 @@ function WritingDesk({ onSelectPaper }) {
 
             <TextArea
               value={paragraph}
-              onChange={(e) => setParagraph(e.target.value)}
+              onChange={(e) => handleParagraphChange(e.target.value)}
               placeholder="在此输入当前写作的段落..."
               style={{
                 flex: 1,
@@ -199,8 +258,10 @@ function WritingDesk({ onSelectPaper }) {
               <Button
                 icon={<ClearOutlined />}
                 onClick={() => {
-                  setParagraph('')
+                  cancelSuggest()
+                  handleParagraphChange('')
                   setSuggestions('')
+                  setCitations([])
                 }}
                 style={{ borderRadius: 20 }}
               >

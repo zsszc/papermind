@@ -76,9 +76,10 @@ export const deleteConversation = (id) => api.delete(`/chat/conversations/${id}`
 export const getHistory = (id) => api.get(`/chat/conversations/${id}/history`)
 export const deleteMessagesFrom = (conversationId, messageId) =>
   api.delete(`/chat/conversations/${conversationId}/messages/${messageId}`)
-export const regenerateMessage = (conversationId, messageId) =>
+export const regenerateMessage = (conversationId, messageId, { signal } = {}) =>
   apiFetch(`/api/chat/conversations/${conversationId}/messages/${messageId}/regenerate`, {
     method: 'POST',
+    signal,
   })
 export const sendChatMessage = (data) =>
   apiFetch('/api/chat', {
@@ -87,13 +88,14 @@ export const sendChatMessage = (data) =>
     body: JSON.stringify(data),
   })
 export const listSkills = () => api.get('/chat/skills')
-export const analyzeImage = (file, question) => {
+export const analyzeImage = (file, question, { signal } = {}) => {
   const form = new FormData()
   form.append('file', file)
   form.append('question', question || '')
   return apiFetch('/api/chat/analyze-image', {
     method: 'POST',
     body: form,
+    signal,
   })
 }
 
@@ -115,8 +117,8 @@ export const updateThesisCitation = (thesisId, citationId, data) =>
 export const getChapterText = (id, chapterIndex) =>
   api.get(`/thesis/${id}/chapters/${chapterIndex}/text`)
 export const analyzeThesis = (id, data) => api.post(`/thesis/${id}/analyze`, data)
-export const suggestCitations = (id, paragraph) =>
-  api.post(`/thesis/${id}/suggest-citations?paragraph=${encodeURIComponent(paragraph)}`)
+export const suggestCitations = (id, paragraph, config = {}) =>
+  api.post(`/thesis/${id}/suggest-citations`, { paragraph }, config)
 
 // Export
 export const exportPapersCSV = () => api.get('/export/papers/csv', { responseType: 'blob' })

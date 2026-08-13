@@ -15,6 +15,7 @@ from app.schemas import (
     ThesisFileListResponse,
     ThesisAnalyzeRequest,
     ThesisAnalyzeResponse,
+    ThesisSuggestRequest,
     ThesisCitationResponse,
     ThesisCitationMapResponse,
     ChapterCitationMapItem,
@@ -441,10 +442,11 @@ async def analyze_thesis(
 @router.post("/{thesis_id}/suggest-citations")
 async def suggest_citations(
     thesis_id: int,
-    paragraph: str,
+    request: ThesisSuggestRequest,
     db: Session = Depends(get_db),
 ):
     """针对输入段落推荐可引用的文献。"""
+    paragraph = request.paragraph
     thesis = db.query(ThesisFile).filter(ThesisFile.id == thesis_id).first()
     if not thesis:
         raise HTTPException(status_code=404, detail="Thesis not found")
@@ -492,7 +494,6 @@ async def suggest_citations(
 
     return {
         "thesis_id": thesis_id,
-        "paragraph": paragraph,
         "suggestions": result,
         "citations": retrieved,
     }

@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import List, Optional, Dict, Any
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 # ---------- Tag ----------
@@ -274,6 +274,16 @@ class ThesisFileListResponse(BaseModel):
 
 class ThesisAnalyzeRequest(BaseModel):
     chapter_index: Optional[int] = None
+
+
+class ThesisSuggestRequest(BaseModel):
+    paragraph: str = Field(min_length=1, max_length=20000)
+
+    @field_validator("paragraph", mode="before")
+    @classmethod
+    def trim_paragraph(cls, value):
+        """请求入口统一去除首尾空白，纯空白交给长度约束拒绝。"""
+        return value.strip() if isinstance(value, str) else value
 
 
 class ThesisAnalyzeResponse(BaseModel):

@@ -276,7 +276,7 @@ class TestSuggestCitationsSanitize:
 
         r = client.post(
             f"/api/thesis/{thesis.id}/suggest-citations",
-            params={"paragraph": "多实例学习在病理图像上的应用段落。"},
+            json={"paragraph": "多实例学习在病理图像上的应用段落。"},
         )
         assert r.status_code == 500
         detail = r.json()["detail"]
@@ -290,7 +290,7 @@ class TestSuggestCitationsSanitize:
 
         r = client.post(
             f"/api/thesis/{thesis.id}/suggest-citations",
-            params={"paragraph": "多实例学习在病理图像上的应用段落。"},
+            json={"paragraph": "多实例学习在病理图像上的应用段落。"},
         )
         assert r.status_code == 500
         assert SECRET_STRING not in r.text
@@ -303,9 +303,52 @@ class TestSuggestCitationsSanitize:
 
         r = client.post(
             f"/api/thesis/{thesis.id}/suggest-citations",
-            params={"paragraph": "多实例学习在病理图像上的应用段落。"},
+            json={"paragraph": "  多实例学习在病理图像上的应用段落。  "},
         )
         assert r.status_code == 200
         data = r.json()
         assert data["suggestions"].startswith("## 评审/概括")
         assert data["citations"] == []
+        assert "paragraph" not in data
+
+    @pytest.mark.parametrize("paragraph", ["", "   \n\t"])
+    def test_blank_paragraph_rejected(self, thesis_env, paragraph):
+        client, thesis = thesis_env
+
+        response = client.post(
+            f"/api/thesis/{thesis.id}/suggest-citations",
+            json={"paragraph": paragraph},
+        )
+
+        assert response.status_code == 422
+
+    def test_paragraph_over_20000_characters_rejected(self, thesis_env):
+        client, thesis = thesis_env
+
+        response = client.post(
+            f"/api/thesis/{thesis.id}/suggest-citations",
+            json={"paragraph": "x" * 20001},
+        )
+
+        assert response.status_code == 422
+
+    def test_paragraph_at_20000_characters_is_accepted(self, thesis_env, monkeypatch):
+        client, thesis = thesis_env
+        monkeypatch.setattr(thesis_router.llm_service, "chat_completion", _fake_chat_ok)
+
+        response = client.post(
+            f"/api/thesis/{thesis.id}/suggest-citations",
+            json={"paragraph": "x" * 20000},
+        )
+
+        assert response.status_code == 200
+
+    def test_query_string_paragraph_is_not_accepted(self, thesis_env):
+        client, thesis = thesis_env
+
+        response = client.post(
+            f"/api/thesis/{thesis.id}/suggest-citations",
+            params={"paragraph": "不应进入 URL"},
+        )
+
+        assert response.status_code == 422
