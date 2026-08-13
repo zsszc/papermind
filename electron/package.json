@@ -9,6 +9,7 @@
     "build": "npm run prepare:runtime && electron-builder",
     "build:dir": "npm run prepare:runtime && electron-builder --dir",
     "test": "node --test test/*.test.js",
+    "smoke:identity": "node scripts/smoke-backend-identity.js",
     "verify:artifact": "node scripts/verify-artifact.js"
   },
   "devDependencies": {

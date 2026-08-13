@@ -45,6 +45,12 @@ jobs:
           PYTHONPATH: ""
         run: python -m pytest tests/ -q
 
+      - name: 运行真实回环身份 smoke
+        working-directory: electron
+        env:
+          PAPERMIND_PYTHON: python
+        run: node scripts/smoke-backend-identity.js
+
   frontend:
     name: 前端检查（lint + build）
     runs-on: ubuntu-latest
@@ -113,4 +119,6 @@ jobs:
           node --check main.js
           node --check backend-lifecycle.js
           node --check security-policy.js
+          node --check runtime-identity.js
+          node --check scripts/smoke-backend-identity.js
           node --check scripts/verify-artifact.js
