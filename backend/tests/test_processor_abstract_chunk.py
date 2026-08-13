@@ -119,7 +119,7 @@ def test_add_chunks_honors_explicit_chunk_id():
         {"title": "t", "authors": "a", "year": 2024},
     )
 
-    add_kwargs = store.collection.add.call_args.kwargs
+    add_kwargs = store.collection.upsert.call_args.kwargs
     assert add_kwargs["ids"] == ["p7_c-1"]
     assert add_kwargs["metadatas"][0]["chunk_type"] == "abstract"
     assert add_kwargs["metadatas"][0]["chunk_index"] == -1

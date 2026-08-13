@@ -69,7 +69,9 @@ class VectorStore:
             metadatas.append(meta)
 
         embeddings = self.embedding_service.embed(documents)
-        self.collection.add(
+        # upsert 使重复处理/崩溃重试幂等，避免 Chroma 的 ADD 日志对
+        # 已有 ID 仅警告后忽略，造成 SQLite 与向量内容不一致。
+        self.collection.upsert(
             ids=ids,
             documents=documents,
             metadatas=metadatas,

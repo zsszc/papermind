@@ -87,6 +87,19 @@ def _git_sha() -> Optional[str]:
     return completed.stdout.strip() or None
 
 
+def _manifest_chunk_paper_uid(chunk: Any, uid_by_id: Dict[int, str]) -> str:
+    """返回 manifest 中 chunk 的稳定论文身份。
+
+    正常数据库必须通过外键找到 paper UID；部分隔离评测测试使用只有
+    chunk 的最小夹具，此时以正文内容哈希建立稳定虚拟身份，不泄漏动态 ID。
+    """
+    uid = uid_by_id.get(chunk.paper_id)
+    if uid is not None:
+        return uid
+    content_hash = _sha256_bytes((chunk.content or "").encode("utf-8"))
+    return f"fixture-orphan:{content_hash}"
+
+
 def _build_benchmark_metadata(db, dataset_path: Path) -> Dict[str, Any]:
     """构建不含正文的 benchmark 指纹与规模元数据。
 
@@ -109,7 +122,7 @@ def _build_benchmark_metadata(db, dataset_path: Path) -> Dict[str, Any]:
             uid_by_id[paper_id] = f"fixture-paper:{paper_id}"
     manifest = sorted([
         {
-            "paper_uid": uid_by_id[row.paper_id],
+            "paper_uid": _manifest_chunk_paper_uid(row, uid_by_id),
             "chunk_index": row.chunk_index,
             "content_sha256": _sha256_bytes((row.content or "").encode("utf-8")),
         }
@@ -623,7 +636,13 @@ def run_eval(args: argparse.Namespace) -> int:
             args.lexical_profile,
             str(args.top_k),
         ))
-        passed = overall[f"recall@{args.top_k}"] >= args.threshold
+        runtime_valid = retriever.runtime_degraded_count == 0
+        passed = (
+            overall[f"recall@{args.top_k}"] >= args.threshold and runtime_valid
+        )
+        effective_profile = (
+            "runtime-degraded" if not runtime_valid else retriever.mode
+        )
         report: Dict[str, Any] = {
             "report_schema": REPORT_SCHEMA_VERSION,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -637,6 +656,7 @@ def run_eval(args: argparse.Namespace) -> int:
             },
             "pipeline": {
                 "profile": retriever.mode,
+                "effective_profile": effective_profile,
                 "lexical_profile": args.lexical_profile,
                 "split": args.split,
                 "top_k": args.top_k,
@@ -650,6 +670,7 @@ def run_eval(args: argparse.Namespace) -> int:
                 "metric": f"recall@{args.top_k}",
                 "threshold": args.threshold,
                 "actual": overall[f"recall@{args.top_k}"],
+                "runtime_valid": runtime_valid,
             },
             "dataset": Path(args.dataset).name if args.fixture else str(args.dataset),
             "top_k": args.top_k,
@@ -717,6 +738,8 @@ def run_eval(args: argparse.Namespace) -> int:
         # 退出码判定
         print(f"[eval] recall@{args.top_k}={overall[f'recall@{args.top_k}']:.3f} "
               f"阈值={args.threshold} -> {'PASS' if passed else 'FAIL'}")
+        if not runtime_valid:
+            print("[eval] hybrid 运行期发生语义检索降级，本次质量门禁无效")
         return 0 if passed else 1
     finally:
         db.close()

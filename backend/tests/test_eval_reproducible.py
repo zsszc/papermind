@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -123,6 +124,21 @@ def test_corpus_fingerprint_does_not_depend_on_database_paper_id(db, tmp_path):
     second = run._build_benchmark_metadata(db, dataset)["corpus_manifest_sha256"]
 
     assert first == second
+
+
+def test_corpus_fingerprint_handles_orphan_fixture_chunks_without_dynamic_id(
+    tmp_path
+):
+    first = SimpleNamespace(
+        paper_id=9, chunk_index=0, content="orphan fixture content"
+    )
+    second = SimpleNamespace(
+        paper_id=99, chunk_index=0, content="orphan fixture content"
+    )
+
+    assert run._manifest_chunk_paper_uid(first, {}) == (
+        run._manifest_chunk_paper_uid(second, {})
+    )
 
 
 def test_eval_workflow_uses_public_fixture_and_frozen_gates():

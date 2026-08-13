@@ -32,6 +32,8 @@ def test_add_chunks_invalidates_only_semantic_search_cache():
 
     assert cache.get("semantic_search:old-query") is None
     assert cache.get("other:stable") == "保留"
+    store.collection.upsert.assert_called_once()
+    store.collection.add.assert_not_called()
 
 
 def test_delete_vectors_invalidates_semantic_cache_even_when_chroma_fails():

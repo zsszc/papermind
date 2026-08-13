@@ -200,6 +200,39 @@ class TestRunReportLatency:
         assert all("mode_used" in item for item in report["items"])
 
 
+def test_hybrid_runtime_degradation_invalidates_gate(tmp_path, monkeypatch):
+    """语义检索任一题异常时，不得继续以 hybrid 名义通过门禁。"""
+    engine, Session = _make_eval_session()
+    session = Session()
+    session.add(Chunk(paper_id=1, content="target evidence", chunk_index=0))
+    session.commit()
+    session.close()
+    monkeypatch.setattr("app.database.SessionLocal", Session)
+
+    fake_store = type("Store", (), {
+        "available": lambda self: True,
+        "search": lambda self, **kwargs: (_ for _ in ()).throw(RuntimeError("broken")),
+    })()
+    monkeypatch.setattr("app.services.retrieval.get_vector_store", lambda: fake_store)
+    dataset = tmp_path / "ds.jsonl"
+    dataset.write_text(json.dumps({
+        "qa_id": "q1", "question": "target evidence", "ground_truth": "target",
+        "relevant_chunks": [{"paper_id": 1, "keywords": ["target"]}],
+        "question_type": "factoid", "source": "synthetic", "has_answer": True,
+    }) + "\n", encoding="utf-8")
+    report_dir = tmp_path / "reports"
+
+    assert run.main([
+        "--dataset", str(dataset), "--threshold", "0",
+        "--report-dir", str(report_dir),
+    ]) == 1
+    report = json.loads(next(report_dir.glob("*.json")).read_text(encoding="utf-8"))
+    assert report["diagnostics"]["runtime_degraded_count"] == 1
+    assert report["pipeline"]["effective_profile"] == "runtime-degraded"
+    assert report["gate"]["passed"] is False
+    engine.dispose()
+
+
 # ---------------------------------------------------------------------------
 # trend.py 兼容：缺 latency 字段的旧报告不崩；含 latency 的新报告同样不崩
 # ---------------------------------------------------------------------------
