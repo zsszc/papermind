@@ -157,3 +157,68 @@ def activate_staged_vector_store(
             backup_dir.replace(target_dir)
         raise
     return backup_dir
+
+
+def build_parser():
+    """构建管理 CLI；是否换入必须显式选择。"""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="python -m app.services.vector_rebuild",
+        description="从 SQLite chunks 隔离重建并校验 Chroma 向量库",
+    )
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument(
+        "--stage-only", dest="activate", action="store_false",
+        help="只生成并校验临时新库，不换入",
+    )
+    mode.add_argument(
+        "--activate", dest="activate", action="store_true",
+        help="校验成功后保留旧库备份并换入新库",
+    )
+    parser.add_argument("--target", default=None, help="目标 vector_db 目录")
+    parser.add_argument("--stage", default=None, help="临时新库目录")
+    parser.add_argument("--batch-size", type=int, default=16)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """管理命令入口；默认不存在隐式换入路径。"""
+    import json
+
+    from app.core.config import config
+    from app.database import SessionLocal
+    from app.services.embedding import EmbeddingService
+
+    args = build_parser().parse_args(argv)
+    target = Path(args.target) if args.target else config.runtime_root / "vector_db"
+    stage = (
+        Path(args.stage)
+        if args.stage
+        else target.with_name(
+            f".{target.name}.stage-{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+        )
+    )
+    if stage.parent != target.parent:
+        raise ValueError("临时向量库必须与目标目录同父目录")
+    with SessionLocal() as db:
+        result = build_staged_vector_store(
+            db,
+            stage,
+            embedder=EmbeddingService(),
+            batch_size=args.batch_size,
+        )
+    payload: dict[str, Any] = {**result, "stage": str(stage), "activated": False}
+    if args.activate:
+        backup = activate_staged_vector_store(stage, target)
+        payload.update({
+            "activated": True,
+            "target": str(target),
+            "backup": str(backup) if backup else None,
+        })
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

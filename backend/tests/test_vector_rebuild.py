@@ -9,6 +9,7 @@ from app.models import Chunk, Paper
 from app.services.vector_rebuild import (
     activate_staged_vector_store,
     build_staged_vector_store,
+    build_parser,
     expected_chunk_records,
     validate_vector_collection,
 )
@@ -135,3 +136,11 @@ def test_activate_rolls_back_when_second_rename_fails(tmp_path, monkeypatch):
     assert (target / "old").read_text(encoding="utf-8") == "old"
     assert (staged / "new").read_text(encoding="utf-8") == "new"
     assert not (tmp_path / "vector_db.backup-failed").exists()
+
+
+def test_cli_requires_explicit_activate_flag():
+    staged = build_parser().parse_args(["--stage-only"])
+    assert staged.activate is False
+
+    activated = build_parser().parse_args(["--activate"])
+    assert activated.activate is True
