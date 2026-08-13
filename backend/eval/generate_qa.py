@@ -11,7 +11,7 @@
 2. 构造 prompt 调 llm_service.chat_completion_sync(json_mode=True) 生成候选 QA；
 3. 严格解析 JSON（支持 ```json 围栏容错），逐条做 schema 与「摘录必须逐字命中原文」校验，
    失败自动重试，仍失败则跳过该篇，不阻塞其他论文；
-4. 合格条目加 source="llm_generated" / reviewed=false 标记写入 qa_candidates.jsonl。
+4. 合格条目使用稳定 paper_uid + 唯一长证据，增加 reviewed=false 后写入私有候选集。
 
 注意：dataset.SOURCES 暂未收录 "llm_generated"，因此候选集不能直接被
 validate_dataset 接受；人工审稿通过、合并进种子集时，应把 source 改为
@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # 候选集默认输出路径（backend/eval/dataset/qa_candidates.jsonl）
-DEFAULT_OUTPUT_PATH = Path(__file__).resolve().parent / "dataset" / "qa_candidates.jsonl"
+DEFAULT_OUTPUT_PATH = Path(__file__).resolve().parent / "private" / "qa_candidates_v1.jsonl"
 
 # 默认处理的论文 id 区间（id=1..3 跳过：1 已被种子集覆盖，2/3 为早期导入）
 DEFAULT_PAPER_IDS = list(range(4, 20))
@@ -126,10 +126,10 @@ _USER_PROMPT_TEMPLATE = """下面是论文「{title}」的内容摘录（可能�
 3. question 用中文，具体、聚焦（避免「这篇论文讲了什么」之外的空泛问法）；
 4. ground_truth 为参考答案要点：用「、」分隔的若干短小关键短语（数值、模块名、
    结论词），总长不超过 120 字，供关键词命中率评测使用；
-5. excerpts 为 2~3 个从上述论文内容中【逐字原样复制】的英文片段（每段 3~10 个词），
-   用于定位答案所在的原文段落——必须与原文完全一致，不得改写或翻译；
+5. evidence_quote 为一个从上述论文内容中【逐字原样复制】的完整证据句或连续片段，
+   长度 40~240 字符；必须与原文完全一致且足以直接支持答案，不得改写或翻译；
 6. 只输出如下 JSON：
-{{"items": [{{"question": "...", "question_type": "...", "ground_truth": "...", "excerpts": ["...", "..."]}}]}}
+{{"items": [{{"question": "...", "question_type": "...", "ground_truth": "...", "evidence_quote": "..."}}]}}
 """
 
 _CROSS_SYSTEM_PROMPT = (
@@ -230,19 +230,29 @@ def _norm(text: str) -> str:
     return _WS_RE.sub(" ", (text or "").lower()).strip()
 
 
+def _verify_unique_quote(quote: Any, chunk_texts: List[str]) -> Optional[str]:
+    """仅接受长度合格且在目标论文所有 chunk 中恰好出现一次的逐字证据。"""
+    if not isinstance(quote, str):
+        return None
+    quote = quote.strip()
+    if len(quote) < 20 or len(quote) > 500:
+        return None
+    if sum(text.count(quote) for text in chunk_texts) != 1:
+        return None
+    return quote
+
+
 def _verify_excerpts(excerpts: Any, corpus_norm: str, max_keep: int = 3) -> List[str]:
-    """过滤出逐字命中原文的摘录片段（保持 LLM 给出的原始大小写）。"""
+    """兼容历史候选测试/文件；正式私有集不再使用这种宽松 locator。"""
     if not isinstance(excerpts, list):
         return []
     verified: List[str] = []
-    for ex in excerpts:
-        if not isinstance(ex, str):
+    for excerpt in excerpts:
+        if not isinstance(excerpt, str):
             continue
-        ex = ex.strip()
-        if len(ex) < 8:  # 太短没有定位价值
-            continue
-        if _norm(ex) in corpus_norm and ex not in verified:
-            verified.append(ex)
+        excerpt = excerpt.strip()
+        if len(excerpt) >= 8 and _norm(excerpt) in corpus_norm and excerpt not in verified:
+            verified.append(excerpt)
         if len(verified) >= max_keep:
             break
     return verified
@@ -254,13 +264,15 @@ def build_items_from_payload(
     corpus_norm: str,
     qa_id_prefix: str,
     start_seq: int = 1,
+    paper_uid: Optional[str] = None,
+    chunk_texts: Optional[List[str]] = None,
 ) -> List[dict]:
     """把 LLM payload 转成符合种子集 schema 的候选条目（含审稿标记）。
 
     过滤规则：
     - question / ground_truth 必须为非空字符串；
     - question_type 必须在 ALLOWED_TYPES 中（LLM 不许生成负例）；
-    - 至少有 1 条摘录逐字命中原文（保证 resolve_relevant_chunks 可解析）。
+    - evidence_quote 至少 20 字符并在目标论文内唯一逐字命中。
 
     返回：
         合格条目列表（可能为空）；qa_id 形如 f"{qa_id_prefix}-{seq:03d}"。
@@ -277,19 +289,26 @@ def build_items_from_payload(
             continue
         if qtype not in ALLOWED_TYPES:
             continue
-        excerpts = _verify_excerpts(raw.get("excerpts"), corpus_norm)
-        if not excerpts:
-            continue
-        items.append({
+        base = {
             "qa_id": f"{qa_id_prefix}-{seq:03d}",
             "question": question.strip(),
             "ground_truth": ground_truth.strip(),
-            "relevant_chunks": [{"paper_id": paper_id, "keywords": excerpts}],
             "question_type": qtype,
             "source": CANDIDATE_SOURCE,
             "has_answer": True,
             "reviewed": False,
-        })
+        }
+        if paper_uid is not None:
+            quote = _verify_unique_quote(raw.get("evidence_quote"), chunk_texts or [])
+            if not quote:
+                continue
+            base["relevant_evidence"] = [{"paper_uid": paper_uid, "quote": quote}]
+        else:
+            excerpts = _verify_excerpts(raw.get("excerpts"), corpus_norm)
+            if not excerpts:
+                continue
+            base["relevant_chunks"] = [{"paper_id": paper_id, "keywords": excerpts}]
+        items.append(base)
         seq += 1
     return items
 
@@ -315,6 +334,7 @@ def generate_for_paper(
     max_attempts: int = 3,
     call_llm: Optional[Callable[[List[Dict[str, str]]], str]] = None,
     retry_sleep: float = 0.0,
+    stable_uid: Optional[str] = None,
 ) -> Tuple[List[dict], str]:
     """为单篇论文生成候选 QA，返回 (条目列表, 错误信息)。
 
@@ -323,7 +343,8 @@ def generate_for_paper(
     绝不抛出、绝不写半截 JSON。
     """
     llm = call_llm or _call_llm
-    corpus_norm = _norm("\n\n".join(ch.content or "" for ch in chunks))
+    chunk_texts = [ch.content or "" for ch in chunks]
+    corpus_norm = _norm("\n\n".join(chunk_texts))
     material = build_material(paper, chunks)
     messages = build_messages(paper.title or "(无标题)", material, per_paper)
     prefix = f"gen-p{paper.id:02d}"
@@ -338,7 +359,14 @@ def generate_for_paper(
         except Exception as e:  # 含 LLM 调用异常与解析失败
             last_error = f"第 {attempt} 次调用/解析失败: {e}"
             continue
-        items = build_items_from_payload(payload, paper.id, corpus_norm, prefix)
+        items = build_items_from_payload(
+            payload,
+            paper.id,
+            corpus_norm,
+            prefix,
+            paper_uid=stable_uid,
+            chunk_texts=chunk_texts,
+        )
         if items:
             return items, ""
         last_error = f"第 {attempt} 次生成全部被过滤（schema/摘录校验未过）"
@@ -431,6 +459,7 @@ def generate_all(
     retry_sleep: float = 0.0,
     call_llm: Optional[Callable[[List[Dict[str, str]]], str]] = None,
     resume: bool = False,
+    stable_uids: Optional[Dict[int, str]] = None,
 ) -> Dict[str, Any]:
     """全量生成入口：逐篇生成 + 跨论文对比题，逐行写 JSONL（带 flush）。
 
@@ -493,7 +522,8 @@ def generate_all(
             items, error = generate_for_paper(
                 paper, chunks, per_paper=per_paper,
                 max_attempts=max_attempts, call_llm=call_llm,
-                retry_sleep=retry_sleep)
+                retry_sleep=retry_sleep,
+                stable_uid=(stable_uids or {}).get(paper.id))
             if error:
                 print(f"[gen] 论文 id={paper.id}《{(paper.title or '')[:40]}》失败: {error}")
                 per_paper_status.append(
@@ -589,10 +619,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     from app.database import SessionLocal  # 延迟导入，连接真实 SQLite（只读）
+    from app.core.config import config
+    from app.models import Paper
+    from eval.private_benchmark import paper_uid
 
     t0 = time.time()
     db = SessionLocal()
     try:
+        stable_uids = {
+            paper.id: paper_uid(paper, config.runtime_root)
+            for paper in db.query(Paper).filter(Paper.id.in_(args.paper_ids)).all()
+        }
         summary = generate_all(
             db,
             paper_ids=args.paper_ids,
@@ -604,6 +641,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             material_budget=args.material_chars,
             retry_sleep=args.retry_sleep,
             resume=args.resume,
+            stable_uids=stable_uids,
         )
     finally:
         db.close()

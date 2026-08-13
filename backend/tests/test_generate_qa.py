@@ -146,6 +146,58 @@ def test_generate_for_paper_happy_path():
     _assert_schema_compatible(items)
 
 
+def test_generate_for_paper_private_mode_emits_stable_unique_evidence():
+    quote = (
+        "PAMIL achieves 0.912 AUC on the CAMELYON16 dataset, "
+        "outperforming AttentionMIL which achieves 0.872 AUC."
+    )
+    payload = json.dumps({"items": [{
+        "question": "PAMIL 的 AUC 是多少？",
+        "question_type": "experiment_data",
+        "ground_truth": "0.912 AUC",
+        "evidence_quote": quote,
+    }]}, ensure_ascii=False)
+
+    items, error = generate_qa.generate_for_paper(
+        _fake_paper(),
+        _fake_chunks(),
+        stable_uid="sha256:" + "a" * 64,
+        call_llm=lambda messages: payload,
+    )
+
+    assert error == ""
+    assert items[0]["relevant_evidence"] == [{
+        "paper_uid": "sha256:" + "a" * 64,
+        "quote": quote,
+    }]
+    assert "relevant_chunks" not in items[0]
+
+
+def test_generate_all_passes_stable_uid_mapping(db, tmp_path):
+    paper = Paper(id=4, title="PAMIL", abstract=None,
+                  file_path="papers/p4.pdf", filename="p4.pdf", processed="done")
+    db.add(paper)
+    db.add(Chunk(paper_id=4, chunk_index=0, content=PAPER_TEXT))
+    db.commit()
+    quote = (
+        "PAMIL achieves 0.912 AUC on the CAMELYON16 dataset, "
+        "outperforming AttentionMIL which achieves 0.872 AUC."
+    )
+    payload = json.dumps({"items": [{
+        "question": "PAMIL 的 AUC 是多少？", "question_type": "experiment_data",
+        "ground_truth": "0.912 AUC", "evidence_quote": quote,
+    }]}, ensure_ascii=False)
+    output = tmp_path / "private.jsonl"
+
+    generate_qa.generate_all(
+        db, [4], 1, output, include_cross=False,
+        stable_uids={4: "doi:10.1/pamil"}, call_llm=lambda messages: payload,
+    )
+
+    item = json.loads(output.read_text(encoding="utf-8"))
+    assert item["relevant_evidence"][0]["paper_uid"] == "doi:10.1/pamil"
+
+
 def test_generate_for_paper_retries_on_bad_json():
     """第一次返回垃圾，第二次返回合法 JSON -> 成功且恰好调用 2 次。"""
     responses = iter(["not json at all", _valid_payload()])
