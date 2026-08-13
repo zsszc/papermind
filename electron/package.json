@@ -6,7 +6,9 @@
   "scripts": {
     "start": "electron .",
     "build": "electron-builder",
-    "test": "node --test test/*.test.js"
+    "build:dir": "electron-builder --dir",
+    "test": "node --test test/*.test.js",
+    "verify:artifact": "node scripts/verify-artifact.js"
   },
   "devDependencies": {
     "electron": "^29.4.0",

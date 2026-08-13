@@ -7,6 +7,8 @@ directories:
 files:
   - main.js
   - preload.js
+  - backend-lifecycle.js
+  - security-policy.js
 extraResources:
   - from: ../frontend/dist
     to: frontend/dist
@@ -14,9 +16,15 @@ extraResources:
     to: backend
     filter:
       - "**/*"
-      - "!__pycache__"
-      - "!*.pyc"
-      - "!.DS_Store"
+      - "!tests{,/**/*}"
+      - "!eval{,/**/*}"
+      - "!scripts{,/**/*}"
+      - "!.pytest_cache{,/**/*}"
+      - "!**/__pycache__{,/**/*}"
+      - "!**/*.pyc"
+      - "!**/.DS_Store"
+      - "!package-lock.json"
+      - "!*=*"
   - from: ../config.yaml.example
     to: config.yaml.example
 mac:
