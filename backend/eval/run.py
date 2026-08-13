@@ -183,6 +183,41 @@ _TECHNICAL_TOKEN_RE = re.compile(
     r"[A-Za-z0-9]+(?:[.\-][A-Za-z0-9]+)*%?"
 )
 
+# 真实集的问题为中文、论文正文主要为英文。该表只做可审计的
+# 领域术语扩展，不对整句做猜测式机器翻译。
+_BILINGUAL_TERM_MAP = (
+    ("多实例学习", ("multiple", "instance", "learning", "mil")),
+    ("全切片", ("whole", "slide", "image", "wsi")),
+    ("生存预测", ("survival", "prediction")),
+    ("交叉验证", ("cross-validation",)),
+    ("外部测试集", ("external", "test", "set")),
+    ("可解释性", ("interpretability", "interpretable")),
+    ("消融实验", ("ablation",)),
+    ("原型", ("prototype",)),
+    ("分类", ("classification",)),
+    ("推理", ("inference",)),
+    ("数据集", ("dataset",)),
+    ("准确率", ("accuracy",)),
+    ("阈值", ("threshold",)),
+    ("队列", ("cohort",)),
+    ("病例", ("cases", "patients")),
+    ("筛选", ("filter", "filtering")),
+    ("临床", ("clinical",)),
+    ("聚类", ("cluster", "clustering")),
+    ("跨区域", ("cross-region", "inter-region")),
+    ("组织", ("tissue",)),
+    ("语义", ("semantic",)),
+    ("模块", ("module",)),
+    ("专家", ("expert",)),
+    ("样本", ("sample",)),
+    ("两阶段", ("two-stage",)),
+    ("训练", ("training",)),
+    ("验证", ("validation",)),
+    ("实验", ("experiment",)),
+    ("表现", ("performance",)),
+    ("指标", ("metric",)),
+)
+
 
 def _tokenize_technical_terms(text: str) -> List[str]:
     """提取中英混合问题中的 ASCII 技术锚点。
@@ -193,11 +228,23 @@ def _tokenize_technical_terms(text: str) -> List[str]:
     return [token.lower() for token in _TECHNICAL_TOKEN_RE.findall(text or "")]
 
 
-def _bm25_chunk_search(db, query: str, limit: int = 20) -> List[Dict[str, Any]]:
+def _query_technical_terms(text: str, *, bilingual: bool = False) -> List[str]:
+    """提取查询锨点，可选扩展显式中英领域术语。"""
+    tokens = _tokenize_technical_terms(text)
+    if bilingual:
+        for chinese, english_terms in _BILINGUAL_TERM_MAP:
+            if chinese in (text or ""):
+                tokens.extend(english_terms)
+    return list(dict.fromkeys(tokens))
+
+
+def _bm25_chunk_search(
+    db, query: str, limit: int = 20, *, bilingual: bool = False
+) -> List[Dict[str, Any]]:
     """基于技术锚点的轻量 BM25 chunk 检索（Batch 12 观察 profile）。"""
     from app.models import Chunk
 
-    query_tokens = list(dict.fromkeys(_tokenize_technical_terms(query)))
+    query_tokens = _query_technical_terms(query, bilingual=bilingual)
     if not query_tokens:
         return []
 
@@ -254,8 +301,10 @@ def _keyword_chunk_search(
 
     返回按得分降序的 chunk 列表，元素含 chunk_id / paper_id / content / score。
     """
-    if lexical_profile == "bm25":
-        return _bm25_chunk_search(db, query, limit)
+    if lexical_profile in {"bm25", "bm25-bilingual"}:
+        return _bm25_chunk_search(
+            db, query, limit, bilingual=lexical_profile == "bm25-bilingual"
+        )
 
     from app.models import Chunk  # 延迟导入，避免加载本模块即连库
 
@@ -699,9 +748,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="强制仅关键词检索（不加载语义模型，速度快）")
     parser.add_argument(
         "--lexical-profile",
-        choices=("count", "bm25"),
+        choices=("count", "bm25", "bm25-bilingual"),
         default="count",
-        help="chunk 词法检索策略；bm25 为观察实验，默认 count 保持历史行为",
+        help=("chunk 词法检索策略；bm25-bilingual 增加可审计中英术语"
+              "扩展，默认 count 保持历史行为"),
     )
     parser.add_argument("--with-llm", action="store_true",
                         help="加跑生成侧指标（会真实调用 LLM API，默认关闭）")
