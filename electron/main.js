@@ -122,6 +122,10 @@ async function startBackend() {
     return false
   }
 
+  // macOS 关闭全部窗口后可再次 activate；新一轮启动必须恢复为非主动退出状态，
+  // 否则后端后续意外退出会被误判为用户主动关闭而不再重启。
+  intentionalKill = false
+
   // 确保数据目录存在，生产环境下数据写在应用数据目录而非 resources（macOS 只读）
   fs.mkdirSync(path.join(dataDir, 'data'), { recursive: true })
   fs.mkdirSync(path.join(dataDir, 'papers'), { recursive: true })
