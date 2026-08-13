@@ -22,6 +22,8 @@ data/
 papers/
 notes/
 vector_db/
+vector_db.backup-*/
+.vector_db.stage-*/
 logs/
 cache/
 backend/eval/reports/
