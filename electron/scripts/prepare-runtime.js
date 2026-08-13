@@ -102,17 +102,33 @@ function prepareRuntime({ platform = process.platform, arch = process.env.PAPERM
   const requirementsPath = path.join(backendSource, 'requirements.txt')
   const requirements = fs.readFileSync(requirementsPath)
   const fingerprint = computeBuildFingerprint(runtime, requirements)
-  const marker = path.join(pythonTarget, '.papermind-runtime')
+  const marker = path.join(pythonTarget, '.papermind-runtime.json')
+  let currentFingerprint = null
+  try {
+    currentFingerprint = JSON.parse(fs.readFileSync(marker, 'utf8')).fingerprint
+  } catch {
+    // 缺失或旧格式 marker 时重建运行时。
+  }
 
-  if (!fs.existsSync(marker) || fs.readFileSync(marker, 'utf8').trim() !== fingerprint) {
+  if (currentFingerprint !== fingerprint) {
     const archive = ensureArchive(runtime)
     fs.rmSync(pythonTarget, { recursive: true, force: true })
     fs.mkdirSync(pythonTarget, { recursive: true })
     run('tar', ['-xzf', archive, '--strip-components=1', '-C', pythonTarget])
     const python = path.join(pythonTarget, 'bin', 'python3')
-    run(python, ['-m', 'pip', 'install', '--disable-pip-version-check', '--no-compile', '-r', requirementsPath])
+    run(python, [
+      '-m', 'pip', 'install', '--disable-pip-version-check', '--no-cache-dir',
+      '--no-compile', '-r', requirementsPath,
+    ])
     run(python, ['-m', 'pip', 'check'])
-    fs.writeFileSync(marker, `${fingerprint}\n`)
+    fs.writeFileSync(marker, `${JSON.stringify({
+      portable: true,
+      platform,
+      arch: arch === 'x86_64' ? 'x64' : arch,
+      pythonVersion: manifest.pythonVersion,
+      sourceSha256: runtime.sha256,
+      fingerprint,
+    }, null, 2)}\n`)
   }
 
   refreshBackendCode()

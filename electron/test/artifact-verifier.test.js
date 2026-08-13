@@ -20,6 +20,14 @@ function createFixture() {
   const python = path.join(root, 'backend/venv/bin/python')
   fs.mkdirSync(path.dirname(python), { recursive: true })
   fs.writeFileSync(python, '#!/bin/sh\n')
+  fs.writeFileSync(path.join(root, 'backend/venv/.papermind-runtime.json'), JSON.stringify({
+    portable: true,
+    platform: 'darwin',
+    arch: 'arm64',
+    pythonVersion: '3.12.13',
+    sourceSha256: 'a'.repeat(64),
+    fingerprint: 'b'.repeat(64),
+  }))
   fs.writeFileSync(path.join(root, 'app.asar'), '')
   fs.writeFileSync(path.join(root, 'config.yaml.example'), 'llm:\n  api_key: ""\n')
   return root
@@ -108,6 +116,21 @@ test('Python 解释器软链不得逃出发布资源目录', () => {
     fs.symlinkSync('python3', python)
     const errors = scanArtifact(root, { asarEntries: validAsarEntries })
     assert.ok(errors.some((error) => error.includes('Python 软链逃出制品')))
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+
+test('Python 运行时必须携带可移植架构清单', () => {
+  const root = createFixture()
+  try {
+    fs.writeFileSync(
+      path.join(root, 'backend/venv/.papermind-runtime.json'),
+      JSON.stringify({ portable: false, arch: 'x64' }),
+    )
+    const errors = scanArtifact(root, { asarEntries: validAsarEntries })
+    assert.ok(errors.some((error) => error.includes('运行时清单非法')))
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }

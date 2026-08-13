@@ -59,6 +59,19 @@ function validatePythonRuntime(resourcesRoot) {
   if (relativeTarget.startsWith('..') || path.isAbsolute(relativeTarget)) {
     return `Python 软链逃出制品: ${found} -> ${resolvedTarget}`
   }
+  const markerPath = path.join(resourcesRoot, 'backend/venv/.papermind-runtime.json')
+  try {
+    const marker = JSON.parse(fs.readFileSync(markerPath, 'utf8'))
+    const valid = marker.portable === true
+      && ['darwin', 'linux', 'win32'].includes(marker.platform)
+      && ['arm64', 'x64'].includes(marker.arch)
+      && /^3\.12\.\d+$/.test(marker.pythonVersion || '')
+      && /^[a-f0-9]{64}$/.test(marker.sourceSha256 || '')
+      && /^[a-f0-9]{64}$/.test(marker.fingerprint || '')
+    if (!valid) return 'Python 运行时清单非法: backend/venv/.papermind-runtime.json'
+  } catch {
+    return '缺少或无法读取 Python 运行时清单: backend/venv/.papermind-runtime.json'
+  }
   return null
 }
 
