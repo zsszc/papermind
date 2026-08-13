@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, useRef } from 'react'
 import {
   Card,
   Button,
@@ -35,6 +35,7 @@ import PdfViewer from '../components/PdfViewer'
 import ResizablePanels from '../components/ResizablePanels'
 import { getApiUrl } from '../utils/apiUrl'
 import { colors, componentStyles } from '../theme'
+import { createLatestSaveQueue } from '../utils/latestSaveQueue'
 
 const { TextArea } = Input
 const { Option } = Select
@@ -58,8 +59,79 @@ function PaperDetail({ paperId, onBack, initialPage }) {
   const [allTags, setAllTags] = useState([])
   const [editModalOpen, setEditModalOpen] = useState(false)
   const [editForm] = Form.useForm()
+  const mountedRef = useRef(false)
+  const noteRef = useRef('')
+  const noteQueueRef = useRef(null)
+  const noteQueuePaperIdRef = useRef(null)
+  const noteStatusTimerRef = useRef(null)
+  const fetchSequenceRef = useRef(0)
+
+  noteRef.current = note
+
+  const clearNoteStatusTimer = useCallback(() => {
+    if (noteStatusTimerRef.current) {
+      clearTimeout(noteStatusTimerRef.current)
+      noteStatusTimerRef.current = null
+    }
+  }, [])
+
+  const getNoteQueue = useCallback(() => {
+    if (noteQueuePaperIdRef.current !== paperId || !noteQueueRef.current) {
+      noteQueuePaperIdRef.current = paperId
+      noteQueueRef.current = createLatestSaveQueue((content) => savePaperNote(paperId, content))
+    }
+    return noteQueueRef.current
+  }, [paperId])
+
+  const showSavedStatus = useCallback((queue, successMessage = null) => {
+    if (!mountedRef.current || noteQueueRef.current !== queue) return
+    const saved = queue.getLastSavedValue()
+    if (saved !== undefined) setLastSavedNote(saved)
+    setAutoSaveStatus('已自动保存')
+    clearNoteStatusTimer()
+    noteStatusTimerRef.current = setTimeout(() => {
+      if (mountedRef.current) setAutoSaveStatus('')
+    }, 2000)
+    if (successMessage) message.success(successMessage)
+  }, [clearNoteStatusTimer])
+
+  const flushLatestNote = useCallback(async (successMessage = null) => {
+    const queue = getNoteQueue()
+    clearNoteStatusTimer()
+    if (mountedRef.current) setAutoSaveStatus('保存中...')
+    try {
+      await queue.flush(noteRef.current)
+      showSavedStatus(queue, successMessage)
+      return true
+    } catch {
+      if (mountedRef.current && noteQueueRef.current === queue) {
+        setAutoSaveStatus('保存失败，请重试')
+      }
+      return false
+    }
+  }, [clearNoteStatusTimer, getNoteQueue, showSavedStatus])
+
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      const queue = noteQueueRef.current
+      const latest = noteRef.current
+      mountedRef.current = false
+      clearNoteStatusTimer()
+      queue?.flush(latest).catch(() => {})
+    }
+  }, [clearNoteStatusTimer])
+
+  useEffect(() => {
+    return () => {
+      if (noteQueuePaperIdRef.current === paperId) {
+        noteQueueRef.current?.flush(noteRef.current).catch(() => {})
+      }
+    }
+  }, [paperId])
 
   const fetchPaper = useCallback(async () => {
+    const sequence = ++fetchSequenceRef.current
     setLoading(true)
     try {
       const [paperRes, noteRes, tagsRes] = await Promise.all([
@@ -67,14 +139,18 @@ function PaperDetail({ paperId, onBack, initialPage }) {
         getPaperNote(paperId),
         listTags(),
       ])
+      if (sequence !== fetchSequenceRef.current) return
+      const savedNote = noteRes.data.content || ''
       setPaper(paperRes.data)
-      setNote(noteRes.data.content || '')
-      setLastSavedNote(noteRes.data.content || '')
+      setNote(savedNote)
+      noteRef.current = savedNote
+      setLastSavedNote(savedNote)
+      getNoteQueue().markSaved(savedNote)
       setAllTags(tagsRes.data || [])
     } finally {
-      setLoading(false)
+      if (sequence === fetchSequenceRef.current) setLoading(false)
     }
-  }, [paperId])
+  }, [paperId, getNoteQueue])
 
   const fetchSummary = useCallback(async () => {
     setSummaryLoading(true)
@@ -99,27 +175,33 @@ function PaperDetail({ paperId, onBack, initialPage }) {
     if (note === lastSavedNote) return
     setAutoSaveStatus('保存中...')
     const timer = setTimeout(() => {
-      savePaperNote(paperId, note)
+      const queue = getNoteQueue()
+      queue.save(note)
         .then(() => {
-          setLastSavedNote(note)
-          setAutoSaveStatus('已自动保存')
-          setTimeout(() => setAutoSaveStatus(''), 2000)
+          showSavedStatus(queue)
         })
         .catch(() => {
-          setAutoSaveStatus('自动保存失败')
+          if (mountedRef.current && noteQueueRef.current === queue) {
+            setAutoSaveStatus('保存失败，请重试')
+          }
         })
     }, 1000)
     return () => clearTimeout(timer)
-  }, [note, lastSavedNote, paperId])
+  }, [note, lastSavedNote, getNoteQueue, showSavedStatus])
 
   const handleSaveNote = async () => {
-    try {
-      await savePaperNote(paperId, note)
-      setLastSavedNote(note)
-      message.success('笔记已保存')
-    } catch (err) {
-      // 全局拦截器已处理错误提示
+    await flushLatestNote('笔记已保存')
+  }
+
+  const handleBack = async () => {
+    if (noteRef.current !== lastSavedNote) {
+      const saved = await flushLatestNote()
+      if (!saved) {
+        message.error('笔记尚未保存，请重试后再返回')
+        return
+      }
     }
+    onBack?.()
   }
 
   const handleStatusChange = async (value) => {
@@ -223,7 +305,7 @@ function PaperDetail({ paperId, onBack, initialPage }) {
       <Space style={{ marginBottom: 16 }}>
         <Button
           icon={<ArrowLeftOutlined />}
-          onClick={onBack}
+          onClick={handleBack}
           style={{ borderRadius: 20 }}
         >
           返回看板

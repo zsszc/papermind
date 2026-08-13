@@ -46,6 +46,7 @@ from app.services.llm import llm_service
 from app.services.auto_tag import auto_tag_service
 from app.services.retrieval import get_vector_store
 from app.services.upload_validation import UploadValidationError, validate_pdf
+from app.services.note_storage import atomic_write_note, validate_note_content
 
 router = APIRouter()
 
@@ -690,7 +691,9 @@ def update_read_progress(paper_id: int, page: int, db: Session = Depends(get_db)
 
 
 @router.get("/{paper_id}/note")
-def get_paper_note(paper_id: int):
+def get_paper_note(paper_id: int, db: Session = Depends(get_db)):
+    if not db.query(Paper.id).filter(Paper.id == paper_id).first():
+        raise HTTPException(status_code=404, detail="Paper not found")
     notes_dir = get_notes_dir()
     note_path = notes_dir / f"{paper_id}.md"
     if not note_path.exists():
@@ -699,10 +702,20 @@ def get_paper_note(paper_id: int):
 
 
 @router.post("/{paper_id}/note")
-def save_paper_note(paper_id: int, content: str = Form(...)):
+def save_paper_note(
+    paper_id: int,
+    content: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    if not db.query(Paper.id).filter(Paper.id == paper_id).first():
+        raise HTTPException(status_code=404, detail="Paper not found")
+    try:
+        validate_note_content(content)
+    except ValueError as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
     notes_dir = get_notes_dir()
     note_path = notes_dir / f"{paper_id}.md"
-    note_path.write_text(content, encoding="utf-8")
+    atomic_write_note(note_path, content)
     return {"status": "ok"}
 
 
