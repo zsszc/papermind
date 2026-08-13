@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import tempfile
 from collections import Counter
 from functools import lru_cache
 from pathlib import Path
@@ -205,6 +206,40 @@ def validate_private_dataset(
         "papers": len(papers),
         "splits": dict(sorted(split_counts.items())),
     }
+
+
+def assemble_private_dataset(
+    input_paths: list[Path],
+    output_path: Path,
+    *,
+    min_items: int = 50,
+    min_papers: int = 12,
+) -> dict[str, Any]:
+    """校验并原子合并多份已审私有 JSONL，避免中断留下半截正式集。"""
+    from eval.dataset import load_dataset
+
+    items: list[dict[str, Any]] = []
+    for path in input_paths:
+        items.extend(load_dataset(path))
+    summary = validate_private_dataset(
+        items, min_items=min_items, min_papers=min_papers
+    )
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=output_path.parent, delete=False
+        ) as stream:
+            temp_path = Path(stream.name)
+            for item in sorted(items, key=lambda row: row["qa_id"]):
+                stream.write(json.dumps(item, ensure_ascii=False) + "\n")
+            stream.flush()
+        temp_path.replace(output_path)
+    finally:
+        if temp_path is not None and temp_path.exists():
+            temp_path.unlink()
+    return summary
 
 
 if __name__ == "__main__":

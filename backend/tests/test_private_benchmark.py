@@ -1,6 +1,7 @@
 """Batch 17：私有真实语料 manifest、稳定 UID 与隐私边界。"""
 
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,7 @@ import pytest
 from app.models import Chunk, Paper
 from eval.dataset import resolve_relevant_chunks, validate_dataset
 from eval.private_benchmark import (
+    assemble_private_dataset,
     audit_corpus,
     normalize_doi,
     public_summary,
@@ -211,3 +213,26 @@ def test_private_dataset_accepts_explicit_negative_items():
     }
     summary = validate_private_dataset([negative], min_items=1, min_papers=0)
     assert summary == {"items": 1, "papers": 0, "splits": {"holdout": 1}}
+
+
+def test_assemble_private_dataset_validates_and_writes_atomically(tmp_path):
+    first = tmp_path / "first.jsonl"
+    second = tmp_path / "second.jsonl"
+    output = tmp_path / "private.jsonl"
+    first.write_text(
+        json.dumps(_private_item("q2", "doi:10.1/two", "dev"), ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    second.write_text(
+        json.dumps(_private_item("q1", "doi:10.1/one", "train"), ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+    summary = assemble_private_dataset(
+        [first, second], output, min_items=2, min_papers=2
+    )
+
+    assert summary["items"] == 2
+    assert [json.loads(line)["qa_id"] for line in output.read_text(
+        encoding="utf-8"
+    ).splitlines()] == ["q1", "q2"]
