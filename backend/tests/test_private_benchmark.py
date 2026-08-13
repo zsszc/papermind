@@ -68,6 +68,17 @@ def test_public_summary_contains_no_titles_or_paths(db, tmp_path):
     }
 
 
+def test_manifest_fingerprint_changes_when_chunk_content_changes(db, tmp_path):
+    paper, _ = _add_paper(
+        db, tmp_path, title="fingerprint", content="original unique chunk content"
+    )
+    before = audit_corpus(db, tmp_path)["manifest_sha256"]
+    paper.chunks[0].content = "changed unique chunk content"
+    db.commit()
+    after = audit_corpus(db, tmp_path)["manifest_sha256"]
+    assert before != after
+
+
 def test_doi_is_canonicalized_and_sha256_uid_resolves_unique_evidence(db, tmp_path):
     doi_paper, _ = _add_paper(
         db,

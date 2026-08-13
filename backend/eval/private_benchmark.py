@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 from collections import Counter
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -13,13 +14,21 @@ from typing import Any
 _DOI_PREFIX_RE = re.compile(r"^(?:https?://(?:dx\.)?doi\.org/|doi:\s*)", re.IGNORECASE)
 
 
-def sha256_file(path: Path) -> str:
-    """流式计算文件 SHA-256，不把论文整体读入内存。"""
+@lru_cache(maxsize=512)
+def _sha256_file_cached(path: str, size: int, mtime_ns: int) -> str:
+    del size, mtime_ns  # 只用于缓存失效键。
     digest = hashlib.sha256()
     with Path(path).open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    """流式计算文件 SHA-256，不把论文整体读入内存。"""
+    resolved = Path(path).resolve()
+    stat = resolved.stat()
+    return _sha256_file_cached(str(resolved), stat.st_size, stat.st_mtime_ns)
 
 
 def normalize_doi(value: str | None) -> str:
@@ -67,11 +76,25 @@ def audit_corpus(db: Any, runtime_root: Path) -> dict[str, Any]:
         else:
             source_hash = sha256_file(source)
             uid = f"doi:{normalize_doi(paper.doi)}" if normalize_doi(paper.doi) else f"sha256:{source_hash}"
+        paper_chunks = (
+            db.query(Chunk).filter(Chunk.paper_id == paper.id)
+            .order_by(Chunk.chunk_index).all()
+        )
+        chunk_payload = json.dumps([
+            {
+                "chunk_index": chunk.chunk_index,
+                "content_sha256": hashlib.sha256(
+                    (chunk.content or "").encode("utf-8")
+                ).hexdigest(),
+            }
+            for chunk in paper_chunks
+        ], sort_keys=True, separators=(",", ":")).encode("utf-8")
         documents.append({
             "paper_uid": uid,
             "pdf_sha256": source_hash,
             "processed": paper.processed,
             "chunk_count": chunk_counts.get(paper.id, 0),
+            "chunk_manifest_sha256": hashlib.sha256(chunk_payload).hexdigest(),
             "physical_copy_count": hash_counts.get(source_hash, 0),
         })
 
@@ -106,6 +129,37 @@ def public_summary(manifest: dict[str, Any]) -> dict[str, Any]:
         "chunks": manifest["chunks"],
         "missing_source_file_count": len(manifest["missing_source_files"]),
     }
+
+
+def build_parser():
+    """构建私有语料只读审计 CLI。"""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="审计本地真实论文语料（只读）")
+    parser.add_argument(
+        "--output",
+        default=str(Path(__file__).resolve().parent / "private" / "corpus_manifest_v1.json"),
+        help="私有 manifest 输出路径（默认在 gitignore 目录）",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """生成私有 manifest，并只向控制台输出去标识化摘要。"""
+    from app.core.config import config
+    from app.database import SessionLocal
+
+    args = build_parser().parse_args(argv)
+    output = Path(args.output)
+    with SessionLocal() as db:
+        manifest = audit_corpus(db, config.runtime_root)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    print(json.dumps(public_summary(manifest), ensure_ascii=False, sort_keys=True))
+    return 0
 
 
 def validate_private_dataset(
@@ -151,3 +205,7 @@ def validate_private_dataset(
         "papers": len(papers),
         "splits": dict(sorted(split_counts.items())),
     }
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
