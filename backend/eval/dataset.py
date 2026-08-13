@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Optional, Union
 
@@ -106,8 +107,15 @@ def _validate_evidence(evidence: Any, where: str) -> list[str]:
     errors: list[str] = []
     paper_uid = evidence.get("paper_uid")
     quote = evidence.get("quote")
-    if not isinstance(paper_uid, str) or not paper_uid.startswith("doi:"):
-        errors.append(f"{where}: evidence.paper_uid 必须使用 doi:<doi>")
+    valid_doi = isinstance(paper_uid, str) and paper_uid.startswith("doi:") \
+        and bool(paper_uid.removeprefix("doi:").strip())
+    valid_sha = isinstance(paper_uid, str) and re.fullmatch(
+        r"sha256:[0-9a-fA-F]{64}", paper_uid
+    ) is not None
+    if not (valid_doi or valid_sha):
+        errors.append(
+            f"{where}: evidence.paper_uid 必须使用 doi:<doi> 或 sha256:<64hex>"
+        )
     if not isinstance(quote, str) or len(quote.strip()) < 20:
         errors.append(f"{where}: evidence.quote 至少 20 个字符")
     return errors
@@ -203,7 +211,7 @@ def validate_dataset(items: list[dict]) -> None:
         raise ValueError("数据集校验失败:\n" + "\n".join(f"  - {e}" for e in errors))
 
 
-def resolve_relevant_chunks(db, entry: dict) -> list[str]:
+def resolve_relevant_chunks(db, entry: dict, runtime_root: Optional[Path] = None) -> list[str]:
     """将一条 QA 的 relevant_chunks 定位信息解析为候选 chunk id 列表。
 
     匹配策略（骨架实现，供后续检索指标计算使用）：
@@ -224,27 +232,48 @@ def resolve_relevant_chunks(db, entry: dict) -> list[str]:
     from app.models import Chunk, Paper  # 延迟导入，保证加载/校验可脱离 app 使用
 
     if "relevant_evidence" in entry:
+        from app.core.config import config
+        from eval.private_benchmark import normalize_doi, sha256_file
+
+        root = Path(runtime_root) if runtime_root is not None else config.runtime_root
         resolved: list[str] = []
         for evidence in entry.get("relevant_evidence", []):
             paper_uid = evidence["paper_uid"]
-            doi = paper_uid.removeprefix("doi:")
-            paper = db.query(Paper).filter(Paper.doi == doi).one_or_none()
+            if paper_uid.startswith("doi:"):
+                target_doi = normalize_doi(paper_uid.removeprefix("doi:"))
+                matches = [
+                    paper for paper in db.query(Paper).all()
+                    if normalize_doi(paper.doi) == target_doi
+                ]
+            else:
+                target_hash = paper_uid.removeprefix("sha256:").lower()
+                matches = []
+                for candidate in db.query(Paper).all():
+                    source = root / candidate.file_path
+                    if source.is_file() and sha256_file(source) == target_hash:
+                        matches.append(candidate)
+            if len(matches) > 1:
+                raise ValueError(f"evidence paper_uid 多篇命中: {paper_uid}")
+            paper = matches[0] if matches else None
             if paper is None:
                 raise ValueError(f"evidence paper_uid 未命中: {paper_uid}")
             quote = evidence["quote"].strip()
-            matches = [
-                row for row in db.query(Chunk).filter(Chunk.paper_id == paper.id).all()
-                if quote in (row.content or "")
-            ]
-            if not matches:
+            occurrences: list[Chunk] = []
+            occurrence_count = 0
+            for row in db.query(Chunk).filter(Chunk.paper_id == paper.id).all():
+                count = (row.content or "").count(quote)
+                occurrence_count += count
+                if count:
+                    occurrences.append(row)
+            if occurrence_count == 0:
                 raise ValueError(
                     f"evidence quote 未命中: qa_id={entry.get('qa_id')} paper_uid={paper_uid}"
                 )
-            if len(matches) > 1:
+            if occurrence_count > 1:
                 raise ValueError(
                     f"evidence quote 多处命中: qa_id={entry.get('qa_id')} paper_uid={paper_uid}"
                 )
-            chunk_id = f"p{paper.id}_c{matches[0].chunk_index}"
+            chunk_id = f"p{paper.id}_c{occurrences[0].chunk_index}"
             if chunk_id not in resolved:
                 resolved.append(chunk_id)
         return resolved
