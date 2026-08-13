@@ -2,6 +2,13 @@ const { app, BrowserWindow } = require('electron')
 const path = require('path')
 const { spawn } = require('child_process')
 const fs = require('fs')
+const {
+  isBackendAlive,
+  waitForBackend,
+  shouldRestartBackend,
+  isProcessRunning,
+  sanitizeBackendEnv,
+} = require('./backend-lifecycle')
 
 // 将主进程日志写入应用数据目录，便于排查后端启动问题
 function getLogPath() {
@@ -76,7 +83,7 @@ async function loadProductionApp() {
   const { distPath } = getProjectPaths()
 
   // 先检查是否已有后端在运行，避免端口冲突和重复启动
-  const alreadyRunning = await isBackendAlive(2000)
+  const alreadyRunning = await isBackendAlive({ timeoutMs: 2000 })
   if (alreadyRunning) {
     console.log('[electron] 检测到后端已运行，直接加载前端')
     mainWindow.loadFile(distPath)
@@ -121,10 +128,7 @@ async function startBackend() {
   try {
     // 净化环境：PYTHONPATH/PYTHONHOME 会污染 backend/venv 的解释器，
     // 曾导致加载到其他 venv 的 fastapi/pydantic_core 使后端无法启动
-    const env = { ...process.env }
-    delete env.PYTHONPATH
-    delete env.PYTHONHOME
-    env.PAPERMIND_DATA_DIR = dataDir
+    const env = sanitizeBackendEnv(process.env, dataDir)
 
     backendProcess = spawn(
       venvPython,
@@ -159,12 +163,15 @@ async function startBackend() {
     backendProcess = null
 
     // 主动 kill（退出应用）时不重启；窗口已销毁时也不重启
-    if (intentionalKill) return
-    if (!mainWindow || mainWindow.isDestroyed()) return
-
-    // 30 秒内最多自动重启 1 次，避免崩溃循环
     const now = Date.now()
-    if (now - lastRestartAt < 30000) {
+    const windowAlive = Boolean(mainWindow && !mainWindow.isDestroyed())
+    if (!shouldRestartBackend({
+      intentionalKill,
+      windowAlive,
+      now,
+      lastRestartAt,
+    })) {
+      if (intentionalKill || !windowAlive) return
       errToFile('[electron] 后端 30 秒内再次退出，放弃自动重启，请查看日志排查')
       return
     }
@@ -181,48 +188,14 @@ async function startBackend() {
     })
   })
 
-  const alive = await waitForBackend(15000)
+  const alive = await waitForBackend({ timeoutMs: 15000 })
   logToFile(`[electron] waitForBackend 结果: ${alive}`)
   return alive
 }
 
-function isBackendAlive(timeoutMs = 2000) {
-  return new Promise((resolve) => {
-    const http = require('http')
-    const req = http.get('http://127.0.0.1:8000/api/health', (res) => {
-      resolve(res.statusCode === 200)
-    })
-    req.on('error', () => resolve(false))
-    req.setTimeout(timeoutMs, () => {
-      req.abort()
-      resolve(false)
-    })
-  })
-}
-
-function waitForBackend(timeoutMs) {
-  const start = Date.now()
-  return new Promise((resolve) => {
-    const check = () => {
-      if (Date.now() - start > timeoutMs) {
-        resolve(false)
-        return
-      }
-      isBackendAlive(1000).then((alive) => {
-        if (alive) {
-          resolve(true)
-        } else {
-          setTimeout(check, 300)
-        }
-      })
-    }
-    check()
-  })
-}
-
 function killBackend() {
   const proc = backendProcess
-  if (!proc || proc.killed) return
+  if (!isProcessRunning(proc)) return
 
   // 标记为主动 kill，exit 回调中不会触发自动重启
   intentionalKill = true
@@ -235,7 +208,7 @@ function killBackend() {
   }
   setTimeout(() => {
     // exitCode/signalCode 均为 null 表示进程仍未退出（此时引用可能已被 exit 回调置 null，故用局部变量 proc）
-    if (proc.exitCode === null && proc.signalCode === null) {
+    if (isProcessRunning(proc)) {
       errToFile('[electron] 后端进程 3 秒内未退出，发送 SIGKILL')
       try {
         proc.kill('SIGKILL')
