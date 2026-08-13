@@ -43,7 +43,7 @@
 ### 桌面端（`electron/`）
 
 - Electron 43 + electron-builder 26
-- `main.js` 负责拉起后端子进程（`backend/venv/bin/python -m uvicorn app.main:app --port 8000 --workers 1`）并加载 `frontend/dist`
+- `main.js` 在生产模式生成随机回环端口、256-bit 能力令牌与实例 ID，再拉起后端子进程并加载 `frontend/dist`；开发模式仍使用 8000
 
 ---
 
@@ -93,7 +93,7 @@ Kimi API (kimi-k2.6) —— 对话 / 概括 / 联网搜索 / 图片分析
 │   │   ├── schemas.py      # Pydantic 请求/响应模型
 │   │   └── main.py         # FastAPI 入口（lifespan、CORS、/mcp 挂载、/static 白名单）
 │   ├── eval/               # RAG 评测：公开 fixture、稳定/私人 QA、metrics.py、run.py
-│   ├── tests/              # pytest 套件（505 用例，内存 SQLite + TestClient）
+│   ├── tests/              # pytest 套件（511 用例，内存 SQLite + TestClient）
 │   ├── venv/               # Python 3.12 虚拟环境（会被 electron-builder 打包）
 │   ├── pyproject.toml      # 依赖声明 + pytest/ruff 配置
 │   └── requirements.txt    # 锁定依赖（与 pyproject 保持一致）
@@ -192,7 +192,7 @@ cd ../electron && npm run build    # 产物在 frontend/out/（dmg/zip/exe）
 
 ## 8. 测试与评测
 
-### 单元/集成测试（pytest，505 个用例）
+### 单元/集成测试（pytest，511 个用例）
 
 ```bash
 cd backend
