@@ -45,6 +45,7 @@ from app.services.processor import PaperProcessor
 from app.services.llm import llm_service
 from app.services.auto_tag import auto_tag_service
 from app.services.retrieval import get_vector_store
+from app.services.upload_validation import UploadValidationError, validate_pdf
 
 router = APIRouter()
 
@@ -321,6 +322,8 @@ async def import_papers(
         try:
             # 分块异步写盘，避免同步写阻塞事件循环
             await _save_upload_file(file, target_path)
+            # Content-Type 和扩展名均可伪造，解析/建档前验证 PDF 内容标识。
+            await run_in_threadpool(validate_pdf, target_path)
 
             try:
                 metadata = await run_in_threadpool(parser.parse_metadata, str(target_path))
@@ -360,6 +363,15 @@ async def import_papers(
                 background_tasks.add_task(_process_paper_background, paper.id)
 
             imported.append(paper)
+        except UploadValidationError as e:
+            db.rollback()
+            for path in (target_path, note_path):
+                if path is not None:
+                    try:
+                        path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+            raise HTTPException(status_code=400, detail="文件内容不是有效 PDF") from e
         except Exception as e:
             # 异常原文只入日志（宪法第 13 条），错误标记用通用文案
             logger.error(f"[import] 导入失败 {safe_name}，清理残留文件: {e}", exc_info=True)

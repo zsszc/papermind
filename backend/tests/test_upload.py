@@ -6,14 +6,23 @@
 - thesis 上传的 DocxParser.parse 也 mock 掉，保证测试快速、离线、稳定。
 """
 
+import io
 import shutil
 import uuid
+import zipfile
 from pathlib import Path
 
 import pytest
+from docx import Document
 
+from app.models import Paper, ThesisFile
 from app.routers import papers as papers_router
 from app.routers import thesis as thesis_router
+from app.services.upload_validation import (
+    UploadValidationError,
+    validate_docx,
+    validate_pdf,
+)
 
 # 项目根目录（路由内用 Path(__file__).resolve().parents[3] 定位，上传目录必须在其下，
 # 否则路由里的 relative_to 会抛 ValueError）
@@ -35,7 +44,25 @@ MINIMAL_PDF = (
     b"trailer<</Root 1 0 R>>\n%%EOF\n"
 )
 
-FAKE_DOCX = b"PK\x03\x04 fake docx content"
+def _minimal_docx() -> bytes:
+    """用 python-docx 生成真实最小 DOCX，避免伪 ZIP 绕过测试门禁。"""
+    buffer = io.BytesIO()
+    document = Document()
+    document.add_heading("测试毕业论文", level=0)
+    document.add_paragraph("正文内容")
+    document.save(buffer)
+    return buffer.getvalue()
+
+
+VALID_DOCX = _minimal_docx()
+
+
+def _zip_bytes(entries, compression=zipfile.ZIP_DEFLATED) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=compression) as archive:
+        for name, payload in entries:
+            archive.writestr(name, payload)
+    return buffer.getvalue()
 
 
 @pytest.fixture()
@@ -125,7 +152,7 @@ def test_thesis_upload_oversized_returns_413(thesis_env, monkeypatch):
 
     r = client.post(
         "/api/thesis/upload",
-        files={"file": ("thesis.docx", FAKE_DOCX, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+        files={"file": ("thesis.docx", VALID_DOCX, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
     )
     assert r.status_code == 413
     assert list(thesis_dir.iterdir()) == []
@@ -146,10 +173,132 @@ def test_thesis_upload_small_docx_success(thesis_env):
     client, thesis_dir = thesis_env
     r = client.post(
         "/api/thesis/upload",
-        files={"file": ("thesis.docx", FAKE_DOCX, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+        files={"file": ("thesis.docx", VALID_DOCX, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
     )
     assert r.status_code == 200
     data = r.json()
     assert data["filename"] == "thesis.docx"
     assert data["title"] == "测试毕业论文"
     assert (thesis_dir / "thesis.docx").exists()
+
+
+def test_validate_pdf_rejects_spoofed_extension(tmp_path):
+    path = tmp_path / "spoofed.pdf"
+    path.write_bytes(b"junk before %PDF-1.7")
+
+    with pytest.raises(UploadValidationError, match="PDF"):
+        validate_pdf(path)
+
+
+def test_import_spoofed_pdf_returns_400_without_orphans(papers_env, db):
+    client, papers_dir, notes_dir = papers_env
+
+    response = client.post(
+        "/api/papers/import",
+        files=[("files", ("spoofed.pdf", b"not-a-pdf", "application/pdf"))],
+    )
+
+    assert response.status_code == 400
+    assert list(papers_dir.iterdir()) == []
+    assert list(notes_dir.iterdir()) == []
+    assert db.query(Paper).count() == 0
+
+
+@pytest.mark.parametrize(
+    ("entries", "kwargs", "message"),
+    [
+        (["[Content_Types].xml"], {}, "word/document.xml"),
+        (["word/document.xml"], {}, "Content_Types"),
+        (["[Content_Types].xml", "word/document.xml", "../escape.xml"], {}, "路径"),
+        (["[Content_Types].xml", "word/document.xml", "/absolute.xml"], {}, "路径"),
+        (["[Content_Types].xml", "word/document.xml", "word\\escape.xml"], {}, "路径"),
+        (["[Content_Types].xml", "word/document.xml", "word/document.xml"], {}, "重复"),
+        (["[Content_Types].xml", "word/document.xml", "extra.xml"], {"max_members": 2}, "成员数"),
+    ],
+)
+def test_validate_docx_rejects_invalid_members(tmp_path, entries, kwargs, message):
+    path = tmp_path / "invalid.docx"
+    path.write_bytes(_zip_bytes([(name, b"x") for name in entries]))
+
+    with pytest.raises(UploadValidationError, match=message):
+        validate_docx(path, **kwargs)
+
+
+def test_validate_docx_rejects_single_and_total_uncompressed_limits(tmp_path):
+    path = tmp_path / "large.docx"
+    path.write_bytes(_zip_bytes([
+        ("[Content_Types].xml", b"x" * 16),
+        ("word/document.xml", b"y" * 16),
+    ]))
+
+    with pytest.raises(UploadValidationError, match="单个"):
+        validate_docx(path, max_member_size=15, max_total_size=100)
+    with pytest.raises(UploadValidationError, match="总量"):
+        validate_docx(path, max_member_size=20, max_total_size=31)
+
+
+def test_validate_docx_rejects_excessive_compression_ratio(tmp_path):
+    path = tmp_path / "bomb.docx"
+    path.write_bytes(_zip_bytes([
+        ("[Content_Types].xml", b"x"),
+        ("word/document.xml", b"A" * 20_000),
+    ]))
+
+    with pytest.raises(UploadValidationError, match="压缩比"):
+        validate_docx(path, max_compression_ratio=10)
+
+
+def test_validate_real_minimal_docx(tmp_path):
+    path = tmp_path / "valid.docx"
+    path.write_bytes(VALID_DOCX)
+
+    validate_docx(path)
+
+
+def test_thesis_invalid_docx_returns_400_without_orphans(thesis_env, db):
+    client, thesis_dir = thesis_env
+
+    response = client.post(
+        "/api/thesis/upload",
+        files={"file": ("spoofed.docx", b"not-a-zip", "application/octet-stream")},
+    )
+
+    assert response.status_code == 400
+    assert list(thesis_dir.iterdir()) == []
+    assert db.query(ThesisFile).count() == 0
+
+
+def test_thesis_parse_failure_cleans_file_and_database(thesis_env, db, monkeypatch):
+    client, thesis_dir = thesis_env
+
+    def fail_parse(self, path):
+        raise ValueError("私密解析异常")
+
+    monkeypatch.setattr(thesis_router.DocxParser, "parse", fail_parse)
+    response = client.post(
+        "/api/thesis/upload",
+        files={"file": ("broken.docx", VALID_DOCX, "application/octet-stream")},
+    )
+
+    assert response.status_code == 500
+    assert "私密解析异常" not in response.text
+    assert list(thesis_dir.iterdir()) == []
+    assert db.query(ThesisFile).count() == 0
+
+
+def test_thesis_commit_failure_cleans_file_and_database(thesis_env, db, monkeypatch):
+    client, thesis_dir = thesis_env
+
+    def fail_commit():
+        raise RuntimeError("私密数据库异常")
+
+    monkeypatch.setattr(db, "commit", fail_commit)
+    response = client.post(
+        "/api/thesis/upload",
+        files={"file": ("commit.docx", VALID_DOCX, "application/octet-stream")},
+    )
+
+    assert response.status_code == 500
+    assert "私密数据库异常" not in response.text
+    assert list(thesis_dir.iterdir()) == []
+    assert db.query(ThesisFile).count() == 0

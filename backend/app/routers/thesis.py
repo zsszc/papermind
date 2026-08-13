@@ -21,6 +21,7 @@ from app.schemas import (
     ThesisCitationUpdate,
 )
 from app.services.docx_parser import DocxParser
+from app.services.upload_validation import UploadValidationError, validate_docx
 from app.services.llm import llm_service
 from app.core.logger import logger
 from app.core.config import config
@@ -138,46 +139,72 @@ async def upload_thesis(
         target_path = thesis_dir / f"{stem}_{counter}{suffix}"
         counter += 1
 
-    # 分块异步写盘，避免同步写阻塞事件循环
-    await _save_upload_file(file, target_path)
+    try:
+        # 先按实际字节数限流写盘，再做 bounded ZIP 门禁；
+        # 未通过验证的内容不会交给 python-docx 解压解析。
+        await _save_upload_file(file, target_path)
+        await run_in_threadpool(validate_docx, target_path)
 
-    # docx 解析为同步 CPU/IO 操作，放线程池执行
-    parser = DocxParser()
-    parsed = await run_in_threadpool(parser.parse, str(target_path))
+        parser = DocxParser()
+        parsed = await run_in_threadpool(parser.parse, str(target_path))
 
-    thesis = ThesisFile(
-        title=parsed.get("title") or target_path.stem,
-        file_path=str(target_path.relative_to(config.runtime_root)),
-        filename=target_path.name,
-        chapter_structure=parsed.get("chapters", []),
-        word_count=parsed.get("word_count"),
-        metadata_json={"citations_detected": len(parsed.get("citations", []))},
-    )
-    db.add(thesis)
-    db.flush()
-
-    # 保存检测到的引用
-    for c in parsed.get("citations", []):
-        paper = find_paper_by_citation(c["citation_text"], db)
-        chapter_index = None
-        for idx, ch in enumerate(parsed.get("chapters", [])):
-            if ch["start_paragraph"] <= c["paragraph_index"] <= ch["end_paragraph"]:
-                chapter_index = idx
-                break
-
-        citation = ThesisCitation(
-            thesis_id=thesis.id,
-            paper_id=paper.id if paper else None,
-            chapter_index=chapter_index,
-            citation_text=c["citation_text"],
-            context=c["context"],
-            detected_auto=True,
+        thesis = ThesisFile(
+            title=parsed.get("title") or target_path.stem,
+            file_path=str(target_path.relative_to(config.runtime_root)),
+            filename=target_path.name,
+            chapter_structure=parsed.get("chapters", []),
+            word_count=parsed.get("word_count"),
+            metadata_json={"citations_detected": len(parsed.get("citations", []))},
         )
-        db.add(citation)
+        db.add(thesis)
+        db.flush()
 
-    db.commit()
-    db.refresh(thesis)
-    return thesis
+        # 保存检测到的引用
+        for c in parsed.get("citations", []):
+            paper = find_paper_by_citation(c["citation_text"], db)
+            chapter_index = None
+            for idx, ch in enumerate(parsed.get("chapters", [])):
+                if ch["start_paragraph"] <= c["paragraph_index"] <= ch["end_paragraph"]:
+                    chapter_index = idx
+                    break
+
+            citation = ThesisCitation(
+                thesis_id=thesis.id,
+                paper_id=paper.id if paper else None,
+                chapter_index=chapter_index,
+                citation_text=c["citation_text"],
+                context=c["context"],
+                detected_auto=True,
+            )
+            db.add(citation)
+
+        db.flush()
+        # commit 后不再执行 refresh 等可失败操作，避免删掉已提交记录的文件。
+        response = ThesisFileResponse.model_validate(thesis)
+        db.commit()
+        return response
+    except UploadValidationError as exc:
+        db.rollback()
+        try:
+            target_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise HTTPException(status_code=400, detail="DOCX 文件内容或结构不合法") from exc
+    except HTTPException:
+        db.rollback()
+        try:
+            target_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    except Exception as exc:
+        logger.exception(f"[thesis-upload] 上传处理失败: {target_path.name}")
+        db.rollback()
+        try:
+            target_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise HTTPException(status_code=500, detail="大论文上传处理失败") from exc
 
 
 @router.get("", response_model=ThesisFileListResponse)
