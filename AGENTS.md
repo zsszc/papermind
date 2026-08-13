@@ -42,7 +42,7 @@
 
 ### 桌面端（`electron/`）
 
-- Electron 29 + electron-builder 24
+- Electron 43 + electron-builder 26
 - `main.js` 负责拉起后端子进程（`backend/venv/bin/python -m uvicorn app.main:app --port 8000 --workers 1`）并加载 `frontend/dist`
 
 ---
@@ -208,8 +208,8 @@ cd frontend && npm test          # Vitest + jsdom + Testing Library（SSE / Erro
 cd ../electron && npm test       # node:test（health / wait / restart / kill 生命周期）
 ```
 
-前端测试依赖包含 MSW，新增网络交互测试不得连接真实后端；Electron 生命周期纯模块不得
-`require('electron')`，确保 CI 无 GUI 也能运行。当前前端 5 个测试、Electron 6 个测试。
+前端测试依赖包含 MSW，新增网络交互测试不得连接真实后端；Electron 生命周期与安全策略纯模块不得
+`require('electron')`，确保 CI 无 GUI 也能运行。当前前端 7 个测试、Electron 17 个测试。
 
 ### RAG 评测（backend/eval/）
 

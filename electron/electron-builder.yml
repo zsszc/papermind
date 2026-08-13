@@ -12,19 +12,14 @@ files:
 extraResources:
   - from: ../frontend/dist
     to: frontend/dist
-  - from: ../backend
+  - from: runtime/backend
     to: backend
     filter:
       - "**/*"
-      - "!tests{,/**/*}"
-      - "!eval{,/**/*}"
-      - "!scripts{,/**/*}"
       - "!.pytest_cache{,/**/*}"
       - "!**/__pycache__{,/**/*}"
       - "!**/*.pyc"
       - "!**/.DS_Store"
-      - "!package-lock.json"
-      - "!=2.6.0"
   - from: ../config.yaml.example
     to: config.yaml.example
 mac:

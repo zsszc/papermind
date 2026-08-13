@@ -136,7 +136,7 @@ cd ../electron && npm run build
 双击安装/运行后，应用会自动启动后端服务并加载前端页面，无需再手动运行 `uvicorn` 或 `npm run dev`。
 
 > **注意**：
-> - 当前 `electron-builder.yml` 会把 `backend/venv` 一并打包，因此安装包较大（约 500MB+），但无需目标机器安装 Python 环境。
+> - 当前 `electron-builder.yml` 会把 `backend/venv` 一并打包，因此安装包较大。发布扫描会拒绝指向开发机外部路径的 Python 软链；只有使用与目标平台同架构、真正自包含的 Python 运行时构建后，安装包才可发布。
 > - 数据默认保存在系统应用数据目录（macOS: `~/Library/Application Support/PaperMind/PaperMindData`；Windows: `%APPDATA%/PaperMind/PaperMindData`），不会随应用升级丢失。
 > - 桌面包不会携带开发机的 API Key 或个人数据；首次运行后请在设置界面填写 Kimi API Key。
 

@@ -34,6 +34,8 @@ models/
 # Node.js
 frontend/node_modules/
 electron/node_modules/
+electron/runtime/
+electron/.runtime-cache/
 backend/package-lock.json
 frontend/dist/
 frontend/.env

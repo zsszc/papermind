@@ -1,0 +1,16 @@
+{
+  "pythonVersion": "3.12.13",
+  "release": "20260807",
+  "runtimes": {
+    "darwin-arm64": {
+      "filename": "cpython-3.12.13+20260807-aarch64-apple-darwin-install_only_stripped.tar.gz",
+      "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260807/cpython-3.12.13%2B20260807-aarch64-apple-darwin-install_only_stripped.tar.gz",
+      "sha256": "25baa97c65b3f0aa90e21131b4f9e80aef8899e8144006db8a9d2c1ab9e807e3"
+    },
+    "darwin-x64": {
+      "filename": "cpython-3.12.13+20260807-x86_64-apple-darwin-install_only_stripped.tar.gz",
+      "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260807/cpython-3.12.13%2B20260807-x86_64-apple-darwin-install_only_stripped.tar.gz",
+      "sha256": "127053f1736f721e391ddb46f07585d05756e15bb8d757d3bbc0519738998ba1"
+    }
+  }
+}

@@ -4,7 +4,7 @@
 # 包含三个并行 job：
 #   - backend ：Python 3.12，安装后端依赖并运行 pytest
 #   - frontend：Node 20，npm ci 后执行 test、lint 与 build
-#   - electron：Node 20，跳过二进制下载后执行 node:test 与语法检查
+#   - electron：Node 20，跳过二进制下载后执行 audit、node:test 与语法检查
 # pip / npm 均开启缓存以加速后续构建。
 
 name: CI
@@ -75,6 +75,10 @@ jobs:
         working-directory: frontend
         run: npm run build
 
+      - name: 前端依赖安全审计
+        working-directory: frontend
+        run: npm audit --audit-level=high
+
   electron:
     name: Electron 生命周期 Harness
     runs-on: ubuntu-latest
@@ -99,8 +103,14 @@ jobs:
         working-directory: electron
         run: npm test
 
+      - name: Electron 依赖安全审计
+        working-directory: electron
+        run: npm audit --audit-level=high
+
       - name: 主进程语法检查
         working-directory: electron
         run: |
           node --check main.js
           node --check backend-lifecycle.js
+          node --check security-policy.js
+          node --check scripts/verify-artifact.js
