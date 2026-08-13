@@ -213,7 +213,7 @@ def test_hybrid_runtime_degradation_invalidates_gate(tmp_path, monkeypatch):
         "available": lambda self: True,
         "search": lambda self, **kwargs: (_ for _ in ()).throw(RuntimeError("broken")),
     })()
-    monkeypatch.setattr("app.services.retrieval.get_vector_store", lambda: fake_store)
+    monkeypatch.setattr(run, "_open_eval_vector_store", lambda path: fake_store)
     dataset = tmp_path / "ds.jsonl"
     dataset.write_text(json.dumps({
         "qa_id": "q1", "question": "target evidence", "ground_truth": "target",
@@ -224,6 +224,7 @@ def test_hybrid_runtime_degradation_invalidates_gate(tmp_path, monkeypatch):
 
     assert run.main([
         "--dataset", str(dataset), "--threshold", "0",
+        "--vector-dir", str(tmp_path / "vector-snapshot"),
         "--report-dir", str(report_dir),
     ]) == 1
     report = json.loads(next(report_dir.glob("*.json")).read_text(encoding="utf-8"))

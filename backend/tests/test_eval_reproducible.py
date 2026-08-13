@@ -85,6 +85,20 @@ def test_parser_accepts_private_split():
     assert args.split == "dev"
 
 
+def test_private_hybrid_requires_explicit_vector_snapshot():
+    parser = run.build_parser()
+    args = parser.parse_args(["--dataset", "private.jsonl"])
+
+    assert run._validate_fixture_args(args) == (
+        "hybrid 评测必须显式指定 --vector-dir 隔离向量快照"
+    )
+
+
+def test_parser_accepts_explicit_vector_snapshot(tmp_path):
+    args = run.build_parser().parse_args(["--vector-dir", str(tmp_path)])
+    assert args.vector_dir == str(tmp_path)
+
+
 def test_qrels_hash_changes_when_evidence_changes():
     original = [{
         "qa_id": "qa",

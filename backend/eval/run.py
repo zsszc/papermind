@@ -410,6 +410,29 @@ def _rrf_fuse_chunks(
     return [metas[cid] for cid in ordered[:top_k]]
 
 
+def _open_eval_vector_store(vector_dir: Path):
+    """只打开显式评测快照中已存在的 papers collection。"""
+    import chromadb
+    from chromadb.config import Settings
+
+    from app.services.embedding import EmbeddingService
+    from app.services.retrieval import VectorStore
+
+    vector_dir = Path(vector_dir)
+    if not vector_dir.is_dir():
+        raise FileNotFoundError(f"评测向量快照不存在: {vector_dir}")
+    client = chromadb.PersistentClient(
+        path=str(vector_dir), settings=Settings(anonymized_telemetry=False)
+    )
+    collection = client.get_collection(name="papers")
+    store = VectorStore.__new__(VectorStore)
+    store.vector_dir = vector_dir
+    store.client = client
+    store.collection = collection
+    store.embedding_service = EmbeddingService()
+    return store
+
+
 class Retriever:
     """评测用检索器：优先语义+关键词混合，模型不可用时降级为仅关键词。"""
 
@@ -419,6 +442,7 @@ class Retriever:
         top_k: int,
         keyword_only: bool = False,
         lexical_profile: str = "count",
+        vector_dir: Optional[Path] = None,
     ):
         self.db = db
         self.top_k = top_k
@@ -436,9 +460,12 @@ class Retriever:
             self.degrade_reason = "--keyword-only 指定，跳过语义检索"
         else:
             try:
-                from app.services.retrieval import get_vector_store
-
-                store = get_vector_store()
+                if vector_dir is not None:
+                    store = _open_eval_vector_store(vector_dir)
+                else:
+                    # 保留类的直接调用兼容；CLI 已强制要求隔离快照。
+                    from app.services.retrieval import get_vector_store
+                    store = get_vector_store()
                 if store.available():
                     self._store = store
                 else:
@@ -570,6 +597,7 @@ def run_eval(args: argparse.Namespace) -> int:
             top_k=args.top_k,
             keyword_only=args.keyword_only,
             lexical_profile=args.lexical_profile,
+            vector_dir=Path(args.vector_dir) if args.vector_dir else None,
         )
         print(f"[eval] 检索模式: {retriever.mode}"
               + (f"（{retriever.degrade_reason}）" if retriever.degraded else ""))
@@ -814,6 +842,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--keyword-only", action="store_true",
                         help="强制仅关键词检索（不加载语义模型，速度快）")
     parser.add_argument(
+        "--vector-dir",
+        default=None,
+        help="hybrid 评测必须显式指定的隔离 Chroma 快照目录",
+    )
+    parser.add_argument(
         "--lexical-profile",
         choices=(
             "count", "bm25", "bm25-bilingual", "bm25-bilingual-neighbor"
@@ -836,6 +869,8 @@ def _validate_fixture_args(args: argparse.Namespace) -> Optional[str]:
         return "fixture 评测必须显式使用 --keyword-only"
     if args.fixture and args.with_llm:
         return "fixture 评测不得使用 --with-llm"
+    if not args.keyword_only and not args.vector_dir:
+        return "hybrid 评测必须显式指定 --vector-dir 隔离向量快照"
     return None
 
 
