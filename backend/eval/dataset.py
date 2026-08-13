@@ -19,12 +19,11 @@ from typing import Any, Optional, Union
 # 默认种子集路径
 DEFAULT_SEED_PATH = Path(__file__).resolve().parent / "dataset" / "qa_seed.jsonl"
 
-# 必填字段
+# 所有数据集共享的必填字段；相关性标注允许旧 relevant_chunks 或新 relevant_evidence。
 REQUIRED_FIELDS = {
     "qa_id",
     "question",
     "ground_truth",
-    "relevant_chunks",
     "question_type",
     "source",
     "has_answer",
@@ -100,6 +99,20 @@ def _validate_locator(locator: Any, where: str) -> list[str]:
     return errors
 
 
+def _validate_evidence(evidence: Any, where: str) -> list[str]:
+    """校验稳定 evidence qrels 定位信息。"""
+    if not isinstance(evidence, dict):
+        return [f"{where}: relevant_evidence 元素必须是对象"]
+    errors: list[str] = []
+    paper_uid = evidence.get("paper_uid")
+    quote = evidence.get("quote")
+    if not isinstance(paper_uid, str) or not paper_uid.startswith("doi:"):
+        errors.append(f"{where}: evidence.paper_uid 必须使用 doi:<doi>")
+    if not isinstance(quote, str) or len(quote.strip()) < 20:
+        errors.append(f"{where}: evidence.quote 至少 20 个字符")
+    return errors
+
+
 def validate_dataset(items: list[dict]) -> None:
     """校验数据集 schema 完整性。
 
@@ -157,14 +170,34 @@ def validate_dataset(items: list[dict]) -> None:
         if not isinstance(has_answer, bool):
             errors.append(f"{where}: has_answer 必须是布尔值")
 
-        chunks = item["relevant_chunks"]
-        if not isinstance(chunks, list):
-            errors.append(f"{where}: relevant_chunks 必须是列表")
+        has_legacy = "relevant_chunks" in item
+        has_evidence = "relevant_evidence" in item
+        if has_legacy == has_evidence:
+            errors.append(
+                f"{where}: 必须且只能提供 relevant_chunks 或 relevant_evidence 之一"
+            )
+            continue
+
+        if has_legacy:
+            chunks = item["relevant_chunks"]
+            if not isinstance(chunks, list):
+                errors.append(f"{where}: relevant_chunks 必须是列表")
+            else:
+                if has_answer is False and chunks:
+                    errors.append(f"{where}: 负例（has_answer=false）不应标注 relevant_chunks")
+                for locator in chunks:
+                    errors.extend(_validate_locator(locator, where))
         else:
-            if has_answer is False and chunks:
-                errors.append(f"{where}: 负例（has_answer=false）不应标注 relevant_chunks")
-            for locator in chunks:
-                errors.extend(_validate_locator(locator, where))
+            evidence_items = item["relevant_evidence"]
+            if not isinstance(evidence_items, list):
+                errors.append(f"{where}: relevant_evidence 必须是列表")
+            else:
+                if has_answer is True and not evidence_items:
+                    errors.append(f"{where}: 正例 relevant_evidence 不得为空")
+                if has_answer is False and evidence_items:
+                    errors.append(f"{where}: 负例不应标注 relevant_evidence")
+                for evidence in evidence_items:
+                    errors.extend(_validate_evidence(evidence, where))
 
     if errors:
         raise ValueError("数据集校验失败:\n" + "\n".join(f"  - {e}" for e in errors))
@@ -188,7 +221,33 @@ def resolve_relevant_chunks(db, entry: dict) -> list[str]:
     返回：
         去重后的 chunk id 列表，如 ["p1_c2", "p1_c0"]。负例返回空列表。
     """
-    from app.models import Chunk  # 延迟导入，保证加载/校验可脱离 app 使用
+    from app.models import Chunk, Paper  # 延迟导入，保证加载/校验可脱离 app 使用
+
+    if "relevant_evidence" in entry:
+        resolved: list[str] = []
+        for evidence in entry.get("relevant_evidence", []):
+            paper_uid = evidence["paper_uid"]
+            doi = paper_uid.removeprefix("doi:")
+            paper = db.query(Paper).filter(Paper.doi == doi).one_or_none()
+            if paper is None:
+                raise ValueError(f"evidence paper_uid 未命中: {paper_uid}")
+            quote = evidence["quote"].strip()
+            matches = [
+                row for row in db.query(Chunk).filter(Chunk.paper_id == paper.id).all()
+                if quote in (row.content or "")
+            ]
+            if not matches:
+                raise ValueError(
+                    f"evidence quote 未命中: qa_id={entry.get('qa_id')} paper_uid={paper_uid}"
+                )
+            if len(matches) > 1:
+                raise ValueError(
+                    f"evidence quote 多处命中: qa_id={entry.get('qa_id')} paper_uid={paper_uid}"
+                )
+            chunk_id = f"p{paper.id}_c{matches[0].chunk_index}"
+            if chunk_id not in resolved:
+                resolved.append(chunk_id)
+        return resolved
 
     scores: dict[tuple[int, int], int] = {}  # (paper_id, chunk_index) -> 得分
 

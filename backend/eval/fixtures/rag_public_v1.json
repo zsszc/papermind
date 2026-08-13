@@ -1,0 +1,91 @@
+{
+  "benchmark_id": "papermind-rag-public-v1",
+  "license": "CC0-1.0",
+  "description": "PaperMind 团队原创的合成评测语料，不代表真实医学研究结论。",
+  "papers": [
+    {
+      "paper_uid": "doi:10.5555/papermind.alpha-mil",
+      "title": "Alpha-MIL: Gated Multiple-Instance Learning for Synthetic Stage Prediction",
+      "authors": "Lin Chen; Mira Zhou",
+      "year": 2026,
+      "chunks": [
+        {
+          "chunk_index": 0,
+          "section_title": "Method",
+          "content": "Alpha-MIL encodes every tile with a pretrained ResNet-34 feature extractor. The encoder produces a 512-dimensional vector for each tile before pooling."
+        },
+        {
+          "chunk_index": 1,
+          "section_title": "Aggregation",
+          "content": "The Alpha-MIL aggregator applies gated attention and retains the top 32 instances. A compact consistency penalty encourages neighboring synthetic regions to receive similar scores."
+        },
+        {
+          "chunk_index": 2,
+          "section_title": "Experiments",
+          "content": "The Orion cohort contains 240 synthetic whole-slide records split 60 percent for training, 20 percent for validation, and 20 percent for testing. Alpha-MIL obtains 0.860 accuracy and 0.910 AUC."
+        },
+        {
+          "chunk_index": 3,
+          "section_title": "Conclusion",
+          "content": "Most Alpha-MIL errors occur between adjacent synthetic stages. Future work will evaluate external centers and replace the handcrafted encoder with a foundation-model representation."
+        }
+      ]
+    },
+    {
+      "paper_uid": "doi:10.5555/papermind.beta-transformer",
+      "title": "Beta-Transformer: Sparse Attention for Synthetic Slide Analysis",
+      "authors": "Aya Sun; Noah Li",
+      "year": 2026,
+      "chunks": [
+        {
+          "chunk_index": 0,
+          "section_title": "Method",
+          "content": "Beta-Transformer uses a Swin-T encoder to create 1024-dimensional patch embeddings. Positional coordinates are added before sparse self-attention."
+        },
+        {
+          "chunk_index": 1,
+          "section_title": "Architecture",
+          "content": "The sparse attention block selects 64 landmarks and uses two transformer layers. This design reduces quadratic interaction cost while preserving long-range synthetic context."
+        },
+        {
+          "chunk_index": 2,
+          "section_title": "Experiments",
+          "content": "The Nova benchmark provides 300 synthetic slides. Beta-Transformer reaches 0.840 accuracy and 0.890 AUC, using AdamW with a learning rate of 3e-4."
+        },
+        {
+          "chunk_index": 3,
+          "section_title": "Conclusion",
+          "content": "Beta-Transformer is strongest on broad contextual patterns but less stable on tiny regions. The authors propose multi-scale landmarks as the next synthetic experiment."
+        }
+      ]
+    },
+    {
+      "paper_uid": "doi:10.5555/papermind.graphpath",
+      "title": "GraphPath-MIL: Neighborhood Graphs for Synthetic Tissue Classification",
+      "authors": "Iris Wu; Evan Qiao",
+      "year": 2026,
+      "chunks": [
+        {
+          "chunk_index": 0,
+          "section_title": "Method",
+          "content": "GraphPath-MIL connects every patch to its six nearest spatial neighbors. Node attributes combine color statistics with 256-dimensional ConvNeXt-T features."
+        },
+        {
+          "chunk_index": 1,
+          "section_title": "Architecture",
+          "content": "Three graph-attention layers propagate local evidence before mean pooling. GraphPath-MIL trains with Adam at a learning rate of 2e-4 and weight decay of 1e-5."
+        },
+        {
+          "chunk_index": 2,
+          "section_title": "Experiments",
+          "content": "The Atlas set contains 180 synthetic slides and uses five-fold cross-validation. GraphPath-MIL reports 0.820 accuracy, 0.800 macro F1, and 0.870 AUC."
+        },
+        {
+          "chunk_index": 3,
+          "section_title": "Conclusion",
+          "content": "GraphPath-MIL improves local interpretability through explicit edges. Its main limitation is graph construction time, so future work will test adaptive neighborhood sampling."
+        }
+      ]
+    }
+  ]
+}
