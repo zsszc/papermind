@@ -192,7 +192,7 @@ cd ../electron && npm run build    # 产物在 frontend/out/（dmg/zip/exe）
 
 ## 8. 测试与评测
 
-### 单元/集成测试（pytest，511 个用例）
+### 单元/集成测试（pytest，571 个用例）
 
 ```bash
 cd backend
@@ -209,7 +209,7 @@ cd ../electron && npm test       # node:test（health / wait / restart / kill �
 ```
 
 前端测试依赖包含 MSW，新增网络交互测试不得连接真实后端；Electron 生命周期与安全策略纯模块不得
-`require('electron')`，确保 CI 无 GUI 也能运行。当前后端 530 个测试、前端 11 个测试、Electron 26 个测试。
+`require('electron')`，确保 CI 无 GUI 也能运行。当前后端 571 个测试、前端 11 个测试、Electron 26 个测试。
 
 ### RAG 评测（backend/eval/）
 
@@ -230,6 +230,7 @@ env -u PYTHONPATH venv/bin/python -m eval.run \
 - **公开稳定基线**：count 与 BM25 Recall@5 均为 0.900；MRR 分别 0.775/0.783，NDCG@5 分别 0.806/0.813；CI Gate 为 Recall@5 ≥ 0.85
 - `eval/private/` 为已忽略的真实语料评测目录；v1 共 72 条已审 QA / 18 篇论文，train/dev/holdout 各 24 条，证据 72/72 唯一解析
 - **真实库留出基线**：BM25 Recall@5/MRR/NDCG@5 为 0.542/0.308/0.365；中英术语扩展为 0.583/0.353/0.410
+- **真实库 dev 当前有效 hybrid**：重建后的 464 条 BGE-M3 向量经显式快照评测，Recall@5/MRR/NDCG@5 为 0.625/0.394/0.452；该结果只用于开发诊断，不替代 holdout
 - 私有真实库不可与公开基准混算趋势；公开集用于链路正确性和回归，不替代真实论文质量评测
 
 ### 改动后至少应验证
@@ -256,7 +257,9 @@ env -u PYTHONPATH venv/bin/python -m eval.run \
 - **BGE-M3 首次下载**：约 2GB，走 HuggingFace 镜像（`hf-mirror.com`），需网络畅通；Embedding 模型在后台线程加载，`available()` 为假时检索会降级。
 - **Kimi API**：当前模型 `kimi-k2.6`（`config.yaml`）；复杂问题响应可达 60–120 秒，优先用 SSE 流式；遇 `429 engine_overloaded_error` 可稍后重试；该模型只支持 `temperature=1`，`llm.py` 已自动处理。
 - **ChromaDB telemetry 警告**：启动时 `Failed to send telemetry event` 可忽略（已设置 `anonymized_telemetry=False`，残余警告无害）。
-- **当前 Chroma 库待原子重建**：真实库的 HNSW 历史快照与 464 条当前 metadata 不一致，hybrid 评测值不可信。不要原地删除/修复；Batch 18 须先备份，在临时新库重建并完整校验 ID/维度/query 后再原子换入。
+- **Chroma 已完成原子重建**：当前库与 SQLite 的 464 个 chunk ID 完全一致，Embedding 为 1024 维并通过 query smoke；旧失配库保留在已忽略的 `vector_db.backup-*` 目录。后续重建必须继续使用显式 stage/activate CLI，不得原地修补。
+- **真实 SQLite 历史孤儿**：主库 `quick_check=ok`，但仍有 4 条 `paper_tags` 外键孤儿；Batch 18 已生成并验证 FK=0 的修复候选副本，未自动覆盖源库。切换前必须再次备份并由用户明确确认。
+- **Kimi 当前未就绪**：2026-08-14 真实启动健康检查收到 429，错误指向账户额度不足或被冻结；本地检索、管理和离线评测可用，LLM 功能需恢复 Moonshot 额度后再验收。
 - **`backend/=2.6.0` 文件**：是历史上 `pip install 包名=2.6.0`（少写一个 `=`）误生成的空文件，可删。
 - **旧设计文档**（`PaperMind_需求规格说明书_技术设计文档.md` 等）描述的是规划态，与实现有出入时以代码为准（例如 React Query、YAML Skill 注册表、Alembic 均未落地）。
 
@@ -272,4 +275,4 @@ env -u PYTHONPATH venv/bin/python -m eval.run \
 
 ---
 
-> 最后更新：2026-08-13，Batch 17 私有真实语料 Benchmark v1 完成后同步。
+> 最后更新：2026-08-14，Batch 18 数据一致性、上传安全与真实向量重建完成后同步。
