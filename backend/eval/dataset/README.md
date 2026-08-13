@@ -2,6 +2,35 @@
 
 本目录存放 PaperMind RAG 评测用的 QA 数据集（P4 评测体系的数据层）。
 
+## 公开可复现基准
+
+`qa_public_v1.jsonl` 对应 `eval/fixtures/rag_public_v1.json`，二者均为 PaperMind
+原创合成内容（CC0），不包含用户论文。公开集使用稳定 evidence qrels：
+
+```json
+{
+  "relevant_evidence": [
+    {
+      "paper_uid": "doi:10.5555/papermind.alpha-mil",
+      "quote": "长度至少 20 字符且在目标论文中唯一命中的逐字证据"
+    }
+  ]
+}
+```
+
+运行命令：
+
+```bash
+cd backend
+env -u PYTHONPATH venv/bin/python -m eval.run \
+  --fixture eval/fixtures/rag_public_v1.json \
+  --dataset eval/dataset/qa_public_v1.jsonl \
+  --keyword-only --lexical-profile bm25 --threshold 0.85
+```
+
+fixture 模式只使用内存 SQLite，不连接 `data/papers.db`，也不加载模型或调用 LLM。
+当前公开集用于 CI 链路正确性与回归门禁；私人真实库仍需单独评测，二者不可混算趋势。
+
 ## 文件
 
 - `qa_seed.jsonl`：种子集，25 条，基于示例论文（`papers/demo-paper.pdf`，paper_id=1，

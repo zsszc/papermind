@@ -5,6 +5,9 @@
     env -u PYTHONPATH venv/bin/python -m eval.run --keyword-only  # 强制只用关键词检索（不加载模型，快）
     env -u PYTHONPATH venv/bin/python -m eval.run --keyword-only --lexical-profile bm25
                                                                # BM25 技术锚点观察实验
+    env -u PYTHONPATH venv/bin/python -m eval.run --fixture eval/fixtures/rag_public_v1.json \
+        --dataset eval/dataset/qa_public_v1.jsonl --keyword-only --lexical-profile bm25
+                                                               # 公开可复现基准
     env -u PYTHONPATH venv/bin/python -m eval.run --with-llm      # 加跑生成侧指标（会真实调用 LLM）
     env -u PYTHONPATH venv/bin/python -m eval.run --threshold 0.6 # 自定义 recall@5 达标阈值
 
@@ -111,6 +114,23 @@ def _build_benchmark_metadata(db, dataset_path: Path) -> Dict[str, Any]:
         "n_papers": db.query(Paper).count(),
         "n_chunks": len(chunks),
     }
+
+
+def _qrels_sha256(items: List[Dict[str, Any]]) -> str:
+    """计算相关性标注的稳定指纹，排除问题文本和参考答案。"""
+    qrels = [
+        {
+            "qa_id": item["qa_id"],
+            "has_answer": item["has_answer"],
+            "relevant_evidence": item.get("relevant_evidence"),
+            "relevant_chunks": item.get("relevant_chunks"),
+        }
+        for item in items
+    ]
+    payload = json.dumps(
+        qrels, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return _sha256_bytes(payload)
 
 
 def _resolve_qrels_or_raise(db, items: List[Dict[str, Any]]) -> Dict[str, List[str]]:
@@ -383,16 +403,31 @@ def _print_table(rows: List[Dict[str, Any]], k: int) -> None:
 
 def run_eval(args: argparse.Namespace) -> int:
     """执行评测，返回进程退出码。"""
-    from app.database import SessionLocal  # 延迟导入，连接真实 SQLite（只读）
-
     items = load_dataset(args.dataset)
     validate_dataset(items)
     print(f"[eval] 数据集 {args.dataset} 共 {len(items)} 条")
 
-    db = SessionLocal()
+    fixture_database = None
+    fixture_metadata: Dict[str, Any] = {}
+    if args.fixture:
+        from eval.fixture import open_fixture_database
+
+        fixture_database = open_fixture_database(args.fixture)
+        fixture_metadata = fixture_database.metadata
+        db = fixture_database.session_factory()
+    else:
+        from app.database import SessionLocal  # 延迟导入，连接真实 SQLite（只读）
+
+        db = SessionLocal()
     try:
         t0 = time.time()
         benchmark = _build_benchmark_metadata(db, Path(args.dataset))
+        benchmark.update({
+            "qrels_sha256": _qrels_sha256(items),
+            "benchmark_id": fixture_metadata.get("benchmark_id", "private-local-observation"),
+        })
+        if fixture_metadata:
+            benchmark["fixture_license"] = fixture_metadata["license"]
         resolved_qrels = _resolve_qrels_or_raise(db, items)
         retriever = Retriever(
             db,
@@ -503,6 +538,7 @@ def run_eval(args: argparse.Namespace) -> int:
 
         comparison_key = ":".join((
             benchmark["dataset_sha256"],
+            benchmark["qrels_sha256"],
             benchmark["corpus_manifest_sha256"],
             retriever.mode,
             args.lexical_profile,
@@ -535,7 +571,7 @@ def run_eval(args: argparse.Namespace) -> int:
                 "threshold": args.threshold,
                 "actual": overall[f"recall@{args.top_k}"],
             },
-            "dataset": str(args.dataset),
+            "dataset": Path(args.dataset).name if args.fixture else str(args.dataset),
             "top_k": args.top_k,
             "threshold": args.threshold,
             "retrieval_mode": retriever.mode,
@@ -604,6 +640,8 @@ def run_eval(args: argparse.Namespace) -> int:
         return 0 if passed else 1
     finally:
         db.close()
+        if fixture_database is not None:
+            fixture_database.close()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -611,6 +649,11 @@ def build_parser() -> argparse.ArgumentParser:
         prog="python -m eval.run", description="PaperMind RAG 一键评测")
     parser.add_argument("--dataset", default=None,
                         help="评测数据集 JSONL 路径，缺省为内置种子集")
+    parser.add_argument(
+        "--fixture",
+        default=None,
+        help="公开 fixture JSON；启用后使用隔离内存 SQLite，不连接真实数据库",
+    )
     parser.add_argument("--top-k", type=int, default=5,
                         help="检索截断位置 k（默认 5，即 recall@5 / NDCG@5）")
     parser.add_argument("--threshold", type=float, default=0.5,
@@ -630,6 +673,15 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _validate_fixture_args(args: argparse.Namespace) -> Optional[str]:
+    """返回 fixture CLI 参数错误；合法时返回 None。"""
+    if args.fixture and not args.keyword_only:
+        return "fixture 评测必须显式使用 --keyword-only"
+    if args.fixture and args.with_llm:
+        return "fixture 评测不得使用 --with-llm"
+    return None
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     # load_dataset 接受 None 表示默认种子集
@@ -637,6 +689,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         from eval.dataset import DEFAULT_SEED_PATH
 
         args.dataset = DEFAULT_SEED_PATH
+    fixture_error = _validate_fixture_args(args)
+    if fixture_error:
+        print(f"[eval] 参数错误: {fixture_error}", file=sys.stderr)
+        return 2
     return run_eval(args)
 
 
