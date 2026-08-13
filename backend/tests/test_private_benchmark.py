@@ -195,3 +195,19 @@ def test_private_dataset_requires_review_stable_uid_coverage_and_paper_split():
         ], min_items=2, min_papers=1)
     with pytest.raises(ValueError, match="覆盖论文"):
         validate_private_dataset(valid, min_items=2, min_papers=3)
+
+
+def test_private_dataset_accepts_explicit_negative_items():
+    negative = {
+        "qa_id": "negative-1",
+        "question": "这套文献是否报告了火星样本结果？",
+        "ground_truth": "库中没有答案，应拒答",
+        "relevant_evidence": [],
+        "question_type": "out_of_scope",
+        "source": "synthetic",
+        "has_answer": False,
+        "reviewed": True,
+        "split": "holdout",
+    }
+    summary = validate_private_dataset([negative], min_items=1, min_papers=0)
+    assert summary == {"items": 1, "papers": 0, "splits": {"holdout": 1}}
