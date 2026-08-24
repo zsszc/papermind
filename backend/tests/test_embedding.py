@@ -82,6 +82,16 @@ class TestChunkerHardLimit:
         assert chunks[0]["content"].endswith("。")
         assert chunks[1]["content"].endswith("。")
 
+    def test_sentence_boundary_wins_over_later_whitespace(self):
+        chunker = TextChunker(chunk_size=20, chunk_overlap=0)
+
+        chunks = chunker.chunk_pages([{
+            "page_number": 8,
+            "text": "0123456789; abcde fghijklmnop",
+        }])
+
+        assert chunks[0]["content"] == "0123456789;"
+
     def test_boundary_free_text_uses_fixed_window_with_bounded_overlap(self):
         chunker = TextChunker(chunk_size=10, chunk_overlap=2)
 
