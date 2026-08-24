@@ -412,6 +412,18 @@ def _rrf_fuse_chunks(
     return [metas[cid] for cid in ordered[:top_k]]
 
 
+# Batch 20：保留上述函数名作为下游兼容 API，但实际实现统一来自生产服务。
+# 这样旧测试/脚本无需改 import，聊天与 eval 又不会继续维护两套算法。
+from app.services.retrieval_pipeline import (  # noqa: E402
+    bm25_chunk_search as _bm25_chunk_search,
+    keyword_chunk_search as _keyword_chunk_search,
+    query_technical_terms as _query_technical_terms,
+    rerank_bm25_neighbors as _rerank_bm25_neighbors,
+    rrf_fuse_chunks as _rrf_fuse_chunks,
+    tokenize_technical_terms as _tokenize_technical_terms,
+)
+
+
 def _open_eval_vector_store(vector_dir: Path):
     """只打开显式评测快照中已存在的 papers collection。"""
     import chromadb
@@ -453,6 +465,7 @@ class Retriever:
         self.degraded = False
         self.degrade_reason = ""
         self._store = None
+        self.keyword_only = keyword_only
         self.lexical_profile = lexical_profile
         self.retrieval_profile = retrieval_profile
         self.semantic_rerank = semantic_rerank
@@ -477,8 +490,9 @@ class Retriever:
                     # 保留类的直接调用兼容；CLI 已强制要求隔离快照。
                     from app.services.retrieval import get_vector_store
                     store = get_vector_store()
+                self._store = store
                 if store.available():
-                    self._store = store
+                    pass
                 else:
                     self.degraded = True
                     self.degrade_reason = "Embedding 模型加载失败（详见日志）"
@@ -496,57 +510,58 @@ class Retriever:
 
     def search(self, query: str) -> List[Dict[str, Any]]:
         """对单条查询返回 top_k 的 chunk 级结果（含 chunk_id 与 content）。"""
-        self.last_query_mode = "keyword-only" if self.degraded else "hybrid"
-        self.last_query_degraded = self.degraded
+        from app.services.retrieval_pipeline import RetrievalPipeline
+
+        self.last_query_mode = "keyword-only" if self.keyword_only else self.mode
+        self.last_query_degraded = self.degraded and not self.keyword_only
         self.last_query_error = None
-        if self.retrieval_profile == "semantic-production":
-            self.last_query_mode = self.mode
-            self.last_query_degraded = self.degraded
-            if self.degraded:
-                self.runtime_degraded_count += 1
-                return []
-            try:
-                assert self._store is not None
-                results = self._store.search(
-                    query=query,
-                    top_k=5,
-                    rerank=self.semantic_rerank,
-                    rerank_diagnostics=self.rerank_diagnostics,
-                )
-                if (
-                    self.semantic_rerank is True
-                    and not self.rerank_diagnostics["effective"]
-                ):
-                    self.last_query_degraded = True
-                    self.last_query_error = self.rerank_diagnostics["error"]
-                    self.runtime_degraded_count += 1
-                return results
-            except Exception as e:
-                self.last_query_mode = "semantic-production(runtime-degraded)"
-                self.last_query_degraded = True
-                self.last_query_error = type(e).__name__
-                self.runtime_degraded_count += 1
-                return []
-        keyword_results = _keyword_chunk_search(
-            self.db,
-            query,
-            limit=self.top_k * 2,
-            lexical_profile=self.lexical_profile,
-        )
-        if self.degraded:
-            return keyword_results[: self.top_k]
-        try:
-            assert self._store is not None  # degraded 时已在上方提前返回
-            semantic_results = self._store.search(query=query, top_k=self.top_k * 2)
-        except Exception as e:
-            # 运行期语义检索失败：本次查询降级为关键词结果
-            print(f"  [warn] 语义检索失败，本条降级为关键词检索: {e}", file=sys.stderr)
-            self.last_query_mode = "keyword-only(runtime-degraded)"
+        pipeline_diagnostics: Dict[str, Any] = {}
+        if self.keyword_only:
+            profile = "keyword"
+        elif self.retrieval_profile == "semantic-production":
+            profile = "semantic"
+        else:
+            profile = "hybrid"
+
+        # 初始化异常时绝不让评测管线隐式回连主 VectorStore。
+        if profile != "keyword" and self._store is None:
+            self.last_query_mode = f"{self.mode}(runtime-degraded)"
             self.last_query_degraded = True
-            self.last_query_error = type(e).__name__
+            self.last_query_error = "semantic_initialization_failed"
             self.runtime_degraded_count += 1
-            return keyword_results[: self.top_k]
-        return _rrf_fuse_chunks(semantic_results, keyword_results, self.top_k)
+            return []
+
+        results = RetrievalPipeline(
+            self.db, vector_store=self._store
+        ).search(
+            query,
+            top_k=5 if profile == "semantic" else self.top_k,
+            filters={},
+            profile=profile,
+            lexical_profile=self.lexical_profile,
+            rerank=self.semantic_rerank,
+            diagnostics=pipeline_diagnostics,
+            rerank_diagnostics=self.rerank_diagnostics,
+        )
+
+        if self.keyword_only:
+            return results
+
+        degraded = bool(pipeline_diagnostics.get("degraded"))
+        reason = pipeline_diagnostics.get("reason")
+        if self.semantic_rerank is True and not self.rerank_diagnostics["effective"]:
+            degraded = True
+            reason = self.rerank_diagnostics.get("error") or "rerank_not_effective"
+        if degraded:
+            self.last_query_degraded = True
+            self.last_query_error = reason
+            self.runtime_degraded_count += 1
+            self.last_query_mode = (
+                f"{self.retrieval_profile}(runtime-degraded)"
+            )
+        else:
+            self.last_query_mode = self.mode
+        return results
 
 
 # ---------------------------------------------------------------------------

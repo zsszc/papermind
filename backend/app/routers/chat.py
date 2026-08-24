@@ -11,9 +11,11 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models import Conversation, MemorySummary, Message, Paper
 from app.schemas import ChatRequest, ConversationResponse, DeepReviewRequest, ImageAnalysisRequest
+from app.core.config import config
 from app.core.logger import logger
 from app.services.llm import llm_service
 from app.services.retrieval import get_vector_store
+from app.services.retrieval_pipeline import RetrievalPipeline
 from app.services.memory_manager import MemoryManager
 from app.services.image_analyzer import image_analyzer_service
 from app.services.skills import list_skills
@@ -196,12 +198,20 @@ async def regenerate_message(
     history_messages = all_messages[:target_index]
     query = prev_user_msg.content
 
-    # 检索相关片段
+    # 重新生成与主聊天共用同一检索策略，避免两条生产路径排序漂移。
     retrieved = []
     try:
-        store = get_vector_store()
-        if store.available():
-            retrieved = store.search(query=query, top_k=5)
+        retrieved = RetrievalPipeline(
+            db, vector_store=get_vector_store()
+        ).search(
+            query,
+            top_k=5,
+            filters={},
+            profile=config.get("retrieval.chat_profile", "semantic"),
+            lexical_profile=config.get(
+                "retrieval.lexical_profile", "bm25-bilingual"
+            ),
+        )
     except Exception as e:
         logger.error(f"[regenerate] 检索失败: {e}")
 

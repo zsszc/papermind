@@ -38,6 +38,7 @@ from app.core.logger import logger
 from app.models import Chunk, Message, Paper
 from app.services.memory_manager import MemoryManager
 from app.services.retrieval import get_vector_store
+from app.services.retrieval_pipeline import RetrievalPipeline
 from app.services.skills import build_skill_prompt
 from app.services.web_search import web_search_service
 
@@ -209,20 +210,25 @@ def load_memory(state: AgentState) -> Dict[str, Any]:
 
 
 def retrieve(state: AgentState) -> Dict[str, Any]:
-    """节点2：向量库检索相关文献片段；失败或不可用时回退为空列表。"""
+    """节点2：经共享管线检索相关文献片段；失败时回退为空列表。"""
     chunks: List[Dict[str, Any]] = []
     filters: Dict[str, Any] = {}
     if state.get("paper_id"):
         filters["paper_id"] = state["paper_id"]
     if state.get("user_message"):
         try:
-            store = get_vector_store()
-            if store.available():
-                chunks = store.search(
-                    query=state["user_message"],
-                    top_k=RETRIEVE_TOP_K,
-                    filters=filters,
-                )
+            pipeline = RetrievalPipeline(
+                state["db"], vector_store=get_vector_store()
+            )
+            chunks = pipeline.search(
+                state["user_message"],
+                top_k=RETRIEVE_TOP_K,
+                filters=filters,
+                profile=config.get("retrieval.chat_profile", "semantic"),
+                lexical_profile=config.get(
+                    "retrieval.lexical_profile", "bm25-bilingual"
+                ),
+            )
         except Exception as e:
             logger.error(f"[agent_graph] 检索失败: {e}")
     return {"context_chunks": chunks}

@@ -57,6 +57,8 @@ _BILINGUAL_TERM_MAP = (
     ("指标", ("metric",)),
 )
 
+_CHUNK_ID_FULL_RE = re.compile(r"^p(-?\d+)_c(-?\d+)$")
+
 
 def tokenize_technical_terms(text: str) -> List[str]:
     """提取 ASCII 技术锚点，保留连字符、小数、科学计数法和百分号。"""
@@ -158,6 +160,11 @@ def keyword_chunk_search(
     filters: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """按显式 profile 执行 chunk 级词法检索。"""
+    if lexical_profile == "bm25-bilingual-neighbor":
+        scored = bm25_chunk_search(
+            db, query, None, bilingual=True, filters=filters
+        )
+        return rerank_bm25_neighbors(scored)[:limit]
     if lexical_profile in {"bm25", "bm25-bilingual"}:
         return bm25_chunk_search(
             db,
@@ -193,6 +200,39 @@ def keyword_chunk_search(
         })
     scored.sort(key=lambda item: (-item["score"], item["chunk_id"]))
     return scored[:limit]
+
+
+def rerank_bm25_neighbors(
+    scored: List[Dict[str, Any]], *, neighbor_weight: float = 0.5
+) -> List[Dict[str, Any]]:
+    """兼容历史实验：按同论文 chunk_index±1 的 BM25 分数做邻块增强。"""
+    base_scores: Dict[tuple[int, int], float] = {}
+    chunk_keys: Dict[str, tuple[int, int]] = {}
+    for item in scored:
+        chunk_id = str(item.get("chunk_id", ""))
+        match = _CHUNK_ID_FULL_RE.fullmatch(chunk_id)
+        if match is None:
+            continue
+        paper_id, chunk_index = (int(value) for value in match.groups())
+        chunk_keys[chunk_id] = (paper_id, chunk_index)
+        base_scores[(paper_id, chunk_index)] = float(item.get("score", 0.0))
+
+    reranked: List[Dict[str, Any]] = []
+    for item in scored:
+        updated = copy.deepcopy(item)
+        key = chunk_keys.get(str(item.get("chunk_id", "")))
+        score = float(item.get("score", 0.0))
+        if key is not None:
+            paper_id, chunk_index = key
+            score += neighbor_weight * (
+                base_scores.get((paper_id, chunk_index - 1), 0.0)
+                + base_scores.get((paper_id, chunk_index + 1), 0.0)
+            )
+        updated["score"] = score
+        updated["source"] = "keyword-bm25-bilingual-neighbor"
+        reranked.append(updated)
+    reranked.sort(key=lambda item: (-item["score"], item["chunk_id"]))
+    return reranked
 
 
 def rrf_fuse_chunks(
@@ -311,21 +351,27 @@ class RetrievalPipeline:
             if not store.available():
                 semantic_reason = "semantic_unavailable"
             else:
-                semantic_results = store.search(
-                    query=query,
-                    top_k=top_k if profile == "semantic" else top_k * 2,
-                    filters=filters,
-                    rerank=rerank,
-                    rerank_diagnostics=(
-                        rerank_diagnostics
-                        if rerank_diagnostics is not None
-                        else {
-                            "requested": bool(rerank),
-                            "effective": False,
-                            "error": None,
-                        }
-                    ),
-                )
+                search_kwargs = {
+                    "query": query,
+                    "top_k": top_k if profile == "semantic" else top_k * 2,
+                    "filters": filters,
+                }
+                # 生产旧调用方不显式控制 rerank 时保持三参数兼容；评测或
+                # 实验显式传值时才附加诊断参数。
+                if rerank is not None or rerank_diagnostics is not None:
+                    search_kwargs.update({
+                        "rerank": rerank,
+                        "rerank_diagnostics": (
+                            rerank_diagnostics
+                            if rerank_diagnostics is not None
+                            else {
+                                "requested": bool(rerank),
+                                "effective": False,
+                                "error": None,
+                            }
+                        ),
+                    })
+                semantic_results = store.search(**search_kwargs)
         except Exception as exc:
             semantic_reason = "semantic_search_failed"
             logger.warning(

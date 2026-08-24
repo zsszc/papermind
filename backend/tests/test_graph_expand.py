@@ -150,10 +150,10 @@ class TestSwitchOffNoRegression:
     def test_switch_off_context_chunks_identity(
         self, db, citation_table, conversation, monkeypatch
     ):
-        """关闭时 context_chunks 为向量召回原列表（同一对象），未做任何加工。"""
+        """关闭时 context_chunks 内容不变；共享管线允许为缓存隔离复制对象。"""
         vector_chunks = [_vchunk(1, 0, "命中片段")]
         state = _run(db, conversation, monkeypatch, vector_chunks, graph_expand=False)
-        assert state["context_chunks"] is vector_chunks
+        assert state["context_chunks"] == vector_chunks
 
     def test_switch_off_messages_byte_identical(
         self, db, citation_table, conversation, monkeypatch
@@ -186,7 +186,7 @@ class TestSwitchOffNoRegression:
         state = run_pre_orchestration(
             db=db, conversation_id=conversation.id, user_message="什么是多实例学习？"
         )
-        assert state["context_chunks"] is vector_chunks
+        assert state["context_chunks"] == vector_chunks
 
 
 class TestGraphExpansion:
@@ -313,11 +313,11 @@ class TestDegradationPassthrough:
     """降级契约：无命中 / 无引用边 / 任何异常 → 透传 retrieve 结果不变。"""
 
     def test_no_edges_passthrough(self, db, citation_table, conversation, monkeypatch):
-        """有命中但无任何引用边：原样透传（同一列表对象）。"""
+        """有命中但无任何引用边：内容原样透传。"""
         p1 = _make_paper(db, "孤立文献")
         vector_chunks = [_vchunk(p1.id, 0, "命中片段")]
         state = _run(db, conversation, monkeypatch, vector_chunks, graph_expand=True)
-        assert state["context_chunks"] is vector_chunks
+        assert state["context_chunks"] == vector_chunks
 
     def test_empty_vector_hits_passthrough(self, db, citation_table, conversation, monkeypatch):
         """向量零命中：无扩展对象，透传空列表，不报错。"""
@@ -332,7 +332,7 @@ class TestDegradationPassthrough:
         db.commit()
         vector_chunks = [_vchunk(1, 0, "命中片段")]
         state = _run(db, conversation, monkeypatch, vector_chunks, graph_expand=True)
-        assert state["context_chunks"] is vector_chunks
+        assert state["context_chunks"] == vector_chunks
         # RAG 消息按向量召回原样组装（无扩展 chunk 混入）
         msg = "什么是多实例学习？"
         assert state["messages"][-1]["content"] == build_rag_prompt(msg, vector_chunks)

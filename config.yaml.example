@@ -20,6 +20,8 @@ embedding:
 
 retrieval:
   top_k: 10
+  chat_profile: "semantic"          # semantic / hybrid；通过真实 dev Gate 后再切 hybrid
+  lexical_profile: "bm25-bilingual" # hybrid 的 chunk 词法策略
   rerank: false                   # 默认关闭，开启后召回 top-20 经 BGE-Reranker 精排
   rerank_model: "BAAI/bge-reranker-v2-m3"
   hybrid_weight: 0.7
