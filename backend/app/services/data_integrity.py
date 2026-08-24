@@ -130,3 +130,31 @@ def repair_database_copy(source: Path, destination: Path, *, dry_run: bool = Tru
         "after": after,
         "output_path": str(destination),
     }
+
+
+def open_readonly_sqlalchemy_database(database_path: Path):
+    """以 SQLite URI 只读模式创建显式 SQLAlchemy engine/session factory。
+
+    用于候选评测和向量构建，避免导入期绑定的生产 ``SessionLocal``。调用方
+    负责关闭 Session 并 ``engine.dispose()``。
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    database_path = Path(database_path).resolve()
+    if not database_path.is_file():
+        raise FileNotFoundError(database_path)
+    uri = _readonly_uri(database_path)
+
+    def _connect():
+        connection = sqlite3.connect(
+            uri, uri=True, check_same_thread=False
+        )
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("PRAGMA foreign_keys=ON")
+        return connection
+
+    engine = create_engine("sqlite://", creator=_connect)
+    return engine, sessionmaker(
+        autocommit=False, autoflush=False, bind=engine
+    )

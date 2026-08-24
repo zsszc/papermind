@@ -74,6 +74,7 @@ def build_staged_vector_store(
     embedder: Any,
     client_factory: Callable[[Path], Any] | None = None,
     batch_size: int = 16,
+    required_dimension: int | None = None,
 ) -> dict[str, int]:
     """在全新目录从 SQLite 重建 Chroma，完成校验后才返回。"""
     stage_dir = Path(stage_dir)
@@ -81,6 +82,8 @@ def build_staged_vector_store(
         raise FileExistsError(f"临时向量库已存在: {stage_dir}")
     if batch_size <= 0:
         raise ValueError("batch_size 必须大于 0")
+    if required_dimension is not None and required_dimension <= 0:
+        raise ValueError("required_dimension 必须大于 0")
     records = expected_chunk_records(db)
     stage_dir.mkdir(parents=True)
     try:
@@ -106,6 +109,13 @@ def build_staged_vector_store(
             if len(embeddings) != len(batch):
                 raise ValueError("Embedding 输出数量与 chunk 数量不一致")
             for vector in embeddings:
+                if (
+                    required_dimension is not None
+                    and len(vector) != required_dimension
+                ):
+                    raise ValueError(
+                        f"Embedding 维度必须为 {required_dimension}"
+                    )
                 if dimension is None:
                     dimension = len(vector)
                     smoke_embedding = list(vector)
@@ -119,6 +129,8 @@ def build_staged_vector_store(
             )
         if records and not dimension:
             raise ValueError("Embedding 维度为空")
+        if required_dimension is not None and not records:
+            raise ValueError("无 chunk，无法验证 Embedding 维度")
         return validate_vector_collection(
             collection,
             expected_ids={item["id"] for item in records},
@@ -179,6 +191,14 @@ def build_parser():
     parser.add_argument("--target", default=None, help="目标 vector_db 目录")
     parser.add_argument("--stage", default=None, help="临时新库目录")
     parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument(
+        "--required-dimension", type=int, default=1024,
+        help="要求的 Embedding 维度（BGE-M3 默认 1024）",
+    )
+    parser.add_argument(
+        "--database", default=None,
+        help="显式只读候选 SQLite；缺省使用当前运行时数据库",
+    )
     return parser
 
 
@@ -209,18 +229,35 @@ def main(argv: list[str] | None = None) -> int:
     """管理命令入口；默认不存在隐式换入路径。"""
     import json
 
-    from app.database import SessionLocal
     from app.services.embedding import EmbeddingService
 
     args = build_parser().parse_args(argv)
     target, stage = _resolve_cli_paths(args.target, args.stage)
-    with SessionLocal() as db:
-        result = build_staged_vector_store(
-            db,
-            stage,
-            embedder=EmbeddingService(),
-            batch_size=args.batch_size,
+    database_engine = None
+    if args.database:
+        from app.services.data_integrity import (
+            open_readonly_sqlalchemy_database,
         )
+
+        database_engine, session_factory = open_readonly_sqlalchemy_database(
+            Path(args.database)
+        )
+    else:
+        from app.database import SessionLocal
+
+        session_factory = SessionLocal
+    try:
+        with session_factory() as db:
+            result = build_staged_vector_store(
+                db,
+                stage,
+                embedder=EmbeddingService(),
+                batch_size=args.batch_size,
+                required_dimension=args.required_dimension,
+            )
+    finally:
+        if database_engine is not None:
+            database_engine.dispose()
     payload: dict[str, Any] = {**result, "stage": str(stage), "activated": False}
     if args.activate:
         backup = activate_staged_vector_store(stage, target)

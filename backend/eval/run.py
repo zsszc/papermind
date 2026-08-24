@@ -102,15 +102,24 @@ def _manifest_chunk_paper_uid(chunk: Any, uid_by_id: Dict[int, str]) -> str:
     return f"fixture-orphan:{content_hash}"
 
 
-def _build_benchmark_metadata(db, dataset_path: Path) -> Dict[str, Any]:
+def _build_benchmark_metadata(
+    db,
+    dataset_path: Path,
+    runtime_root: Optional[Path] = None,
+) -> Dict[str, Any]:
     """构建不含正文的 benchmark 指纹与规模元数据。
 
     corpus manifest 以 chunk 的稳定定位字段与正文 SHA 组成；报告只保存最终
     manifest SHA，不保存私有论文正文或逐条正文摘要。
     """
-    from app.core.config import config
     from app.models import Chunk, Paper
     from eval.private_benchmark import paper_uid
+
+    if runtime_root is None:
+        from app.core.config import config
+
+        runtime_root = config.runtime_root
+    runtime_root = Path(runtime_root)
 
     dataset_path = Path(dataset_path)
     chunks = db.query(Chunk).order_by(Chunk.paper_id, Chunk.chunk_index).all()
@@ -118,7 +127,7 @@ def _build_benchmark_metadata(db, dataset_path: Path) -> Dict[str, Any]:
     uid_by_id: Dict[int, str] = {}
     for paper_id, paper in papers.items():
         try:
-            uid_by_id[paper_id] = paper_uid(paper, config.runtime_root)
+            uid_by_id[paper_id] = paper_uid(paper, runtime_root)
         except ValueError:
             # 公开内存 fixture 不携带真实 PDF；其 DOI 仍提供稳定身份。
             uid_by_id[paper_id] = f"fixture-paper:{paper_id}"
@@ -174,12 +183,16 @@ def _select_split(
     return selected
 
 
-def _resolve_qrels_or_raise(db, items: List[Dict[str, Any]]) -> Dict[str, List[str]]:
+def _resolve_qrels_or_raise(
+    db,
+    items: List[Dict[str, Any]],
+    runtime_root: Optional[Path] = None,
+) -> Dict[str, List[str]]:
     """预解析 qrels；正例无法解析时立即失败，避免混入模型质量分数。"""
     resolved: Dict[str, List[str]] = {}
     unresolved: List[str] = []
     for entry in items:
-        ids = resolve_relevant_chunks(db, entry)
+        ids = resolve_relevant_chunks(db, entry, runtime_root=runtime_root)
         resolved[entry["qa_id"]] = ids
         if entry["has_answer"] and not ids:
             unresolved.append(entry["qa_id"])
@@ -757,6 +770,7 @@ def run_eval(args: argparse.Namespace) -> int:
     )
 
     fixture_database = None
+    explicit_database_engine = None
     fixture_metadata: Dict[str, Any] = {}
     if args.fixture:
         from eval.fixture import open_fixture_database
@@ -764,20 +778,39 @@ def run_eval(args: argparse.Namespace) -> int:
         fixture_database = open_fixture_database(args.fixture)
         fixture_metadata = fixture_database.metadata
         db = fixture_database.session_factory()
+    elif args.database:
+        from app.services.data_integrity import (
+            open_readonly_sqlalchemy_database,
+        )
+
+        explicit_database_engine, session_factory = (
+            open_readonly_sqlalchemy_database(Path(args.database))
+        )
+        db = session_factory()
     else:
         from app.database import SessionLocal  # 延迟导入，连接真实 SQLite（只读）
 
         db = SessionLocal()
     try:
         t0 = time.time()
-        benchmark = _build_benchmark_metadata(db, Path(args.dataset))
+        if args.corpus_root:
+            runtime_root = Path(args.corpus_root).resolve()
+        else:
+            from app.core.config import config
+
+            runtime_root = config.runtime_root
+        benchmark = _build_benchmark_metadata(
+            db, Path(args.dataset), runtime_root=runtime_root
+        )
         benchmark.update({
             "qrels_sha256": _qrels_sha256(items),
             "benchmark_id": fixture_metadata.get("benchmark_id", "private-local-observation"),
         })
         if fixture_metadata:
             benchmark["fixture_license"] = fixture_metadata["license"]
-        resolved_qrels = _resolve_qrels_or_raise(db, items)
+        resolved_qrels = _resolve_qrels_or_raise(
+            db, items, runtime_root=runtime_root
+        )
         retriever = Retriever(
             db,
             top_k=args.top_k,
@@ -1045,6 +1078,8 @@ def run_eval(args: argparse.Namespace) -> int:
         db.close()
         if fixture_database is not None:
             fixture_database.close()
+        if explicit_database_engine is not None:
+            explicit_database_engine.dispose()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1056,6 +1091,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--fixture",
         default=None,
         help="公开 fixture JSON；启用后使用隔离内存 SQLite，不连接真实数据库",
+    )
+    parser.add_argument(
+        "--database",
+        default=None,
+        help="显式只读候选 SQLite；用于隔离评测，不连接生产 SessionLocal",
+    )
+    parser.add_argument(
+        "--corpus-root",
+        default=None,
+        help="解析稳定 PDF 身份的只读语料根目录",
     )
     parser.add_argument("--top-k", type=int, default=5,
                         help="检索截断位置 k（默认 5，即 recall@5 / NDCG@5）")
@@ -1141,6 +1186,10 @@ def _validate_cli_args(args: argparse.Namespace) -> Optional[str]:
         return "--max-p95-ms 必须为正数"
     if args.fixture and not args.keyword_only:
         return "fixture 评测必须显式使用 --keyword-only"
+    if args.fixture and (args.database or args.corpus_root):
+        return "fixture 评测不得指定 --database/--corpus-root"
+    if args.database and not args.corpus_root:
+        return "显式 --database 必须同时指定 --corpus-root"
     if args.fixture and args.with_llm:
         return "fixture 评测不得使用 --with-llm"
     if args.with_llm and args.split != "dev":
