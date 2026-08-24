@@ -11,7 +11,7 @@ from __future__ import annotations
 import copy
 import math
 import re
-from collections import Counter
+from collections import Counter, defaultdict
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import tuple_
@@ -73,6 +73,16 @@ _LOCAL_NEIGHBOR_SEED_POOL = 20
 _LOCAL_NEIGHBOR_RADIUS = 2
 _LOCAL_NEIGHBOR_DECAY = 0.5
 _LOCAL_NEIGHBOR_EXPANDED_CAP = 20
+_PARENT_CHILD_POOL = 40
+_PARENT_CHILD_DISCOUNTS = (1.0, 0.5, 0.25)
+
+
+class ParentMappingError(ValueError):
+    """初召回 child 无法安全映射到冻结 parent 时抛出。"""
+
+    def __init__(self, message: str, *, reason: str):
+        super().__init__(message)
+        self.reason = reason
 
 
 def tokenize_technical_terms(text: str) -> List[str]:
@@ -429,12 +439,109 @@ def rrf_fuse_chunks(
     return [copy.deepcopy(metas[cid]) for cid in ordered[:top_k]]
 
 
+def parent_child_fuse_chunks(
+    semantic_results: List[Dict[str, Any]],
+    keyword_results: List[Dict[str, Any]],
+    parent_map: Dict[str, str],
+    top_k: int,
+    *,
+    k: int = 60,
+) -> List[Dict[str, Any]]:
+    """按冻结 RRF/parent 折扣/round-robin 契约融合 child 结果。"""
+    if top_k <= 0:
+        return []
+    child_scores: Dict[str, float] = {}
+    metas: Dict[str, Dict[str, Any]] = {}
+    for route in (semantic_results, keyword_results):
+        seen_route: set[str] = set()
+        unique_route: list[Dict[str, Any]] = []
+        for item in route[:_PARENT_CHILD_POOL]:
+            chunk_id = str(item.get("chunk_id", ""))
+            if not _CHUNK_ID_FULL_RE.fullmatch(chunk_id):
+                raise ParentMappingError(
+                    f"非法 child id: {chunk_id!r}",
+                    reason="parent_mapping_invalid",
+                )
+            if chunk_id in seen_route:
+                continue
+            seen_route.add(chunk_id)
+            unique_route.append(item)
+        for rank, item in enumerate(unique_route):
+            chunk_id = str(item["chunk_id"])
+            if chunk_id not in parent_map:
+                raise ParentMappingError(
+                    f"child {chunk_id} 缺少 parent 映射",
+                    reason="parent_mapping_missing",
+                )
+            parent_id = str(parent_map[chunk_id])
+            child_match = _CHUNK_ID_FULL_RE.fullmatch(chunk_id)
+            parent_match = _CHUNK_ID_FULL_RE.fullmatch(parent_id)
+            if (
+                parent_match is None
+                or child_match is None
+                or parent_match.group(1) != child_match.group(1)
+            ):
+                raise ParentMappingError(
+                    f"child {chunk_id} 的 parent id 非法: {parent_id!r}",
+                    reason="parent_mapping_invalid",
+                )
+            child_scores[chunk_id] = (
+                child_scores.get(chunk_id, 0.0) + 1.0 / (k + rank + 1)
+            )
+            metas.setdefault(chunk_id, copy.deepcopy(item))
+
+    children_by_parent: Dict[str, List[str]] = defaultdict(list)
+    for chunk_id in child_scores:
+        children_by_parent[parent_map[chunk_id]].append(chunk_id)
+    parent_scores: Dict[str, float] = {}
+    for parent_id, child_ids in children_by_parent.items():
+        child_ids.sort(key=lambda cid: (-child_scores[cid], cid))
+        parent_scores[parent_id] = sum(
+            discount * child_scores[chunk_id]
+            for discount, chunk_id in zip(
+                _PARENT_CHILD_DISCOUNTS, child_ids
+            )
+        )
+        # 冻结契约只允许前三个 child 贡献且进入 round-robin。
+        del child_ids[len(_PARENT_CHILD_DISCOUNTS):]
+
+    ordered_parents = sorted(
+        children_by_parent,
+        key=lambda parent_id: (-parent_scores[parent_id], parent_id),
+    )
+    results: List[Dict[str, Any]] = []
+    for round_index in range(len(_PARENT_CHILD_DISCOUNTS)):
+        for parent_id in ordered_parents:
+            child_ids = children_by_parent[parent_id]
+            if round_index >= len(child_ids):
+                continue
+            chunk_id = child_ids[round_index]
+            item = copy.deepcopy(metas[chunk_id])
+            item.update({
+                "score": child_scores[chunk_id],
+                "child_rrf_score": child_scores[chunk_id],
+                "parent_chunk_id": parent_id,
+                "parent_score": parent_scores[parent_id],
+            })
+            results.append(item)
+            if len(results) >= top_k:
+                return results
+    return results
+
+
 class RetrievalPipeline:
     """共享检索入口；生产降级、评测通过 diagnostics 决定是否接受。"""
 
-    def __init__(self, db: Session, *, vector_store=None):
+    def __init__(
+        self,
+        db: Session,
+        *,
+        vector_store=None,
+        parent_map: Optional[Dict[str, str]] = None,
+    ):
         self.db = db
         self.vector_store = vector_store
+        self.parent_map = dict(parent_map or {})
 
     def _store(self):
         if self.vector_store is None:
@@ -480,18 +587,21 @@ class RetrievalPipeline:
             profile = "hybrid"
             lexical_profile = "bm25-bilingual"
         if profile not in {
-            "semantic", "hybrid", "hybrid-local-neighbor", "keyword"
+            "semantic", "hybrid", "hybrid-local-neighbor",
+            "parent-child-v1", "keyword"
         }:
             raise ValueError(f"不支持的检索 profile: {requested_profile}")
 
         keyword_results: List[Dict[str, Any]] = []
         keyword_error = False
-        if profile in {"hybrid", "hybrid-local-neighbor", "keyword"}:
+        if profile in {
+            "hybrid", "hybrid-local-neighbor", "parent-child-v1", "keyword"
+        }:
             try:
                 keyword_results = keyword_chunk_search(
                     self.db,
                     query,
-                    top_k * 2,
+                    _PARENT_CHILD_POOL if profile == "parent-child-v1" else top_k * 2,
                     lexical_profile=lexical_profile,
                     filters=filters,
                 )
@@ -520,6 +630,9 @@ class RetrievalPipeline:
                 semantic_reason = "semantic_unavailable"
             else:
                 semantic_top_k = (
+                    _PARENT_CHILD_POOL
+                    if profile == "parent-child-v1"
+                    else
                     _LOCAL_NEIGHBOR_SEED_POOL
                     if profile == "hybrid-local-neighbor"
                     else top_k if profile == "semantic" else top_k * 2
@@ -560,6 +673,67 @@ class RetrievalPipeline:
                 reason=semantic_reason,
             )
             return copy.deepcopy(semantic_results[:top_k])
+
+        if profile == "parent-child-v1":
+            if semantic_reason is not None:
+                self._write_diagnostics(
+                    diagnostics,
+                    requested_profile,
+                    "empty",
+                    degraded=True,
+                    reason=semantic_reason,
+                )
+                return []
+            if keyword_error:
+                self._write_diagnostics(
+                    diagnostics,
+                    requested_profile,
+                    "empty",
+                    degraded=True,
+                    reason="keyword_search_failed",
+                )
+                return []
+            try:
+                results = parent_child_fuse_chunks(
+                    semantic_results,
+                    keyword_results,
+                    self.parent_map,
+                    top_k,
+                )
+            except ParentMappingError as exc:
+                logger.warning(
+                    "[retrieval_pipeline] Parent-Child 映射失败: "
+                    f"{type(exc).__name__}"
+                )
+                self._write_diagnostics(
+                    diagnostics,
+                    requested_profile,
+                    "empty",
+                    degraded=True,
+                    reason=exc.reason,
+                )
+                return []
+            except Exception as exc:
+                logger.warning(
+                    "[retrieval_pipeline] Parent-Child 聚合失败: "
+                    f"{type(exc).__name__}"
+                )
+                self._write_diagnostics(
+                    diagnostics,
+                    requested_profile,
+                    "empty",
+                    degraded=True,
+                    reason="parent_aggregation_failed",
+                )
+                return []
+            self._write_diagnostics(
+                diagnostics,
+                requested_profile,
+                "parent-child-v1",
+                degraded=False,
+                reason=None,
+            )
+            return results
 
         baseline_semantic_results = semantic_results[:top_k * 2]
         neighbor_error = False

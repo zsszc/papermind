@@ -110,6 +110,44 @@ def test_parent_manifest_depends_on_stable_coordinates_not_row_id(tmp_path):
         second_engine.dispose()
 
 
+def test_parent_map_rejects_same_dynamic_id_for_different_paper(tmp_path):
+    parent_engine, parent_db = _session(
+        tmp_path / "parents.db", [(0, 1, 0, 20)]
+    )
+    child_engine, child_db = _session(
+        tmp_path / "children.db", [(0, 1, 0, 20)]
+    )
+    child_db.query(Paper).one().title = "different paper"
+    child_db.commit()
+    try:
+        with pytest.raises(ValueError, match="论文身份不一致"):
+            build_parent_map(child_db, parent_db)
+    finally:
+        child_db.close()
+        parent_db.close()
+        child_engine.dispose()
+        parent_engine.dispose()
+
+
+def test_parent_manifest_includes_paper_identity_and_content_hash(tmp_path):
+    first_engine, first = _session(
+        tmp_path / "first.db", [(0, 1, 0, 20)]
+    )
+    second_engine, second = _session(
+        tmp_path / "second.db", [(0, 1, 0, 20)]
+    )
+    try:
+        assert parent_manifest_sha256(first) == parent_manifest_sha256(second)
+        second.query(Chunk).one().content = "changed parent content"
+        second.commit()
+        assert parent_manifest_sha256(first) != parent_manifest_sha256(second)
+    finally:
+        first.close()
+        second.close()
+        first_engine.dispose()
+        second_engine.dispose()
+
+
 def test_parent_score_caps_child_count_and_uses_frozen_discounts():
     semantic = [_item(f"p1_c{i}") for i in range(4)] + [_item("p2_c0")]
     mapping = {f"p1_c{i}": "p1_c10" for i in range(4)}
@@ -159,6 +197,25 @@ def test_parent_fusion_fails_when_any_recalled_child_is_unmapped():
         parent_child_fuse_chunks([_item("p1_c0")], [], {}, top_k=5)
 
 
+def test_parent_fusion_rejects_invalid_id_and_duplicate_does_not_consume_rank():
+    with pytest.raises(ValueError, match="非法 child id"):
+        parent_child_fuse_chunks(
+            [{"chunk_id": "bad", "content": "bad"}], [], {}, top_k=5
+        )
+
+    first = _item("p1_c0")
+    second = _item("p2_c0")
+    results = parent_child_fuse_chunks(
+        [first, deepcopy(first), second],
+        [],
+        {"p1_c0": "p1_c9", "p2_c0": "p2_c9"},
+        top_k=5,
+    )
+    scores = {row["chunk_id"]: row["child_rrf_score"] for row in results}
+    assert scores["p1_c0"] == pytest.approx(1 / 61)
+    assert scores["p2_c0"] == pytest.approx(1 / 62)
+
+
 class _Store:
     def __init__(self, results):
         self.results = results
@@ -170,6 +227,11 @@ class _Store:
     def search(self, **kwargs):
         self.calls.append(dict(kwargs))
         return deepcopy(self.results)
+
+
+class _UnavailableStore(_Store):
+    def available(self):
+        return False
 
 
 def test_pipeline_parent_child_profile_uses_top40_and_keeps_hybrid_unchanged(
@@ -207,4 +269,39 @@ def test_pipeline_parent_child_profile_uses_top40_and_keeps_hybrid_unchanged(
         "effective_profile": "parent-child-v1",
         "degraded": False,
         "reason": None,
+    }
+
+
+@pytest.mark.parametrize(
+    ("store", "keyword_raises", "parent_map", "reason"),
+    [
+        (_UnavailableStore([]), False, {"p1_c1": "p1_c9"}, "semantic_unavailable"),
+        (_Store([_item("p1_c0")]), True, {"p1_c0": "p1_c9"}, "keyword_search_failed"),
+        (_Store([_item("p1_c0")]), False, {}, "parent_mapping_missing"),
+    ],
+)
+def test_pipeline_parent_child_fail_closes_without_single_route_fallback(
+    db, monkeypatch, store, keyword_raises, parent_map, reason
+):
+    def keyword_search(*args, **kwargs):
+        if keyword_raises:
+            raise RuntimeError("keyword failed")
+        return [_item("p1_c1")]
+
+    monkeypatch.setattr(
+        "app.services.retrieval_pipeline.keyword_chunk_search", keyword_search
+    )
+    diagnostics = {}
+    results = RetrievalPipeline(
+        db, vector_store=store, parent_map=parent_map
+    ).search(
+        "query", top_k=5, profile="parent-child-v1", diagnostics=diagnostics
+    )
+
+    assert results == []
+    assert diagnostics == {
+        "requested_profile": "parent-child-v1",
+        "effective_profile": "empty",
+        "degraded": True,
+        "reason": reason,
     }
