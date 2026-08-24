@@ -349,6 +349,9 @@ def graph_expand(state: AgentState) -> Dict[str, Any]:
     """
     if not config.get("retrieval.graph_expand", False):
         return {}
+    # 用户显式限定单篇论文时，引用图只能作为关系信息，不能扩大 RAG 作用域。
+    if state.get("paper_id") is not None:
+        return {}
     chunks = state.get("context_chunks") or []
     try:
         hit_ids = {c.get("paper_id") for c in chunks if c.get("paper_id") is not None}
