@@ -63,3 +63,52 @@ class TestChunkerConfig:
         monkeypatch.setattr(config, "_config", {})
         c = TextChunker()
         assert (c.chunk_size, c.chunk_overlap) == (512, 50)
+
+
+class TestChunkerHardLimit:
+    """Batch 22C：单个超长段落也必须遵守真实字符上限。"""
+
+    def test_long_single_paragraph_prefers_sentence_boundaries(self):
+        chunker = TextChunker(chunk_size=12, chunk_overlap=0)
+
+        chunks = chunker.chunk_pages([{
+            "page_number": 7,
+            "text": "第一句话很短。第二句话也很短。第三句话结束。",
+        }])
+
+        assert len(chunks) >= 3
+        assert all(0 < len(item["content"]) <= 12 for item in chunks)
+        assert all(item["page_number"] == 7 for item in chunks)
+        assert chunks[0]["content"].endswith("。")
+        assert chunks[1]["content"].endswith("。")
+
+    def test_boundary_free_text_uses_fixed_window_with_bounded_overlap(self):
+        chunker = TextChunker(chunk_size=10, chunk_overlap=2)
+
+        chunks = chunker.chunk_pages([{"page_number": 1, "text": "x" * 35}])
+
+        assert [len(item["content"]) for item in chunks] == [10, 10, 10, 10, 3]
+        assert all(
+            previous["content"][-2:] == current["content"][:2]
+            for previous, current in zip(chunks, chunks[1:])
+        )
+
+    def test_join_separator_counts_toward_hard_limit(self):
+        chunker = TextChunker(chunk_size=10, chunk_overlap=0)
+
+        chunks = chunker.chunk_pages([{
+            "page_number": 2,
+            "text": "12345\n\n67890",
+        }])
+
+        assert [item["content"] for item in chunks] == ["12345", "67890"]
+        assert all(item["token_count"] == len(item["content"]) for item in chunks)
+
+    def test_overlap_larger_than_chunk_size_cannot_stall(self):
+        chunker = TextChunker(chunk_size=8, chunk_overlap=50)
+
+        chunks = chunker.chunk_pages([{"page_number": 3, "text": "z" * 20}])
+
+        assert len(chunks) == 13
+        assert all(0 < len(item["content"]) <= 8 for item in chunks)
+        assert chunks[-1]["content"] == "z" * 8
