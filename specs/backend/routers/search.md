@@ -17,7 +17,7 @@
 ### 2.1 包含
 
 - `POST /api/search` 端点（`search()`）的请求/响应契约、参数回落规则、四种开关组合行为、`source` 字段覆写语义
-- 端点级错误路径：哪些异常有兜底、哪些冒泡为 500（含 `_build_where` 组合过滤缺陷在路由层**无兜底**的明确规约）
+- 端点级错误路径：关键词与语义适配器异常的独立降级边界
 - 请求/响应 Pydantic 模型（`SearchRequest` / `SearchResponse` / `SearchResult`，定义于 `app/schemas.py`）的字段契约
 
 ### 2.2 非目标
@@ -56,7 +56,7 @@
 - **后置条件**：`len(results) <= top_k`（回落后）；论文级去重仅在双开融合路径保证（单开路径不去重，但单开时只有一路有结果，该路自身语义侧为 chunk 级、可能同论文多条——见第 4 节）。
 - **行为规则**（按代码顺序）：
   1. `filters = request.filters or {}`；`top_k = request.top_k or 10`；
-  2. `use_semantic` 为真**且** `store.available()` 为真 → `store.search(query, top_k=top_k*2, filters=filters)`（超量取回为融合预留候选），结果 `source` 覆写为 `"semantic"`；模型不可用则**静默跳过**（不报错、不标记）；
+  2. `use_semantic` 为真时，在同一异常边界内获取 store、检查 `available()` 并执行 `store.search(query, top_k=top_k*2, filters=filters)`；结果 `source` 覆写为 `"semantic"`。模型不可用则静默跳过，状态检查或查询异常写 warning 并把语义结果降级为空；
   3. `use_keyword` 为真 → `_keyword_search(db, query, limit=top_k*2)`；清洗后无有效 token 或 SQL 异常时返回 `[]`（retrieval.md 3.9，永不因关键词路 500）；
   4. **双开** → `_reciprocal_rank_fusion(semantic, keyword, top_k)`（RRF k=60，按 `paper_id` 去重、同论文多 chunk 分数累计、载体取先出现的语义项），全部结果 `source` 覆写 `"hybrid"`；
   5. **单开** → `(semantic_results + keyword_results)[:top_k]`（另一路为空列表，等价于取该路前 `top_k`；**此路径不做论文级去重**，语义单开时同一论文可出现多条 chunk）；
@@ -64,8 +64,7 @@
 - **副作用**：ChromaDB 查询 + 写 60 秒语义缓存（仅语义路，retrieval.md 3.4）；FTS5 只读查询；`_keyword_search` 异常时写 `[search]` warning 日志；**无任何 DB 写入**。
 - **异常与兜底（任务关切的明确规约）**：
   - 关键词路异常：**函数内全捕获**，warning 日志 + 返回 `[]`——路由层有兜底；
-  - 语义路 `store.available()` 为假：跳过——有降级；
-  - 语义路 `store.search()` 抛异常（**含 `_build_where` 组合过滤触发的 ChromaDB `ValueError`**：`year_gte+year_lte` 同给、或 `year_*` 与 `paper_id` 同给，0.4.24 实证必抛，见 retrieval.md 3.5）：**路由层（search.py 本文件）没有任何 try/except 兜底**，异常冒泡出端点，由 `main.py` 全局异常处理器统一捕获，返回 **500 + 通用脱敏 JSON**（`{"detail": "服务器内部错误，请稍后重试", "error_code": "internal_error", "path": "/api/search"}`），异常原文只写 `logs/app.log`（宪法第 13 条）。**即：组合过滤 = 500，不降级、不返回部分结果**；
+  - 语义路 `get_vector_store()` / `available()` / `search()` 抛异常：warning 仅入日志，语义结果降级为空；若关键词开启则仍返回关键词结果，若语义单开则返回空列表，均为 200；
   - Pydantic 校验失败（如缺 `query`、`top_k` 非整数）：FastAPI 自动 422。
 
 ## 4. 边界条件与错误处理
@@ -76,9 +75,9 @@
 | 双开关皆 false | `results=[]`，200 |
 | 空查询串 / 纯特殊字符（`---`、`"*^:()`） | 关键词路清洗为空跳过；语义路若可用仍会以空串调 embed（服务层行为）；接口不报错 |
 | FTS5 注入特征查询（`' OR "1"="1`、`NEAR(...)`、`cancer*` 等） | 特殊字符剥离/短语化，200（宪法第 11 条） |
-| `filters` 组合条件（`year_gte`+`year_lte`，或 `year_*`+`paper_id`）且语义路实际执行 | ChromaDB `ValueError` → **500**（路由层无兜底，全局异常处理器脱敏） |
-| `filters` 组合条件但模型不可用 / `use_semantic=false` | 语义路不执行，过滤缺陷不触发，200 |
-| `filters` 含未识别键 | 静默忽略，不过滤 |
+| `filters` 组合条件 | VectorStore 生成合法 `$and`，语义与关键词两路均应用相同限制 |
+| `filters` 含未识别键 | 语义路 fail-closed 抛出后被降级为空；关键词路拒绝并返回空，不扩大范围 |
+| 语义状态检查/查询异常 | 双开时保留关键词结果并返回 200；语义单开返回空列表 |
 | `top_k=None` / `0` | 回落 10 |
 | `top_k` 为负数 | 不拦截；语义/关键词 `LIMIT`/`n_results` 为负的行为由 SQLite/ChromaDB 决定，融合路径 `sorted_pids[:负数]` 在 Python 中返回**去掉尾部 |top_k| 条后的列表**（非空时结果异常多）——未规约的脏输入，前端不产生 |
 | 语义单开且同论文多 chunk 命中 | 不去重，同一 `paper_id` 可出现多条（与双开路径行为不同） |
@@ -95,7 +94,7 @@
   - `app.models` 的 `papers_fts` 虚拟表（经 `_keyword_search` 的 SQL）
   - `app.core.logger.logger`
   - `main.py` 全局异常处理器（500 脱敏的唯一兜底）
-- **下游消费者**：前端 `SearchPage`（经 `api.js`）；无其他后端消费者（chat/thesis/agent_graph 直接用 `VectorStore`，不经本端点）。
+- **下游消费者**：前端 `SearchPage`（经 `api.js`）；聊天、论文引用与深度综述使用共享 chunk `RetrievalPipeline`，不经本论文级端点。
 
 ## 6. 验收标准（可测试）
 
@@ -108,16 +107,16 @@
 - [ ] AC7：`top_k=None` / `0` → 回落 10（**当前无测试**）
 - [ ] AC8：语义单开时结果 `source == "semantic"` 且不做论文级去重（**当前无测试**，需可用桩 VectorStore）
 - [ ] AC9：双开且语义有结果时全部结果 `source == "hybrid"`；语义降级时关键词结果也被误标 `hybrid`（**当前无测试**，固化现有语义）
-- [ ] AC10：`filters` 组合过滤 + 语义路执行 → 500 且响应为全局脱敏格式（`error_code == "internal_error"`）（**当前无测试**；缺陷修复后本 AC 应改写为「组合过滤合法生效」）
+- [x] AC10：组合 filters 合法生效且限制性条件 fail-closed；语义状态检查/查询异常时关键词路径仍返回 200
 - [ ] AC11：缺 `query` 字段 → 422（**当前无测试**）
 
 ## 7. 现有测试覆盖与盲区
 
-- **已覆盖**（`backend/tests/test_search.py`，全部经 monkeypatch 桩化 `get_vector_store` → `available()=False`）：
+- **已覆盖**（`backend/tests/test_search.py`，向量库均使用离线桩）：
   - `TestSanitizeFtsQuery`（8 用例，服务层契约，见 retrieval.md 第 7 节）
-  - `TestSearchApi`：AC1（10 个注入特征参数化用例）、AC2、AC3、AC4、AC5
+  - `TestSearchApi`：AC1（10 个注入特征参数化用例）、AC2、AC3、AC4、AC5，以及 `available()` / `search()` 两阶段异常关键词降级
+  - `TestKeywordSearchFilters` / `TestBuildWhere`：关键词与 Chroma 组合限制条件、未知条件 fail-closed
 - **盲区**（端点层；服务层盲区见 retrieval.md 第 7 节，不重复）：
-  - **高**：`_build_where` 组合过滤 → 500 的缺陷路径（AC10）无测试暴露——路由层无兜底这一行为无任何用例固化
   - **中**：双开关皆 false、`top_k` 回落（AC6/AC7）无测试
   - **中**：语义可用桩下的路径全无——`source="semantic"`、单开不去重、双开 RRF 融合后 `source="hybrid"`、语义降级误标 hybrid（AC8/AC9）均无测试（现有桩恒不可用）
   - **低**：缺 `query` 的 422、`filters` 未识别键忽略、尾斜杠 307 重定向，无测试
@@ -128,5 +127,5 @@
 - **管线函数放路由层而非服务层**：`_sanitize_fts_query` / `_keyword_search` / `_reciprocal_rank_fusion` 位于 `routers/search.py`（唯一天然消费点），宪法第 11 条安全闸紧贴输入边界；retrieval.md 将它们纳入服务侧规格只为构成完整检索契约，物理位置不变。
 - **双开时 `source` 无条件覆写 `hybrid`**：实现简单（融合后统一打标），代价是语义降级时关键词结果被误标；前端仅用 `source` 做展示徽标，无逻辑分支，误标无害，故保留现状并在 AC9 固化。
 - **各取 `top_k*2` 再融合截 `top_k`**：为 RRF 预留候选池，与 `VectorStore.search` 内部的 `max(top_k*2, 20)` 超量取回叠加（服务层决策，见 retrieval.md 第 8 节）。
-- **关键词路吞异常、语义路不吞**：关键词路（FTS5）是兜底链路，必须永不 500；语义路异常（含组合过滤缺陷）选择冒泡 500 而非静默降级——**这并非有意设计而是缺陷未修**（retrieval.md 3.5 已实证），修复前以 AC10 固化现有行为，修复时同步修订本规格与 retrieval.md。
+- **两路独立降级**：FTS 与语义适配器任一路异常都只清空自身候选；双开时保留另一分支，避免局部基础设施故障拖垮论文发现页。异常只写服务日志，不进入响应。
 - **单开路径不做论文级去重**：单开语义时直接展示 chunk 级结果（含页码），服务「定位片段」场景；双开才折叠为论文级。两路径粒度不一致是刻意取舍。

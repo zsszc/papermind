@@ -165,7 +165,7 @@
 ### 3.11 `deep_review()`（`POST /api/chat/deep-review`，Phase F 新增）
 
 - **输入**：`DeepReviewRequest`（`topic: str` 必填，`conversation_id: int | None` 可选）
-- **行为**：长任务综述链路——`plan(topic)` 拆子问题（SSE 首帧 `{type:"plan", questions:[...]}`，**新增 plan 事件类型**）→ 逐子问题 `execute` → `synthesize` 汇总，正文经 `{delta}` 增量帧流出 → `{finished, citations}` 收尾；服务层经 `importlib` 延迟导入 `services/deep_review.py`（解耦加载时序）
+- **行为**：长任务综述链路——`plan(topic)` 拆子问题（SSE 首帧 `{type:"plan", questions:[...]}`，**新增 plan 事件类型**）→ 逐子问题 `execute(q, db=db)` 经生产共享 hybrid 检索 → `synthesize` 汇总，正文经 `{delta}` 增量帧流出 → `{finished, citations}` 收尾；服务层经 `importlib` 延迟导入 `services/deep_review.py`（解耦加载时序）
 - **SSE 帧序列**：plan 帧在先 → 多个 delta → finished（含 citations）；plan 失败 → 单个脱敏 `{error}` 帧（异常原文不透出）
 - **Guardrails 复用**：落库前同样过 `verify_citations`（越界 `[^n^]` 剔除 + `verified/removed` 标记）；**citations 仅本地 chunk**（外部来源过滤，不进帧不落库）；子问题失败降级为「该子问题检索不足」段落标记，不阻塞整体
 - **异常**：404（conversation 不存在）/ 422（topic 缺失）走 FastAPI 默认

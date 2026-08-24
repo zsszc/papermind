@@ -42,7 +42,7 @@ PaperMind 的语义检索依赖本地向量模型，本模块承担两件基础�
 
 - **输入**：`chunk_size` 单块字符数上限（组块阈值）；`chunk_overlap` 相邻块间保留的重叠字符数上限
 - **输出**：`TextChunker` 实例；无全局状态
-- **注意**：`config.yaml(.example)` 中虽有 `embedding.chunk_size` / `embedding.chunk_overlap` 配置项，但本类**不读取配置**，默认值硬编码为 512/50；当前唯一消费者 `processor.py` 以无参方式实例化，即配置项实际不生效。
+- **配置**：未显式传参时读取 `embedding.chunk_size` / `embedding.chunk_overlap`，非法或非正值分别回退 512/50；当前 `processor.py` 以无参方式实例化，因此运行配置已生效。
 
 ### 3.2 `TextChunker.chunk_pages(self, pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]`
 

@@ -24,7 +24,7 @@
 
 ```
 plan(topic, n_papers?) -> List[SubQuestion]     # LLM 拆 3-5 个子问题
-execute(sub_question) -> SubAnswer              # 现有 retrieve + llm 生成，带本地引用
+execute(sub_question, db=...) -> SubAnswer      # 共享 RetrievalPipeline + LLM，带本地引用
 synthesize(topic, sub_answers) -> Review        # LLM 汇总：引言/分节/结论，保留 [^n^] 引用
 ```
 
@@ -42,7 +42,7 @@ synthesize(topic, sub_answers) -> Review        # LLM 汇总：引言/分节/结
 ### 3.3 测试计划（全程 mock LLM，Moonshot 冻结不影响）
 
 - plan 拆分：mock LLM 返回固定子问题列表 → 断言解析结构
-- 子问题执行：mock retrieve + llm → 断言每子问题独立检索与引用传递
+- 子问题执行：mock 共享 hybrid + llm → 断言每子问题独立检索、关键词降级与引用传递
 - 汇总：断言结构化输出与引用保留
 - 降级：单子问题失败 / plan 失败两条路径
 - API：TestClient 流式帧序列断言（含 plan 事件）

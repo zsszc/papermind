@@ -1,4 +1,4 @@
-# 检索服务规格（Batch 20 当前实现）
+# 检索服务规格（Batch 22B 当前实现）
 
 > 适用文件：`app/services/retrieval.py`、`app/services/retrieval_pipeline.py`、
 > `app/routers/search.py`。最后核对：2026-08-24。
@@ -6,11 +6,11 @@
 ## 1. 分层边界
 
 - `VectorStore` 是低层 BGE-M3/Chroma 适配器，只负责向量增删查、rerank 和 60 秒语义缓存。
-- `RetrievalPipeline` 是聊天与 eval 共用的 chunk 级管线，负责 semantic、轻量 BM25、
+- `RetrievalPipeline` 是聊天、重新生成、深度综述、论文引用推荐与 eval 共用的 chunk 级管线，负责 semantic、轻量 BM25、
   bilingual expansion、chunk-id RRF、filters 和降级诊断。
 - `/api/search` 是论文级搜索适配器：语义 chunk + `papers_fts` title/authors/abstract，
   按 paper_id RRF。它与 RAG 的 chunk 证据检索不是同一返回粒度。
-- `thesis`、`deep_review` 仍是 VectorStore 直接消费者，计划在后续批次迁移。
+- graph expansion 是共享管线后的可选增强；显式 `paper_id` 范围下必须跳过，禁止扩展到其他论文。
 
 ## 2. VectorStore 契约
 
@@ -91,7 +91,8 @@ diagnostics 固定包含：
 - FTS MATCH 查询必须先清洗并用绑定参数执行；特殊字符不能成为 FTS 语法。
 - 关键词路应用与语义路相同的 paper_id/year filters。
 - 路由不得原地修改 VectorStore 返回对象；语义/Hybrid source 用新字典生成。
-- 语义与关键词双开时按 paper_id RRF；单开时返回对应分支；模型不可用时安全退为关键词。
+- 语义与关键词双开时按 paper_id RRF；单开时返回对应分支；模型不可用、状态检查异常或
+  查询异常时安全退为关键词，不能让仍可用的 FTS 路径返回 500。
 
 ## 5. 配置
 
@@ -111,5 +112,6 @@ retrieval:
 - `test_retrieval_pipeline.py`：融合、双路过滤、降级、复制隔离。
 - `test_retrieval_pipeline_parity.py`：聊天与 eval chunk ID/顺序逐项一致。
 - `test_cache_invalidation.py`：缓存失效与可变对象隔离。
-- `test_search.py`：FTS 安全、filters、Chroma where fail-closed。
+- `test_search.py`：FTS 安全、filters、Chroma where fail-closed、语义异常关键词降级。
 - `test_agent_graph.py` / `test_chat.py`：生产接线、重新生成与引用下游兼容。
+- `test_deep_review.py` / `test_routes_sanitize.py`：旁路共享 profile、关键词降级与零证据拒绝生成。
