@@ -185,6 +185,24 @@ def test_train_selector_requires_baseline_parity_and_selects_lexicographically()
     assert result["passed"] is True
 
 
+def test_baseline_parity_can_emit_a_stop_artifact_before_running_grid():
+    module = _selector()
+    production = _production_report()
+    baseline = _report(1.0)
+    passed = module.evaluate_weighted_baseline_parity(production, baseline)
+    assert passed["passed"] is True
+    assert passed["matched_queries"] == 24
+
+    baseline["items"][0]["retrieved_ids"] = ["p9_c9"]
+    failed = module.evaluate_weighted_baseline_parity(production, baseline)
+    assert failed == {
+        "gate_version": "weighted-rrf-baseline-parity-v1",
+        "passed": False,
+        "matched_queries": 23,
+        "total_queries": 24,
+    }
+
+
 def test_train_selector_fails_closed_on_parity_grid_and_degradation():
     module = _selector()
     production = _production_report()
