@@ -85,6 +85,10 @@ class ParentMappingError(ValueError):
         self.reason = reason
 
 
+class WeightedRRFError(ValueError):
+    """Weighted-RRF 输入或冻结参数不满足候选契约。"""
+
+
 def tokenize_technical_terms(text: str) -> List[str]:
     """提取 ASCII 技术锚点，保留连字符、小数、科学计数法和百分号。"""
     return [token.lower() for token in _TECHNICAL_TOKEN_RE.findall(text or "")]
@@ -439,6 +443,70 @@ def rrf_fuse_chunks(
     return [copy.deepcopy(metas[cid]) for cid in ordered[:top_k]]
 
 
+def weighted_rrf_fuse_chunks(
+    semantic_results: List[Dict[str, Any]],
+    keyword_results: List[Dict[str, Any]],
+    top_k: int,
+    *,
+    semantic_weight: float = 1.0,
+    keyword_weight: float = 1.0,
+    k: int = 60,
+) -> List[Dict[str, Any]]:
+    """严格去重且稳定排序的 Weighted-RRF；不改变历史等权函数。"""
+    if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k < 0:
+        raise WeightedRRFError("top_k 必须是非负整数")
+    if top_k == 0:
+        return []
+    if not isinstance(k, int) or isinstance(k, bool) or k <= 0:
+        raise WeightedRRFError("k 必须是正整数")
+    for name, value in (
+        ("semantic_weight", semantic_weight),
+        ("keyword_weight", keyword_weight),
+    ):
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+            or float(value) <= 0
+        ):
+            raise WeightedRRFError(f"{name} 必须是有限正数")
+
+    scores: Dict[str, float] = {}
+    metas: Dict[str, Dict[str, Any]] = {}
+
+    def canonical_id(item: Dict[str, Any]) -> str:
+        chunk_id = item.get("chunk_id")
+        match = _CHUNK_ID_FULL_RE.fullmatch(str(chunk_id or ""))
+        if match is None:
+            raise WeightedRRFError("chunk_id 必须是 canonical pN_cN")
+        paper_id, chunk_index = (int(value) for value in match.groups())
+        canonical = f"p{paper_id}_c{chunk_index}"
+        if paper_id <= 0 or chunk_index < -1 or canonical != chunk_id:
+            raise WeightedRRFError("chunk_id 必须是 canonical pN_cN")
+        return canonical
+
+    def add_route(results: List[Dict[str, Any]], weight: float) -> None:
+        unique: list[tuple[str, Dict[str, Any]]] = []
+        seen: set[str] = set()
+        for item in results:
+            chunk_id = canonical_id(item)
+            if chunk_id in seen:
+                continue
+            seen.add(chunk_id)
+            unique.append((chunk_id, item))
+        for rank, (chunk_id, item) in enumerate(unique, start=1):
+            scores[chunk_id] = (
+                scores.get(chunk_id, 0.0) + float(weight) / (k + rank)
+            )
+            # semantic 路先执行，固定为跨路 metadata 优先来源。
+            metas.setdefault(chunk_id, copy.deepcopy(item))
+
+    add_route(semantic_results, semantic_weight)
+    add_route(keyword_results, keyword_weight)
+    ordered = sorted(scores, key=lambda chunk_id: (-scores[chunk_id], chunk_id))
+    return [copy.deepcopy(metas[chunk_id]) for chunk_id in ordered[:top_k]]
+
+
 def parent_child_fuse_chunks(
     semantic_results: List[Dict[str, Any]],
     keyword_results: List[Dict[str, Any]],
@@ -579,6 +647,7 @@ class RetrievalPipeline:
         rerank: Optional[bool] = None,
         diagnostics: Optional[Dict[str, Any]] = None,
         rerank_diagnostics: Optional[Dict[str, Any]] = None,
+        rrf_lexical_weight: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         filters = dict(filters or {})
         requested_profile = profile
@@ -588,14 +657,17 @@ class RetrievalPipeline:
             lexical_profile = "bm25-bilingual"
         if profile not in {
             "semantic", "hybrid", "hybrid-local-neighbor",
-            "parent-child-v1", "keyword"
+            "parent-child-v1", "weighted-rrf-v1", "keyword"
         }:
             raise ValueError(f"不支持的检索 profile: {requested_profile}")
+        if profile != "weighted-rrf-v1" and rrf_lexical_weight is not None:
+            raise ValueError("rrf_lexical_weight 仅适用于 weighted-rrf-v1")
 
         keyword_results: List[Dict[str, Any]] = []
         keyword_error = False
         if profile in {
-            "hybrid", "hybrid-local-neighbor", "parent-child-v1", "keyword"
+            "hybrid", "hybrid-local-neighbor", "parent-child-v1",
+            "weighted-rrf-v1", "keyword"
         }:
             try:
                 keyword_results = keyword_chunk_search(
@@ -673,6 +745,43 @@ class RetrievalPipeline:
                 reason=semantic_reason,
             )
             return copy.deepcopy(semantic_results[:top_k])
+
+        if profile == "weighted-rrf-v1":
+            if semantic_reason is not None:
+                self._write_diagnostics(
+                    diagnostics, requested_profile, "empty",
+                    degraded=True, reason=semantic_reason,
+                )
+                return []
+            if keyword_error:
+                self._write_diagnostics(
+                    diagnostics, requested_profile, "empty",
+                    degraded=True, reason="keyword_search_failed",
+                )
+                return []
+            try:
+                results = weighted_rrf_fuse_chunks(
+                    semantic_results,
+                    keyword_results,
+                    top_k,
+                    semantic_weight=1.0,
+                    keyword_weight=rrf_lexical_weight,
+                )
+            except WeightedRRFError as exc:
+                logger.warning(
+                    "[retrieval_pipeline] Weighted-RRF 融合失败: "
+                    f"{type(exc).__name__}"
+                )
+                self._write_diagnostics(
+                    diagnostics, requested_profile, "empty",
+                    degraded=True, reason="weighted_rrf_contract_invalid",
+                )
+                return []
+            self._write_diagnostics(
+                diagnostics, requested_profile, "weighted-rrf-v1",
+                degraded=False, reason=None,
+            )
+            return results
 
         if profile == "parent-child-v1":
             if semantic_reason is not None:
