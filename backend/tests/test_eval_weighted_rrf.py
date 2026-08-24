@@ -10,6 +10,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.database import Base
 from app.models import Chunk, Paper
+from eval.deterministic_vector_snapshot import _config_sha256
 from eval import run
 
 
@@ -136,6 +137,7 @@ def _report(
     contract = run.weighted_rrf_contract_metadata(
         weight, profile=contract_profile
     )
+    hnsw_sha = _config_sha256(464)
     items = [
         {
             "qa_id": f"q{index:02d}",
@@ -154,7 +156,7 @@ def _report(
             "resolver_version": "page-span-v2",
             "vector_manifest_sha256": "e" * 64,
             "weighted_rrf_formula_sha256": contract["formula_sha256"],
-            "hnsw_config_sha256": "1" * 64,
+            "hnsw_config_sha256": hnsw_sha,
         },
         "pipeline": {
             "profile": profile,
@@ -177,7 +179,7 @@ def _report(
                 "vector_manifest_sha256": "e" * 64,
                 "hnsw_num_threads": 1,
                 "hnsw_search_ef": 464,
-                "hnsw_config_sha256": "1" * 64,
+                "hnsw_config_sha256": hnsw_sha,
             },
         },
         "overall": {

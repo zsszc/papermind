@@ -679,6 +679,21 @@ def _audit_vector_snapshot(db, store) -> Dict[str, Any]:
         digest.update(b"\0")
         for value in embedding:
             digest.update(struct.pack("<f", float(value)))
+    metadata = dict(getattr(store.collection, "metadata", {}) or {})
+    hnsw_num_threads = metadata.get("hnsw:num_threads")
+    hnsw_search_ef = metadata.get("hnsw:search_ef")
+    hnsw_payload = {
+        "version": "deterministic-hnsw-v1",
+        "hnsw_num_threads": hnsw_num_threads,
+        "hnsw_search_ef": hnsw_search_ef,
+        "vector_count": len(vector_ids),
+    }
+    hnsw_sha = _sha256_bytes(json.dumps(
+        hnsw_payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8"))
     return {
         "database_chunk_count": len(database_ids),
         "vector_count": len(vector_ids),
@@ -686,6 +701,9 @@ def _audit_vector_snapshot(db, store) -> Dict[str, Any]:
         "extra_vector_ids": len(extra),
         "embedding_dimension": next(iter(dimensions)),
         "vector_manifest_sha256": digest.hexdigest(),
+        "hnsw_num_threads": hnsw_num_threads,
+        "hnsw_search_ef": hnsw_search_ef,
+        "hnsw_config_sha256": hnsw_sha,
     }
 
 
@@ -1148,6 +1166,9 @@ def run_eval(args: argparse.Namespace) -> int:
             benchmark["vector_manifest_sha256"] = (
                 vector_audit["vector_manifest_sha256"]
             )
+            benchmark["hnsw_config_sha256"] = (
+                vector_audit["hnsw_config_sha256"]
+            )
         if args.retrieval_profile == "parent-child-v1":
             if retriever._store is None:
                 print("[eval] Parent-Child 向量快照不可用", file=sys.stderr)
@@ -1341,6 +1362,7 @@ def run_eval(args: argparse.Namespace) -> int:
             benchmark.get("parent_manifest_sha256", "none"),
             benchmark.get("parent_child_contract_sha256", "none"),
             benchmark.get("vector_manifest_sha256", "none"),
+            benchmark.get("hnsw_config_sha256", "none"),
             benchmark.get("weighted_rrf_formula_sha256", "none"),
             str(args.top_k),
         ))

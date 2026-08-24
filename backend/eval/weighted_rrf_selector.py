@@ -18,6 +18,7 @@ _COMMON_BENCHMARK_FIELDS = (
     "page_text_manifest_sha256",
     "resolver_version",
     "vector_manifest_sha256",
+    "hnsw_config_sha256",
     "weighted_rrf_formula_sha256",
 )
 _WEIGHTED_PROFILES = {
@@ -105,6 +106,18 @@ def _validate_complete_report(
         != (report.get("benchmark") or {}).get("vector_manifest_sha256")
     ):
         raise ValueError("报告向量快照审计不完整")
+    if weighted_profile == "weighted-rrf-compat-v1":
+        from eval.deterministic_vector_snapshot import _config_sha256
+
+        expected_hnsw_sha = _config_sha256(snapshot["vector_count"])
+        if (
+            snapshot.get("hnsw_num_threads") != 1
+            or snapshot.get("hnsw_search_ef") != snapshot["vector_count"]
+            or snapshot.get("hnsw_config_sha256") != expected_hnsw_sha
+            or (report.get("benchmark") or {}).get("hnsw_config_sha256")
+            != expected_hnsw_sha
+        ):
+            raise ValueError("报告未使用冻结的确定性 HNSW 契约")
 
     items = report.get("items") or []
     qa_ids = [item.get("qa_id") for item in items]
@@ -192,6 +205,7 @@ def _selection_binding(report: dict[str, Any]) -> dict[str, Any]:
         "corpus_manifest_sha256": benchmark.get("corpus_manifest_sha256"),
         "page_text_manifest_sha256": benchmark.get("page_text_manifest_sha256"),
         "vector_manifest_sha256": benchmark.get("vector_manifest_sha256"),
+        "hnsw_config_sha256": benchmark.get("hnsw_config_sha256"),
         "resolver_version": benchmark.get("resolver_version"),
         "profile": pipeline.get("profile"),
         "lexical_profile": pipeline.get("lexical_profile"),
@@ -229,6 +243,7 @@ def evaluate_weighted_baseline_parity(
         "dataset_sha256", "qrels_sha256", "corpus_manifest_sha256",
         "page_text_manifest_sha256", "resolver_version",
         "vector_manifest_sha256",
+        "hnsw_config_sha256",
     ):
         if (
             production_common["benchmark"].get(key)
@@ -362,6 +377,7 @@ def select_weighted_rrf_train(
         "dataset_sha256", "qrels_sha256", "corpus_manifest_sha256",
         "page_text_manifest_sha256", "resolver_version",
         "vector_manifest_sha256",
+        "hnsw_config_sha256",
     ):
         if production_common["benchmark"].get(key) != common["benchmark"].get(key):
             raise ValueError("生产 baseline 与 Weighted-RRF 快照指纹不一致")
