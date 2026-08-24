@@ -122,3 +122,38 @@ class TestChunkerHardLimit:
         assert len(chunks) == 13
         assert all(0 < len(item["content"]) <= 8 for item in chunks)
         assert chunks[-1]["content"] == "z" * 8
+
+
+class TestChunkerPageOffsets:
+    """Batch 22D：正文 chunk 必须保留原始页文本半开坐标。"""
+
+    def test_grouped_paragraph_has_page_envelope(self):
+        text = "  first paragraph  \n\n   second paragraph   "
+        chunks = TextChunker(chunk_size=100, chunk_overlap=0).chunk_pages([{
+            "page_number": 4,
+            "text": text,
+        }])
+
+        assert chunks == [{
+            "content": "first paragraph\n\nsecond paragraph",
+            "page_number": 4,
+            "page_start": text.index("first"),
+            "page_end": text.index("paragraph", text.index("second")) + len("paragraph"),
+            "chunk_type": "paragraph",
+            "token_count": len("first paragraph\n\nsecond paragraph"),
+        }]
+
+    def test_hard_split_overlap_offsets_match_original_text(self):
+        text = "abcdefghijklmnopqrstuvwxyz"
+        chunks = TextChunker(chunk_size=10, chunk_overlap=3).chunk_pages([{
+            "page_number": 2,
+            "text": text,
+        }])
+
+        assert [(row["page_start"], row["page_end"]) for row in chunks] == [
+            (0, 10), (7, 17), (14, 24), (21, 26),
+        ]
+        assert all(
+            row["content"] == text[row["page_start"]:row["page_end"]]
+            for row in chunks
+        )
