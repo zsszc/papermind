@@ -1,0 +1,373 @@
+"""聊天与评测共享的 chunk 级检索管线。
+
+``VectorStore`` 保持为向量基础设施适配器；本模块统一负责轻量 BM25、
+可审计中英术语扩展、chunk-id RRF、过滤和运行期降级诊断。生产聊天允许
+在语义不可用时以相同范围的关键词结果继续工作；评测读取 diagnostics 后
+fail-close，不能把降级结果记成有效 Hybrid 指标。
+"""
+
+from __future__ import annotations
+
+import copy
+import math
+import re
+from collections import Counter
+from typing import Any, Dict, List, Optional
+
+from sqlalchemy.orm import Session
+
+from app.core.logger import logger
+from app.models import Chunk, Paper
+
+
+_TECHNICAL_TOKEN_RE = re.compile(r"[A-Za-z0-9]+(?:[.\-][A-Za-z0-9]+)*%?")
+
+# 真实问题以中文为主、论文正文以英文为主。这里只扩展有限且可审计的领域术语，
+# 不进行猜测式整句翻译；本表原样迁移自 Batch 17 已验证 profile。
+_BILINGUAL_TERM_MAP = (
+    ("多实例学习", ("multiple", "instance", "learning", "mil")),
+    ("全切片", ("whole", "slide", "image", "wsi")),
+    ("生存预测", ("survival", "prediction")),
+    ("交叉验证", ("cross-validation",)),
+    ("外部测试集", ("external", "test", "set")),
+    ("可解释性", ("interpretability", "interpretable")),
+    ("消融实验", ("ablation",)),
+    ("原型", ("prototype",)),
+    ("分类", ("classification",)),
+    ("推理", ("inference",)),
+    ("数据集", ("dataset",)),
+    ("准确率", ("accuracy",)),
+    ("阈值", ("threshold",)),
+    ("队列", ("cohort",)),
+    ("病例", ("cases", "patients")),
+    ("筛选", ("filter", "filtering")),
+    ("临床", ("clinical",)),
+    ("聚类", ("cluster", "clustering")),
+    ("跨区域", ("cross-region", "inter-region")),
+    ("组织", ("tissue",)),
+    ("语义", ("semantic",)),
+    ("模块", ("module",)),
+    ("专家", ("expert",)),
+    ("样本", ("sample",)),
+    ("两阶段", ("two-stage",)),
+    ("训练", ("training",)),
+    ("验证", ("validation",)),
+    ("实验", ("experiment",)),
+    ("表现", ("performance",)),
+    ("指标", ("metric",)),
+)
+
+
+def tokenize_technical_terms(text: str) -> List[str]:
+    """提取 ASCII 技术锚点，保留连字符、小数、科学计数法和百分号。"""
+    return [token.lower() for token in _TECHNICAL_TOKEN_RE.findall(text or "")]
+
+
+def query_technical_terms(text: str, *, bilingual: bool = False) -> List[str]:
+    """提取查询锚点，可选扩展显式中英领域术语。"""
+    tokens = tokenize_technical_terms(text)
+    if bilingual:
+        for chinese, english_terms in _BILINGUAL_TERM_MAP:
+            if chinese in (text or ""):
+                tokens.extend(english_terms)
+    return list(dict.fromkeys(tokens))
+
+
+def _filtered_chunk_rows(db: Session, filters: Optional[Dict[str, Any]]):
+    filters = filters or {}
+    supported = {"paper_id", "year_gte", "year_lte"}
+    unknown = sorted(set(filters) - supported)
+    if unknown:
+        raise ValueError(f"不支持的检索过滤条件: {', '.join(unknown)}")
+
+    query = db.query(Chunk, Paper).join(Paper, Paper.id == Chunk.paper_id)
+    if "paper_id" in filters:
+        query = query.filter(Chunk.paper_id == filters["paper_id"])
+    if "year_gte" in filters:
+        query = query.filter(Paper.year >= filters["year_gte"])
+    if "year_lte" in filters:
+        query = query.filter(Paper.year <= filters["year_lte"])
+    return query.order_by(Chunk.paper_id, Chunk.chunk_index).all()
+
+
+def bm25_chunk_search(
+    db: Session,
+    query: str,
+    limit: Optional[int] = 20,
+    *,
+    bilingual: bool = False,
+    filters: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """以技术锚点对 chunk 内容执行轻量 BM25。"""
+    query_tokens = query_technical_terms(query, bilingual=bilingual)
+    if not query_tokens:
+        return []
+
+    rows = _filtered_chunk_rows(db, filters)
+    if not rows:
+        return []
+    tokenized = [tokenize_technical_terms(chunk.content or "") for chunk, _ in rows]
+    lengths = [len(tokens) for tokens in tokenized]
+    avg_length = sum(lengths) / len(lengths) if lengths else 0.0
+    if avg_length <= 0.0:
+        return []
+
+    doc_freq = {
+        token: sum(1 for tokens in tokenized if token in set(tokens))
+        for token in query_tokens
+    }
+    n_docs = len(rows)
+    k1 = 1.2
+    b = 0.9
+    scored: List[Dict[str, Any]] = []
+    for (chunk, paper), tokens, doc_length in zip(rows, tokenized, lengths):
+        counts = Counter(tokens)
+        score = 0.0
+        for token in query_tokens:
+            tf = counts.get(token, 0)
+            if tf == 0:
+                continue
+            df = doc_freq[token]
+            idf = math.log(1.0 + (n_docs - df + 0.5) / (df + 0.5))
+            length_norm = 1.0 - b + b * doc_length / avg_length
+            score += idf * (tf * (k1 + 1.0)) / (tf + k1 * length_norm)
+        if score <= 0.0:
+            continue
+        scored.append({
+            "chunk_id": f"p{chunk.paper_id}_c{chunk.chunk_index}",
+            "paper_id": chunk.paper_id,
+            "title": paper.title,
+            "authors": paper.authors,
+            "year": paper.year,
+            "content": chunk.content or "",
+            "page_number": chunk.page_number,
+            "chunk_type": chunk.chunk_type,
+            "score": score,
+            "source": "keyword-bm25-bilingual" if bilingual else "keyword-bm25",
+        })
+    scored.sort(key=lambda item: (-item["score"], item["chunk_id"]))
+    return scored if limit is None else scored[:limit]
+
+
+def keyword_chunk_search(
+    db: Session,
+    query: str,
+    limit: int = 20,
+    *,
+    lexical_profile: str = "count",
+    filters: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """按显式 profile 执行 chunk 级词法检索。"""
+    if lexical_profile in {"bm25", "bm25-bilingual"}:
+        return bm25_chunk_search(
+            db,
+            query,
+            limit,
+            bilingual=lexical_profile == "bm25-bilingual",
+            filters=filters,
+        )
+    if lexical_profile != "count":
+        raise ValueError(f"不支持的词法检索 profile: {lexical_profile}")
+
+    tokens = [token for token in re.split(r"\s+", query.strip()) if token]
+    if not tokens:
+        return []
+    scored: List[Dict[str, Any]] = []
+    for chunk, paper in _filtered_chunk_rows(db, filters):
+        content = chunk.content or ""
+        lowered = content.lower()
+        score = sum(lowered.count(token.lower()) for token in tokens)
+        if score <= 0:
+            continue
+        scored.append({
+            "chunk_id": f"p{chunk.paper_id}_c{chunk.chunk_index}",
+            "paper_id": chunk.paper_id,
+            "title": paper.title,
+            "authors": paper.authors,
+            "year": paper.year,
+            "content": content,
+            "page_number": chunk.page_number,
+            "chunk_type": chunk.chunk_type,
+            "score": float(score),
+            "source": "keyword",
+        })
+    scored.sort(key=lambda item: (-item["score"], item["chunk_id"]))
+    return scored[:limit]
+
+
+def rrf_fuse_chunks(
+    semantic_results: List[Dict[str, Any]],
+    keyword_results: List[Dict[str, Any]],
+    top_k: int,
+    *,
+    k: int = 60,
+) -> List[Dict[str, Any]]:
+    """按 chunk_id 去重的稳定 RRF；不修改任一路输入。"""
+    scores: Dict[str, float] = {}
+    metas: Dict[str, Dict[str, Any]] = {}
+    order: Dict[str, int] = {}
+
+    def _add(results: List[Dict[str, Any]]) -> None:
+        for rank, item in enumerate(results):
+            chunk_id = item.get("chunk_id")
+            if chunk_id is None:
+                continue
+            scores[chunk_id] = scores.get(chunk_id, 0.0) + 1.0 / (k + rank + 1)
+            if chunk_id not in metas:
+                order[chunk_id] = len(order)
+                metas[chunk_id] = copy.deepcopy(item)
+
+    _add(semantic_results)
+    _add(keyword_results)
+    ordered = sorted(scores, key=lambda cid: (-scores[cid], order[cid], cid))
+    return [dict(metas[cid], source="hybrid") for cid in ordered[:top_k]]
+
+
+class RetrievalPipeline:
+    """共享检索入口；生产降级、评测通过 diagnostics 决定是否接受。"""
+
+    def __init__(self, db: Session, *, vector_store=None):
+        self.db = db
+        self.vector_store = vector_store
+
+    def _store(self):
+        if self.vector_store is None:
+            from app.services.retrieval import get_vector_store
+
+            self.vector_store = get_vector_store()
+        return self.vector_store
+
+    @staticmethod
+    def _write_diagnostics(
+        target: Optional[Dict[str, Any]],
+        requested: str,
+        effective: str,
+        *,
+        degraded: bool,
+        reason: Optional[str],
+    ) -> None:
+        if target is not None:
+            target.clear()
+            target.update({
+                "requested_profile": requested,
+                "effective_profile": effective,
+                "degraded": degraded,
+                "reason": reason,
+            })
+
+    def search(
+        self,
+        query: str,
+        *,
+        top_k: int = 5,
+        filters: Optional[Dict[str, Any]] = None,
+        profile: str = "semantic",
+        lexical_profile: str = "bm25-bilingual",
+        rerank: Optional[bool] = None,
+        diagnostics: Optional[Dict[str, Any]] = None,
+        rerank_diagnostics: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        filters = dict(filters or {})
+        requested_profile = profile
+        if profile == "hybrid-bilingual":
+            # RED 测试与早期实验名的兼容别名；正式配置使用 profile=hybrid。
+            profile = "hybrid"
+            lexical_profile = "bm25-bilingual"
+        if profile not in {"semantic", "hybrid", "keyword"}:
+            raise ValueError(f"不支持的检索 profile: {requested_profile}")
+
+        keyword_results: List[Dict[str, Any]] = []
+        keyword_error = False
+        if profile in {"hybrid", "keyword"}:
+            try:
+                keyword_results = keyword_chunk_search(
+                    self.db,
+                    query,
+                    top_k * 2,
+                    lexical_profile=lexical_profile,
+                    filters=filters,
+                )
+            except Exception as exc:
+                keyword_error = True
+                logger.warning(
+                    f"[retrieval_pipeline] 词法检索失败: {type(exc).__name__}"
+                )
+
+        if profile == "keyword":
+            effective = "empty" if keyword_error else "keyword-only"
+            self._write_diagnostics(
+                diagnostics,
+                requested_profile,
+                effective,
+                degraded=keyword_error,
+                reason="keyword_search_failed" if keyword_error else None,
+            )
+            return copy.deepcopy(keyword_results[:top_k])
+
+        semantic_results: List[Dict[str, Any]] = []
+        semantic_reason: Optional[str] = None
+        try:
+            store = self._store()
+            if not store.available():
+                semantic_reason = "semantic_unavailable"
+            else:
+                semantic_results = store.search(
+                    query=query,
+                    top_k=top_k if profile == "semantic" else top_k * 2,
+                    filters=filters,
+                    rerank=rerank,
+                    rerank_diagnostics=(
+                        rerank_diagnostics
+                        if rerank_diagnostics is not None
+                        else {
+                            "requested": bool(rerank),
+                            "effective": False,
+                            "error": None,
+                        }
+                    ),
+                )
+        except Exception as exc:
+            semantic_reason = "semantic_search_failed"
+            logger.warning(
+                f"[retrieval_pipeline] 语义检索失败: {type(exc).__name__}"
+            )
+
+        if profile == "semantic":
+            self._write_diagnostics(
+                diagnostics,
+                requested_profile,
+                "semantic" if semantic_reason is None else "empty",
+                degraded=semantic_reason is not None,
+                reason=semantic_reason,
+            )
+            return copy.deepcopy(semantic_results[:top_k])
+
+        if semantic_reason is not None:
+            effective = "keyword-only" if not keyword_error else "empty"
+            self._write_diagnostics(
+                diagnostics,
+                requested_profile,
+                effective,
+                degraded=True,
+                reason=semantic_reason if not keyword_error else "both_routes_failed",
+            )
+            return copy.deepcopy(keyword_results[:top_k])
+        if keyword_error:
+            self._write_diagnostics(
+                diagnostics,
+                requested_profile,
+                "semantic-only",
+                degraded=True,
+                reason="keyword_search_failed",
+            )
+            return copy.deepcopy(semantic_results[:top_k])
+
+        effective = requested_profile if requested_profile == "hybrid-bilingual" else "hybrid"
+        self._write_diagnostics(
+            diagnostics,
+            requested_profile,
+            effective,
+            degraded=False,
+            reason=None,
+        )
+        return rrf_fuse_chunks(semantic_results, keyword_results, top_k)

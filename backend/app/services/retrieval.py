@@ -1,3 +1,4 @@
+import copy
 import threading
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -118,7 +119,9 @@ class VectorStore:
                     "effective": cached_rerank_effective,
                     "error": None,
                 })
-            return cached_output
+            # 缓存值属于共享状态，调用方（搜索路由/Hybrid 管线）会补写
+            # source 等展示字段；必须返回深拷贝，避免一次请求污染后续命中。
+            return copy.deepcopy(cached_output)
 
         query_embedding = self.embedding_service.embed_query(query)
         n_results = max(top_k * 2, 20)
@@ -170,12 +173,12 @@ class VectorStore:
             cache.set(
                 cache_key,
                 {
-                    "results": output,
+                    "results": copy.deepcopy(output),
                     "rerank_effective": diagnostics["effective"],
                 },
                 ttl=60,
             )
-        return output
+        return copy.deepcopy(output)
 
     @staticmethod
     def _rerank_enabled() -> bool:
@@ -229,9 +232,11 @@ class VectorStore:
 
     @staticmethod
     def _query_with_fallback(collection, query_embedding, n_results, where):
-        """带兜底的向量查询：where 子句被 ChromaDB 拒绝时降级为无过滤检索。
+        """执行向量查询；过滤条件异常时 fail-closed 为空结果。
 
-        防 500 契约：过滤条件异常不得冒泡为接口错误，退化为无过滤结果并记日志。
+        限制性过滤代表用户明确指定的检索范围。ChromaDB 拒绝 ``where`` 时
+        若重试无过滤查询，会把其他论文片段带入定向对话，因此这里只记录告警并
+        返回与 Chroma 响应同构的空结果，交由上层按相同 filters 做词法降级。
         """
         kwargs = dict(
             query_embeddings=[query_embedding],
@@ -241,8 +246,13 @@ class VectorStore:
         try:
             return collection.query(where=where, **kwargs)
         except ValueError:
-            logger.warning(f"[VectorStore] where 子句被拒绝，降级为无过滤检索: {where}")
-            return collection.query(where=None, **kwargs)
+            logger.warning(f"[VectorStore] where 子句被拒绝，限制性查询返回空结果: {where}")
+            return {
+                "ids": [[]],
+                "documents": [[]],
+                "metadatas": [[]],
+                "distances": [[]],
+            }
 
     @staticmethod
     def _build_where(filters: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -253,6 +263,10 @@ class VectorStore:
         """
         if not filters:
             return None
+        supported = {"year_gte", "year_lte", "paper_id"}
+        unknown = sorted(set(filters) - supported)
+        if unknown:
+            raise ValueError(f"不支持的检索过滤条件: {', '.join(unknown)}")
         conditions = []
         if "year_gte" in filters:
             conditions.append({"year": {"$gte": filters["year_gte"]}})

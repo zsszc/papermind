@@ -36,23 +36,45 @@ def _sanitize_fts_query(query: str) -> str:
     return " ".join('"' + token.replace('"', '""') + '"' for token in tokens)
 
 
-def _keyword_search(db: Session, query: str, limit: int = 20) -> List[Dict[str, Any]]:
+def _keyword_search(
+    db: Session,
+    query: str,
+    limit: int = 20,
+    filters: Dict[str, Any] | None = None,
+) -> List[Dict[str, Any]]:
     """基于 SQLite FTS5 的关键词检索，返回论文级别结果。"""
     safe_query = _sanitize_fts_query(query)
     if not safe_query:
         # 清洗后无有效检索词（空输入或纯特殊字符），跳过关键词检索
         return []
+    filters = filters or {}
+    supported = {"year_gte", "year_lte", "paper_id"}
+    unknown = sorted(set(filters) - supported)
+    if unknown:
+        logger.warning(f"[search] 拒绝未知关键词过滤条件: {unknown}")
+        return []
+    clauses = ["papers_fts MATCH :query"]
+    params: Dict[str, Any] = {"query": safe_query, "limit": limit}
+    if "paper_id" in filters:
+        clauses.append("p.id = :paper_id")
+        params["paper_id"] = filters["paper_id"]
+    if "year_gte" in filters:
+        clauses.append("p.year >= :year_gte")
+        params["year_gte"] = filters["year_gte"]
+    if "year_lte" in filters:
+        clauses.append("p.year <= :year_lte")
+        params["year_lte"] = filters["year_lte"]
     try:
         rows = db.execute(
-            text("""
+            text(f"""
                 SELECT p.id, p.title, p.authors, p.year, p.abstract
                 FROM papers_fts fts
                 JOIN papers p ON p.id = fts.rowid
-                WHERE papers_fts MATCH :query
+                WHERE {' AND '.join(clauses)}
                 ORDER BY rank
                 LIMIT :limit
             """),
-            {"query": safe_query, "limit": limit},
+            params,
         ).fetchall()
         return [
             {
@@ -114,17 +136,16 @@ def search(request: SearchRequest, db: Session = Depends(get_db)):
             top_k=top_k * 2,
             filters=filters,
         )
-        for r in semantic_results:
-            r["source"] = "semantic"
+        semantic_results = [dict(r, source="semantic") for r in semantic_results]
 
     if request.use_keyword:
-        keyword_results = _keyword_search(db, request.query, limit=top_k * 2)
+        keyword_results = _keyword_search(
+            db, request.query, limit=top_k * 2, filters=filters
+        )
 
     if request.use_semantic and request.use_keyword:
         fused = _reciprocal_rank_fusion(semantic_results, keyword_results, top_k)
-        for r in fused:
-            r["source"] = "hybrid"
-        results = fused
+        results = [dict(r, source="hybrid") for r in fused]
     else:
         results = (semantic_results + keyword_results)[:top_k]
 
