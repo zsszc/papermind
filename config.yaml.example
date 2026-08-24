@@ -7,9 +7,9 @@ llm:
   provider: "moonshot"
   api_key: "sk-xxxxxxxx"          # 请替换为您的 Kimi API Key
   base_url: "https://api.moonshot.cn/v1"
-  model: "kimi-k2-7"
+  model: "kimi-k2.6"
   max_tokens: 4096
-  temperature: 0.3
+  temperature: 1.0
 
 embedding:
   provider: "local"
@@ -20,7 +20,7 @@ embedding:
 
 retrieval:
   top_k: 10
-  chat_profile: "semantic"          # semantic / hybrid；通过真实 dev Gate 后再切 hybrid
+  chat_profile: "hybrid"            # semantic / hybrid；Batch20 真实 dev Gate 已通过
   lexical_profile: "bm25-bilingual" # hybrid 的 chunk 词法策略
   rerank: false                   # 默认关闭，开启后召回 top-20 经 BGE-Reranker 精排
   rerank_model: "BAAI/bge-reranker-v2-m3"

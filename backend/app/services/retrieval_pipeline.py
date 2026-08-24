@@ -250,6 +250,13 @@ def rrf_fuse_chunks(
     def _add(results: List[Dict[str, Any]]) -> None:
         for rank, item in enumerate(results):
             chunk_id = item.get("chunk_id")
+            if chunk_id is None and _CHUNK_ID_FULL_RE.fullmatch(
+                str(item.get("source", ""))
+            ):
+                # 兼容 Phase 1–3 的旧检索桩/插件结果：当 source 本身就是
+                # p{paper}_c{index} 时可作为 chunk id；普通 "semantic" 等
+                # 来源标签绝不能参与去重。
+                chunk_id = str(item["source"])
             if chunk_id is None:
                 continue
             scores[chunk_id] = scores.get(chunk_id, 0.0) + 1.0 / (k + rank + 1)
@@ -260,7 +267,9 @@ def rrf_fuse_chunks(
     _add(semantic_results)
     _add(keyword_results)
     ordered = sorted(scores, key=lambda cid: (-scores[cid], order[cid], cid))
-    return [dict(metas[cid], source="hybrid") for cid in ordered[:top_k]]
+    # 保留首个命中分支的 source 与元数据，兼容既有聊天引用契约；
+    # 管线级 effective_profile 由 diagnostics 单独表达。
+    return [copy.deepcopy(metas[cid]) for cid in ordered[:top_k]]
 
 
 class RetrievalPipeline:

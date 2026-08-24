@@ -207,7 +207,7 @@ async def regenerate_message(
             query,
             top_k=5,
             filters={},
-            profile=config.get("retrieval.chat_profile", "semantic"),
+            profile=config.get("retrieval.chat_profile", "hybrid"),
             lexical_profile=config.get(
                 "retrieval.lexical_profile", "bm25-bilingual"
             ),

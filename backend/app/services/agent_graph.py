@@ -224,7 +224,7 @@ def retrieve(state: AgentState) -> Dict[str, Any]:
                 state["user_message"],
                 top_k=RETRIEVE_TOP_K,
                 filters=filters,
-                profile=config.get("retrieval.chat_profile", "semantic"),
+                profile=config.get("retrieval.chat_profile", "hybrid"),
                 lexical_profile=config.get(
                     "retrieval.lexical_profile", "bm25-bilingual"
                 ),
