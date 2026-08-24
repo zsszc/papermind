@@ -618,6 +618,73 @@ def _mean(values: List[float]) -> float:
     return sum(values) / len(values) if values else 0.0
 
 
+def _build_quality_gate(
+    *,
+    overall: Dict[str, Any],
+    type_rows: List[Dict[str, Any]],
+    latency: Dict[str, Any],
+    top_k: int,
+    recall_threshold: float,
+    min_mrr: Optional[float] = None,
+    min_ndcg: Optional[float] = None,
+    min_factoid_recall: Optional[float] = None,
+    max_p95_ms: Optional[float] = None,
+    runtime_valid: bool,
+) -> Dict[str, Any]:
+    """构造可审计多指标 Gate；未显式配置的可选指标不进入 checks。"""
+    recall_key = f"recall@{top_k}"
+    ndcg_key = f"ndcg@{top_k}"
+    checks: Dict[str, Dict[str, Any]] = {
+        recall_key: {
+            "actual": overall[recall_key],
+            "threshold": recall_threshold,
+            "operator": ">=",
+            "passed": overall[recall_key] >= recall_threshold,
+        }
+    }
+
+    def _minimum(name: str, actual: Optional[float], threshold: Optional[float]):
+        if threshold is None:
+            return
+        checks[name] = {
+            "actual": actual,
+            "threshold": threshold,
+            "operator": ">=",
+            "passed": actual is not None and actual >= threshold,
+        }
+
+    _minimum("mrr", overall.get("mrr"), min_mrr)
+    _minimum(ndcg_key, overall.get(ndcg_key), min_ndcg)
+    factoid_row = next(
+        (row for row in type_rows if row.get("question_type") == "factoid"),
+        None,
+    )
+    _minimum(
+        "factoid_recall",
+        factoid_row.get("recall") if factoid_row else None,
+        min_factoid_recall,
+    )
+    if max_p95_ms is not None:
+        actual_p95 = latency.get("p95")
+        checks["p95_ms"] = {
+            "actual": actual_p95,
+            "threshold": max_p95_ms,
+            "operator": "<",
+            "passed": actual_p95 is not None and actual_p95 < max_p95_ms,
+        }
+
+    passed = runtime_valid and all(item["passed"] for item in checks.values())
+    # metric/threshold/actual 保留 v2 旧消费者兼容；checks 是 Batch 20 增量。
+    return {
+        "passed": passed,
+        "metric": recall_key,
+        "threshold": recall_threshold,
+        "actual": overall[recall_key],
+        "runtime_valid": runtime_valid,
+        "checks": checks,
+    }
+
+
 def _print_table(rows: List[Dict[str, Any]], k: int) -> None:
     """打印控制台汇总表格（纯文本，不依赖第三方库）。"""
     header = ("question_type", "n", f"recall@{k}", "MRR", f"NDCG@{k}")
@@ -845,9 +912,20 @@ def run_eval(args: argparse.Namespace) -> int:
             str(args.top_k),
         ))
         runtime_valid = retriever.runtime_degraded_count == 0
-        passed = (
-            overall[f"recall@{args.top_k}"] >= args.threshold and runtime_valid
+        latency_summary = latency_stats(retrieval_latencies)
+        gate = _build_quality_gate(
+            overall=overall,
+            type_rows=type_rows,
+            latency=latency_summary,
+            top_k=args.top_k,
+            recall_threshold=args.threshold,
+            min_mrr=args.min_mrr,
+            min_ndcg=args.min_ndcg,
+            min_factoid_recall=args.min_factoid_recall,
+            max_p95_ms=args.max_p95_ms,
+            runtime_valid=runtime_valid,
         )
+        passed = gate["passed"]
         effective_profile = (
             "runtime-degraded" if not runtime_valid else retriever.mode
         )
@@ -875,13 +953,7 @@ def run_eval(args: argparse.Namespace) -> int:
                 "runtime_degraded_count": retriever.runtime_degraded_count,
                 "rerank": retriever.rerank_diagnostics,
             },
-            "gate": {
-                "passed": passed,
-                "metric": f"recall@{args.top_k}",
-                "threshold": args.threshold,
-                "actual": overall[f"recall@{args.top_k}"],
-                "runtime_valid": runtime_valid,
-            },
+            "gate": gate,
             "dataset": Path(args.dataset).name if args.fixture else str(args.dataset),
             "top_k": args.top_k,
             "threshold": args.threshold,
@@ -890,7 +962,7 @@ def run_eval(args: argparse.Namespace) -> int:
             "degrade_reason": retriever.degrade_reason,
             "with_llm": args.with_llm,
             "elapsed_seconds": round(elapsed, 2),
-            "latency": latency_stats(retrieval_latencies),
+            "latency": latency_summary,
             "overall": overall,
             "by_question_type": type_rows,
             "items": per_item,
@@ -988,6 +1060,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--threshold", type=float, default=0.5,
                         help="recall@k 达标阈值，低于则退出码为 1（默认 0.5）")
+    parser.add_argument(
+        "--min-mrr", type=float, default=None,
+        help="可选 MRR 下限；与 recall Gate 同时满足才通过",
+    )
+    parser.add_argument(
+        "--min-ndcg", type=float, default=None,
+        help="可选 NDCG@k 下限；与 recall Gate 同时满足才通过",
+    )
+    parser.add_argument(
+        "--min-factoid-recall", type=float, default=None,
+        help="可选 factoid Recall 下限；数据集无该类型时 fail-close",
+    )
+    parser.add_argument(
+        "--max-p95-ms", type=float, default=None,
+        help="可选检索 P95 严格上限（毫秒）",
+    )
     parser.add_argument("--keyword-only", action="store_true",
                         help="强制仅关键词检索（不加载语义模型，速度快）")
     parser.add_argument(
@@ -1034,6 +1122,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _validate_cli_args(args: argparse.Namespace) -> Optional[str]:
     """返回 CLI 安全契约错误；合法时返回 None。"""
+    for name in ("threshold", "min_mrr", "min_ndcg", "min_factoid_recall"):
+        value = getattr(args, name, None)
+        if value is not None and not 0.0 <= value <= 1.0:
+            return f"--{name.replace('_', '-')} 必须位于 0 到 1"
+    if args.max_p95_ms is not None and args.max_p95_ms <= 0:
+        return "--max-p95-ms 必须为正数"
     if args.fixture and not args.keyword_only:
         return "fixture 评测必须显式使用 --keyword-only"
     if args.fixture and args.with_llm:
