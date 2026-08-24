@@ -24,6 +24,21 @@ class _StubVectorStore:
         return []
 
 
+class _FailingVectorStore:
+    """语义适配器异常桩：锁定发现与查询两个阶段的关键词降级。"""
+
+    def __init__(self, failure_stage: str):
+        self.failure_stage = failure_stage
+
+    def available(self) -> bool:
+        if self.failure_stage == "available":
+            raise RuntimeError("semantic availability failed")
+        return True
+
+    def search(self, **kwargs):
+        raise RuntimeError("semantic search failed")
+
+
 @pytest.fixture(autouse=True)
 def stub_vector_store(monkeypatch):
     """所有检索接口测试都走桩向量库，避免加载模型/访问真实 vector_db。"""
@@ -161,6 +176,26 @@ class TestSearchApi:
         results = resp.json()["results"]
         assert len(results) == 1
         assert results[0]["paper_id"] == paper.id
+
+    @pytest.mark.parametrize("failure_stage", ["available", "search"])
+    def test_hybrid_semantic_exception_falls_back_to_keyword(
+        self, client, paper, monkeypatch, failure_stage
+    ):
+        """语义适配器异常不能把仍可用的论文级关键词检索升级为 500。"""
+        monkeypatch.setattr(
+            "app.routers.search.get_vector_store",
+            lambda: _FailingVectorStore(failure_stage),
+        )
+
+        resp = client.post(
+            "/api/search",
+            json={"query": "colorectal", "use_keyword": True, "use_semantic": True},
+        )
+
+        assert resp.status_code == 200
+        results = resp.json()["results"]
+        assert [item["paper_id"] for item in results] == [paper.id]
+        assert results[0]["source"] == "hybrid"
 
 
 @pytest.fixture()
