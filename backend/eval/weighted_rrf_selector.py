@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import re
 from typing import Any
 
 
@@ -19,6 +20,18 @@ _COMMON_BENCHMARK_FIELDS = (
     "vector_manifest_sha256",
     "weighted_rrf_formula_sha256",
 )
+_WEIGHTED_PROFILES = {
+    "weighted-rrf-v1": {
+        "parity": "weighted-rrf-baseline-parity-v1",
+        "train": "weighted-rrf-train-v1",
+        "dev": "weighted-rrf-dev-v1",
+    },
+    "weighted-rrf-compat-v1": {
+        "parity": "weighted-rrf-compat-baseline-parity-v1",
+        "train": "weighted-rrf-compat-train-v1",
+        "dev": "weighted-rrf-compat-dev-v1",
+    },
+}
 
 
 def _number(block: dict[str, Any], key: str) -> float:
@@ -39,10 +52,16 @@ def _factoid_recall(report: dict[str, Any]) -> float:
 
 
 def _validate_complete_report(
-    report: dict[str, Any], *, split: str, weighted: bool
+    report: dict[str, Any],
+    *,
+    split: str,
+    weighted: bool,
+    weighted_profile: str = "weighted-rrf-v1",
 ) -> None:
     pipeline = report.get("pipeline") or {}
-    expected_profile = "weighted-rrf-v1" if weighted else "hybrid"
+    if weighted_profile not in _WEIGHTED_PROFILES:
+        raise ValueError(f"不支持的 Weighted-RRF profile: {weighted_profile}")
+    expected_profile = weighted_profile if weighted else "hybrid"
     if (
         pipeline.get("profile") != expected_profile
         or pipeline.get("effective_profile") != expected_profile
@@ -58,6 +77,11 @@ def _validate_complete_report(
         raise ValueError("报告必须使用 bm25-bilingual")
     if report.get("with_llm") is not False:
         raise ValueError("Weighted-RRF 报告禁止 LLM")
+    git_sha = (report.get("run") or {}).get("git_sha")
+    if not isinstance(git_sha, str) or re.fullmatch(
+        r"[0-9a-f]{40}|[0-9a-f]{64}", git_sha
+    ) is None:
+        raise ValueError("报告缺少有效 git_sha")
 
     overall = report.get("overall") or {}
     if overall.get("n_positive") != 24 or overall.get("n_negative") != 0:
@@ -109,6 +133,23 @@ def _validate_complete_report(
         )
         if benchmark_formula != contract["formula_sha256"]:
             raise ValueError("Weighted-RRF 公式指纹不一致")
+        from eval.run import weighted_rrf_contract_metadata
+
+        expected_contract = weighted_rrf_contract_metadata(
+            contract["lexical_weight"], profile=weighted_profile
+        )
+        if contract.get("formula_sha256") != expected_contract["formula_sha256"]:
+            raise ValueError("Weighted-RRF 公式指纹不符合冻结代码契约")
+        if (
+            contract.get("configuration_sha256")
+            != expected_contract["configuration_sha256"]
+        ):
+            raise ValueError("Weighted-RRF 配置指纹不符合冻结代码契约")
+        if (
+            weighted_profile == "weighted-rrf-compat-v1"
+            and contract.get("algorithm") != weighted_profile
+        ):
+            raise ValueError(f"报告必须声明 {weighted_profile} 算法")
 
 
 def _common_payload(report: dict[str, Any]) -> dict[str, Any]:
@@ -120,22 +161,65 @@ def _common_payload(report: dict[str, Any]) -> dict[str, Any]:
             key: benchmark.get(key) for key in _COMMON_BENCHMARK_FIELDS
         },
         "pipeline": {
+            "profile": pipeline.get("profile"),
             "lexical_profile": pipeline.get("lexical_profile"),
             "top_k": pipeline.get("top_k"),
             "evidence_resolver": pipeline.get("evidence_resolver"),
             "formula_sha256": (
                 (pipeline.get("weighted_rrf") or {}).get("formula_sha256")
             ),
+            "algorithm": (
+                (pipeline.get("weighted_rrf") or {}).get("algorithm")
+            ),
         },
     }
 
 
+def _report_sha256(report: dict[str, Any]) -> str:
+    payload = json.dumps(
+        report, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _selection_binding(report: dict[str, Any]) -> dict[str, Any]:
+    """返回 train/dev 间必须稳定的快照与算法身份。"""
+    benchmark = report.get("benchmark") or {}
+    pipeline = report.get("pipeline") or {}
+    contract = pipeline.get("weighted_rrf") or {}
+    return {
+        "git_sha": (report.get("run") or {}).get("git_sha"),
+        "corpus_manifest_sha256": benchmark.get("corpus_manifest_sha256"),
+        "page_text_manifest_sha256": benchmark.get("page_text_manifest_sha256"),
+        "vector_manifest_sha256": benchmark.get("vector_manifest_sha256"),
+        "resolver_version": benchmark.get("resolver_version"),
+        "profile": pipeline.get("profile"),
+        "lexical_profile": pipeline.get("lexical_profile"),
+        "top_k": pipeline.get("top_k"),
+        "evidence_resolver": pipeline.get("evidence_resolver"),
+        "algorithm": contract.get("algorithm"),
+        "formula_sha256": contract.get("formula_sha256"),
+    }
+
+
 def evaluate_weighted_baseline_parity(
-    production: dict[str, Any], weighted: dict[str, Any]
+    production: dict[str, Any],
+    weighted: dict[str, Any],
+    *,
+    weighted_profile: str = "weighted-rrf-v1",
 ) -> dict[str, Any]:
     """在运行权重网格前独立验证旧 hybrid 与新等权逐题顺序。"""
-    _validate_complete_report(production, split="train", weighted=False)
-    _validate_complete_report(weighted, split="train", weighted=True)
+    versions = _WEIGHTED_PROFILES.get(weighted_profile)
+    if versions is None:
+        raise ValueError(f"不支持的 Weighted-RRF profile: {weighted_profile}")
+    _validate_complete_report(
+        production, split="train", weighted=False,
+        weighted_profile=weighted_profile,
+    )
+    _validate_complete_report(
+        weighted, split="train", weighted=True,
+        weighted_profile=weighted_profile,
+    )
     weight = weighted["pipeline"]["weighted_rrf"]["lexical_weight"]
     if weight != 1.0:
         raise ValueError("baseline parity 必须使用词法权重 1.0")
@@ -169,11 +253,16 @@ def evaluate_weighted_baseline_parity(
         for qa_id in production_items
     )
     result = {
-        "gate_version": "weighted-rrf-baseline-parity-v1",
+        "gate_version": versions["parity"],
         "passed": matched == len(production_items),
         "matched_queries": matched,
         "total_queries": len(production_items),
     }
+    if weighted_profile == "weighted-rrf-compat-v1":
+        result["input_report_sha256"] = {
+            "production": _report_sha256(production),
+            "weighted_baseline": _report_sha256(weighted),
+        }
     if not result["passed"]:
         return result
     payload = json.dumps(
@@ -231,12 +320,26 @@ def select_weighted_rrf_train(
     production_baseline: dict[str, Any],
     weighted_baseline: dict[str, Any],
     candidates: list[dict[str, Any]],
+    *,
+    weighted_profile: str = "weighted-rrf-v1",
 ) -> dict[str, Any]:
     """验证完整冻结网格，并按预注册词典序选择唯一 train 胜者。"""
-    _validate_complete_report(production_baseline, split="train", weighted=False)
-    _validate_complete_report(weighted_baseline, split="train", weighted=True)
+    versions = _WEIGHTED_PROFILES.get(weighted_profile)
+    if versions is None:
+        raise ValueError(f"不支持的 Weighted-RRF profile: {weighted_profile}")
+    _validate_complete_report(
+        production_baseline, split="train", weighted=False,
+        weighted_profile=weighted_profile,
+    )
+    _validate_complete_report(
+        weighted_baseline, split="train", weighted=True,
+        weighted_profile=weighted_profile,
+    )
     for candidate in candidates:
-        _validate_complete_report(candidate, split="train", weighted=True)
+        _validate_complete_report(
+            candidate, split="train", weighted=True,
+            weighted_profile=weighted_profile,
+        )
 
     reports = [weighted_baseline, *candidates]
     weights = [
@@ -265,7 +368,8 @@ def select_weighted_rrf_train(
     if production_common["git_sha"] != common["git_sha"]:
         raise ValueError("生产 baseline 与 Weighted-RRF git_sha 不一致")
     parity = evaluate_weighted_baseline_parity(
-        production_baseline, weighted_baseline
+        production_baseline, weighted_baseline,
+        weighted_profile=weighted_profile,
     )
     if not parity["passed"]:
         raise ValueError("生产 hybrid 与 weighted 1.0 baseline parity 失败")
@@ -278,7 +382,13 @@ def select_weighted_rrf_train(
     ):
         gate = _candidate_gate(weighted_baseline, report)
         weight = report["pipeline"]["weighted_rrf"]["lexical_weight"]
-        row = {"lexical_weight": weight, **gate}
+        row = {
+            "lexical_weight": weight,
+            "configuration_sha256": report["pipeline"]["weighted_rrf"][
+                "configuration_sha256"
+            ],
+            **gate,
+        }
         rows.append(row)
         if gate["passed"]:
             passed_reports.append((report, row))
@@ -303,38 +413,82 @@ def select_weighted_rrf_train(
             "factoid_recall": _factoid_recall(report),
             "mrr": _number(report["overall"], "mrr"),
             "ndcg@5": _number(report["overall"], "ndcg@5"),
+            "configuration_sha256": report["pipeline"]["weighted_rrf"][
+                "configuration_sha256"
+            ],
         }
 
     pair_payload = json.dumps(
         common, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
-    return {
-        "selector_version": "weighted-rrf-train-v1",
+    result = {
+        "selector_version": versions["train"],
+        "weighted_profile": weighted_profile,
         "pair_key": hashlib.sha256(pair_payload).hexdigest(),
         "baseline_parity": parity,
         "passed": winner is not None,
         "winner": winner,
         "candidates": rows,
     }
+    if weighted_profile == "weighted-rrf-compat-v1":
+        result["selection_binding"] = _selection_binding(weighted_baseline)
+        result["input_report_sha256"] = {
+            "production": _report_sha256(production_baseline),
+            "weighted_baseline": _report_sha256(weighted_baseline),
+            **{
+                str(report["pipeline"]["weighted_rrf"]["lexical_weight"]): (
+                    _report_sha256(report)
+                )
+                for report in candidates
+            },
+        }
+    return result
 
 
 def evaluate_weighted_rrf_dev(
     baseline: dict[str, Any],
     candidate: dict[str, Any],
     selection: dict[str, Any],
+    *,
+    weighted_profile: str = "weighted-rrf-v1",
 ) -> dict[str, Any]:
     """只允许 train 胜者执行一次 dev 非回退 Gate。"""
+    versions = _WEIGHTED_PROFILES.get(weighted_profile)
+    if versions is None:
+        raise ValueError(f"不支持的 Weighted-RRF profile: {weighted_profile}")
     if not selection.get("passed") or not selection.get("winner"):
         raise ValueError("train selector 没有 winner")
-    _validate_complete_report(baseline, split="dev", weighted=True)
-    _validate_complete_report(candidate, split="dev", weighted=True)
-    if _common_payload(baseline) != _common_payload(candidate):
-        raise ValueError("dev 配对公共指纹不一致")
+    _validate_complete_report(
+        baseline, split="dev", weighted=True,
+        weighted_profile=weighted_profile,
+    )
     if baseline["pipeline"]["weighted_rrf"]["lexical_weight"] != 1.0:
         raise ValueError("dev baseline 必须使用词法权重 1.0")
     candidate_weight = candidate["pipeline"]["weighted_rrf"]["lexical_weight"]
     if candidate_weight != selection["winner"]["lexical_weight"]:
         raise ValueError("dev candidate 必须使用 train winner 权重")
+    _validate_complete_report(
+        candidate, split="dev", weighted=True,
+        weighted_profile=weighted_profile,
+    )
+    if _common_payload(baseline) != _common_payload(candidate):
+        raise ValueError("dev 配对公共指纹不一致")
+    if weighted_profile == "weighted-rrf-compat-v1":
+        if (
+            selection.get("selector_version") != versions["train"]
+            or selection.get("weighted_profile") != weighted_profile
+        ):
+            raise ValueError("dev selection 不是当前 compat train 制品")
+        if selection.get("selection_binding") != _selection_binding(baseline):
+            raise ValueError("dev baseline 与 train 选择制品身份不一致")
+        candidate_configuration = candidate["pipeline"]["weighted_rrf"].get(
+            "configuration_sha256"
+        )
+        if (
+            selection["winner"].get("configuration_sha256")
+            != candidate_configuration
+        ):
+            raise ValueError("dev candidate 配置指纹与 train winner 不一致")
 
     diffs = {
         "recall": _number(candidate["overall"], "recall@5")
@@ -358,7 +512,7 @@ def evaluate_weighted_rrf_dev(
         "actual": p95, "threshold": 1000.0, "passed": p95 < 1000.0,
     }
     return {
-        "gate_version": "weighted-rrf-dev-v1",
+        "gate_version": versions["dev"],
         "passed": all(row["passed"] for row in checks.values()),
         "lexical_weight": candidate_weight,
         "checks": checks,
@@ -374,6 +528,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weighted-baseline", required=True)
     parser.add_argument("--candidate", action="append", default=[])
     parser.add_argument("--parity-only", action="store_true")
+    parser.add_argument(
+        "--weighted-profile",
+        choices=tuple(_WEIGHTED_PROFILES),
+        default="weighted-rrf-v1",
+    )
     parser.add_argument("--output", default=None)
     return parser
 
@@ -386,10 +545,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.parity_only:
         if args.candidate:
             raise ValueError("--parity-only 不得指定 --candidate")
-        result = evaluate_weighted_baseline_parity(production, weighted)
+        result = evaluate_weighted_baseline_parity(
+            production, weighted, weighted_profile=args.weighted_profile
+        )
     else:
         result = select_weighted_rrf_train(
-            production, weighted, [load(path) for path in args.candidate]
+            production, weighted, [load(path) for path in args.candidate],
+            weighted_profile=args.weighted_profile,
         )
     rendered = json.dumps(result, ensure_ascii=False, indent=2)
     if args.output:

@@ -284,6 +284,39 @@ def test_selector_recomputes_contract_hashes_and_rejects_empty_git_sha():
         )
 
 
+def test_compat_dev_gate_binds_train_selection_identity_and_configuration():
+    module = _selector()
+    profile = "weighted-rrf-compat-v1"
+    train_baseline = _report(1.0, profile=profile)
+    candidates = [
+        _report(1.25, profile=profile, factoid=0.5),
+        _report(1.5, profile=profile, factoid=0.5, recall=0.62),
+        _report(2.0, profile=profile, factoid=0.5),
+    ]
+    selection = module.select_weighted_rrf_train(
+        _production_report(), train_baseline, candidates,
+        weighted_profile=profile,
+    )
+    dev_baseline = _report(1.0, profile=profile, split="dev")
+    dev_candidate = _report(
+        1.5, profile=profile, split="dev", recall=0.61,
+    )
+
+    gate = module.evaluate_weighted_rrf_dev(
+        dev_baseline, dev_candidate, selection, weighted_profile=profile
+    )
+    assert gate["gate_version"] == "weighted-rrf-compat-dev-v1"
+    assert gate["passed"] is True
+
+    wrong_selection = deepcopy(selection)
+    wrong_selection["selection_binding"]["vector_manifest_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="身份不一致"):
+        module.evaluate_weighted_rrf_dev(
+            dev_baseline, dev_candidate, wrong_selection,
+            weighted_profile=profile,
+        )
+
+
 def test_train_selector_fails_closed_on_parity_grid_and_degradation():
     module = _selector()
     production = _production_report()

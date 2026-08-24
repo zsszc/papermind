@@ -96,6 +96,24 @@ _WEIGHTED_RRF_FORMULA = {
     "lexical_weight_grid": [1.0, 1.25, 1.5, 2.0],
 }
 
+_WEIGHTED_RRF_COMPAT_FORMULA = {
+    "algorithm": "weighted-rrf-compat-v1",
+    "rrf_k": 60,
+    "rank_base": 1,
+    "rank_source": "raw-route-position",
+    "duplicate_contribution": "repeat-and-occupy-rank",
+    "tie": "first-seen-then-chunk-id",
+    "metadata": "first-seen",
+    "missing_chunk_id": "canonical-source-fallback",
+    "semantic_weight": 1.0,
+    "lexical_weight_grid": [1.0, 1.25, 1.5, 2.0],
+}
+
+_WEIGHTED_RRF_PROFILES = frozenset({
+    "weighted-rrf-v1",
+    "weighted-rrf-compat-v1",
+})
+
 
 def _sha256_bytes(data: bytes) -> str:
     """返回 bytes 的 SHA256 十六进制摘要。"""
@@ -585,12 +603,23 @@ def parent_child_contract_metadata() -> Dict[str, Any]:
     }
 
 
-def weighted_rrf_contract_metadata(lexical_weight: float) -> Dict[str, Any]:
+def weighted_rrf_contract_metadata(
+    lexical_weight: float,
+    *,
+    profile: str = "weighted-rrf-v1",
+) -> Dict[str, Any]:
     """返回不含权重的公式 SHA 与包含本次权重的配置 SHA。"""
     if lexical_weight not in {1.0, 1.25, 1.5, 2.0}:
         raise ValueError("Weighted-RRF 词法权重不在冻结网格")
+    if profile not in _WEIGHTED_RRF_PROFILES:
+        raise ValueError(f"不支持的 Weighted-RRF profile: {profile}")
+    formula = (
+        _WEIGHTED_RRF_COMPAT_FORMULA
+        if profile == "weighted-rrf-compat-v1"
+        else _WEIGHTED_RRF_FORMULA
+    )
     formula_payload = json.dumps(
-        _WEIGHTED_RRF_FORMULA,
+        formula,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -608,6 +637,7 @@ def weighted_rrf_contract_metadata(lexical_weight: float) -> Dict[str, Any]:
         separators=(",", ":"),
     ).encode("utf-8")
     return {
+        "algorithm": profile,
         "semantic_weight": 1.0,
         "lexical_weight": float(lexical_weight),
         "rrf_k": 60,
@@ -742,10 +772,9 @@ class Retriever:
 
     @property
     def mode(self) -> str:
-        if self.retrieval_profile == "weighted-rrf-v1" and not self.degraded:
-            return "weighted-rrf-v1"
-        if self.retrieval_profile == "weighted-rrf-v1":
-            return "weighted-rrf-v1(degraded)"
+        if self.retrieval_profile in _WEIGHTED_RRF_PROFILES:
+            suffix = "" if not self.degraded else "(degraded)"
+            return f"{self.retrieval_profile}{suffix}"
         if self.retrieval_profile == "parent-child-v1" and not self.degraded:
             return "parent-child-v1"
         if self.retrieval_profile == "parent-child-v1":
@@ -777,8 +806,8 @@ class Retriever:
             profile = "hybrid-local-neighbor"
         elif self.retrieval_profile == "parent-child-v1":
             profile = "parent-child-v1"
-        elif self.retrieval_profile == "weighted-rrf-v1":
-            profile = "weighted-rrf-v1"
+        elif self.retrieval_profile in _WEIGHTED_RRF_PROFILES:
+            profile = self.retrieval_profile
         else:
             profile = "hybrid"
 
@@ -803,7 +832,7 @@ class Retriever:
             rerank_diagnostics=self.rerank_diagnostics,
             rrf_lexical_weight=(
                 self.rrf_lexical_weight
-                if profile == "weighted-rrf-v1" else None
+                if profile in _WEIGHTED_RRF_PROFILES else None
             ),
         )
 
@@ -1139,9 +1168,10 @@ def run_eval(args: argparse.Namespace) -> int:
                     parent_contract["contract_sha256"]
                 ),
             })
-        if args.retrieval_profile == "weighted-rrf-v1":
+        if args.retrieval_profile in _WEIGHTED_RRF_PROFILES:
             weighted_contract = weighted_rrf_contract_metadata(
-                args.rrf_lexical_weight
+                args.rrf_lexical_weight,
+                profile=args.retrieval_profile,
             )
             benchmark["weighted_rrf_formula_sha256"] = (
                 weighted_contract["formula_sha256"]
@@ -1523,12 +1553,14 @@ def build_parser() -> argparse.ArgumentParser:
         choices=(
             "hybrid", "hybrid-local-neighbor", "semantic-production",
             "parent-child-v1", "weighted-rrf-v1",
+            "weighted-rrf-compat-v1",
         ),
         default="hybrid",
         help=("评测检索管线；hybrid-local-neighbor 为 Batch21 候选；"
               "semantic-production 严格仅跑生产语义 top5；"
               "parent-child-v1 为 Batch22E 隔离候选；"
-              "weighted-rrf-v1 为 Batch22F 隔离候选"),
+              "weighted-rrf-v1 为 Batch22F 严格候选；"
+              "weighted-rrf-compat-v1 为 Batch22G 旧版兼容候选"),
     )
     parser.add_argument(
         "--vector-dir",
@@ -1546,7 +1578,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         choices=(1.0, 1.25, 1.5, 2.0),
         default=None,
-        help="weighted-rrf-v1 的冻结词法权重",
+        help="Weighted-RRF 隔离候选的冻结词法权重",
     )
     parser.add_argument(
         "--lexical-profile",
@@ -1611,32 +1643,36 @@ def _validate_cli_args(args: argparse.Namespace) -> Optional[str]:
             return "--with-llm 的 dataset 必须位于 eval/private 内"
         if not report_dir.is_relative_to(private_root):
             return "--with-llm 的 --report-dir 必须位于 eval/private 内"
-    if args.retrieval_profile == "weighted-rrf-v1":
+    if args.retrieval_profile in _WEIGHTED_RRF_PROFILES:
+        weighted_profile = args.retrieval_profile
         if args.keyword_only:
-            return "weighted-rrf-v1 不得使用 --keyword-only"
+            return f"{weighted_profile} 不得使用 --keyword-only"
         if not args.database or not args.corpus_root or not args.vector_dir:
             return (
-                "weighted-rrf-v1 必须显式指定 --database/--corpus-root/"
+                f"{weighted_profile} 必须显式指定 --database/--corpus-root/"
                 "--vector-dir"
             )
         if args.parent_database:
-            return "weighted-rrf-v1 不得指定 --parent-database"
+            return f"{weighted_profile} 不得指定 --parent-database"
         if args.evidence_resolver != "page-span-v2":
-            return "weighted-rrf-v1 必须使用 --evidence-resolver page-span-v2"
+            return f"{weighted_profile} 必须使用 --evidence-resolver page-span-v2"
         if args.top_k != 5:
-            return "weighted-rrf-v1 必须使用 top-k=5"
+            return f"{weighted_profile} 必须使用 top-k=5"
         if args.split not in {"train", "dev"}:
-            return "weighted-rrf-v1 只允许 train/dev，禁止 holdout"
+            return f"{weighted_profile} 只允许 train/dev，禁止 holdout"
         if args.lexical_profile != "bm25-bilingual":
-            return "weighted-rrf-v1 必须使用 --lexical-profile bm25-bilingual"
+            return f"{weighted_profile} 必须使用 --lexical-profile bm25-bilingual"
         if args.rrf_lexical_weight is None:
-            return "weighted-rrf-v1 必须指定 --rrf-lexical-weight"
+            return f"{weighted_profile} 必须指定 --rrf-lexical-weight"
         if args.qa_id:
-            return "weighted-rrf-v1 检索评测禁止 --qa-id 子集"
+            return f"{weighted_profile} 检索评测禁止 --qa-id 子集"
         if args.with_llm:
-            return "weighted-rrf-v1 禁止 --with-llm"
+            return f"{weighted_profile} 禁止 --with-llm"
     elif args.rrf_lexical_weight is not None:
-        return "--rrf-lexical-weight 仅适用于 weighted-rrf-v1"
+        return (
+            "--rrf-lexical-weight 仅适用于 weighted-rrf-v1 或 "
+            "weighted-rrf-compat-v1"
+        )
     if args.retrieval_profile == "parent-child-v1":
         if args.keyword_only:
             return "parent-child-v1 不得使用 --keyword-only"
