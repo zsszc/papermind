@@ -1,6 +1,7 @@
 """Batch 22D：旧粗分块候选库的只读复制与坐标回填 RED。"""
 
 from pathlib import Path
+import sqlite3
 
 import pytest
 from sqlalchemy import create_engine
@@ -90,6 +91,23 @@ def test_duplicate_chunk_text_fails_closed_and_removes_candidate(tmp_path):
 
     assert not candidate.exists()
     assert _row(source)[-2:] == (None, None)
+
+
+def test_wal_source_snapshot_does_not_require_journal_mode_switch(tmp_path):
+    content = "wal legacy chunk content"
+    page = "prefix " + content + " suffix"
+    source, corpus = _seed(tmp_path, content)
+    with sqlite3.connect(source) as conn:
+        assert conn.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+
+    result = build_staged_offset_database(
+        source,
+        tmp_path / "candidate.db",
+        corpus_root=corpus,
+        parser=_FakeParser(page),
+    )
+
+    assert result["body_chunks"] == 1
 
 
 def test_cli_has_no_activation_path():

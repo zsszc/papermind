@@ -57,8 +57,8 @@ def _candidate_engine(database_path: Path):
     def _set_pragmas(dbapi_conn, connection_record):
         del connection_record
         cursor = dbapi_conn.cursor()
+        cursor.execute("PRAGMA busy_timeout=5000")
         cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.execute("PRAGMA journal_mode=DELETE")
         cursor.close()
 
     return engine
