@@ -94,12 +94,12 @@ def test_pair_gate_fails_closed_when_page_manifest_differs():
 def test_parent_child_pair_gate_locks_parent_and_algorithm_contract():
     common = dict(
         coverage=0.7, any_hit=0.7, factoid=0.5, mrr=0.5, ndcg=0.5,
-        profile="parent-child-v1", parent_manifest="parent-a",
-        contract_sha="contract-a",
+        profile="parent-child-v1", parent_manifest="a" * 64,
+        contract_sha="b" * 64,
     )
     baseline = _report(**common)
     candidate = _report(**common)
-    candidate["benchmark"]["parent_child_contract_sha256"] = "contract-b"
+    candidate["benchmark"]["parent_child_contract_sha256"] = "c" * 64
     with pytest.raises(ValueError, match="配对配置不一致"):
         evaluate_span_pair(baseline, candidate)
 

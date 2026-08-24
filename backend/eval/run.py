@@ -75,6 +75,15 @@ PRIVATE_EVAL_ROOT = Path(__file__).resolve().parent / "private"
 
 REPORT_SCHEMA_VERSION = "2.0"
 
+_PARENT_CHILD_CONTRACT = {
+    "version": "parent-child-v1",
+    "route_limit": 40,
+    "rrf_k": 60,
+    "parent_weights": [1.0, 0.5, 0.25],
+    "max_scoring_children": 3,
+    "routing": "parent-round-robin",
+}
+
 
 def _sha256_bytes(data: bytes) -> str:
     """返回 bytes 的 SHA256 十六进制摘要。"""
@@ -550,6 +559,64 @@ def _open_eval_vector_store(vector_dir: Path):
     return store
 
 
+def parent_child_contract_metadata() -> Dict[str, Any]:
+    """返回冻结 Parent-Child 算法参数及其可配对指纹。"""
+    payload = json.dumps(
+        _PARENT_CHILD_CONTRACT,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return {
+        **_PARENT_CHILD_CONTRACT,
+        "contract_sha256": _sha256_bytes(payload),
+    }
+
+
+def _audit_parent_child_snapshot(db, store, parent_db, parent_map) -> Dict[str, Any]:
+    """在检索前校验 child SQLite、Chroma、映射和 parent 快照。"""
+    from app.models import Chunk
+    from app.services.parent_child import parent_manifest_sha256
+
+    rows = db.query(Chunk).order_by(Chunk.paper_id, Chunk.chunk_index).all()
+    database_ids = [f"p{row.paper_id}_c{row.chunk_index}" for row in rows]
+    if len(database_ids) != len(set(database_ids)):
+        raise ValueError("候选 SQLite 存在重复 chunk 自然 ID")
+    if set(parent_map) != set(database_ids):
+        raise ValueError("child→parent 映射未覆盖全部 SQLite chunk")
+
+    snapshot = store.collection.get(include=["embeddings"])
+    vector_ids = [str(value) for value in snapshot.get("ids") or []]
+    if len(vector_ids) != len(set(vector_ids)):
+        raise ValueError("Chroma 存在重复向量 ID")
+    missing = set(database_ids) - set(vector_ids)
+    extra = set(vector_ids) - set(database_ids)
+    if missing or extra:
+        raise ValueError("SQLite/Chroma chunk ID 不一致")
+    embeddings = snapshot.get("embeddings")
+    if embeddings is None:
+        embeddings = []
+    dimensions = {len(embedding) for embedding in embeddings}
+    if len(dimensions) != 1 or dimensions != {1024}:
+        raise ValueError("Parent-Child 评测向量维度必须统一为 1024")
+
+    mapping_payload = json.dumps(
+        sorted(parent_map.items()),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return {
+        "database_chunk_count": len(database_ids),
+        "vector_count": len(vector_ids),
+        "missing_vector_ids": len(missing),
+        "extra_vector_ids": len(extra),
+        "embedding_dimension": next(iter(dimensions)),
+        "mapped_child_count": len(parent_map),
+        "parent_manifest_sha256": parent_manifest_sha256(parent_db),
+        "mapping_manifest_sha256": _sha256_bytes(mapping_payload),
+    }
+
+
 class Retriever:
     """评测用检索器：优先语义+关键词混合，模型不可用时降级为仅关键词。"""
 
@@ -562,6 +629,7 @@ class Retriever:
         vector_dir: Optional[Path] = None,
         retrieval_profile: str = "hybrid",
         semantic_rerank: Optional[bool] = None,
+        parent_map: Optional[Dict[str, str]] = None,
     ):
         self.db = db
         self.top_k = top_k
@@ -572,6 +640,7 @@ class Retriever:
         self.lexical_profile = lexical_profile
         self.retrieval_profile = retrieval_profile
         self.semantic_rerank = semantic_rerank
+        self.parent_map = dict(parent_map or {})
         self.rerank_diagnostics: Dict[str, Any] = {
             "requested": semantic_rerank,
             "effective": False,
@@ -605,6 +674,10 @@ class Retriever:
 
     @property
     def mode(self) -> str:
+        if self.retrieval_profile == "parent-child-v1" and not self.degraded:
+            return "parent-child-v1"
+        if self.retrieval_profile == "parent-child-v1":
+            return "parent-child-v1(degraded)"
         if self.retrieval_profile == "semantic-production" and not self.degraded:
             return "semantic-production"
         if self.retrieval_profile == "semantic-production":
@@ -630,6 +703,8 @@ class Retriever:
             profile = "semantic"
         elif self.retrieval_profile == "hybrid-local-neighbor":
             profile = "hybrid-local-neighbor"
+        elif self.retrieval_profile == "parent-child-v1":
+            profile = "parent-child-v1"
         else:
             profile = "hybrid"
 
@@ -642,7 +717,7 @@ class Retriever:
             return []
 
         results = RetrievalPipeline(
-            self.db, vector_store=self._store
+            self.db, vector_store=self._store, parent_map=self.parent_map
         ).search(
             query,
             top_k=5 if profile == "semantic" else self.top_k,
@@ -867,6 +942,8 @@ def run_eval(args: argparse.Namespace) -> int:
 
     fixture_database = None
     explicit_database_engine = None
+    parent_database_engine = None
+    parent_db = None
     fixture_metadata: Dict[str, Any] = {}
     if args.fixture:
         from eval.fixture import open_fixture_database
@@ -917,6 +994,22 @@ def run_eval(args: argparse.Namespace) -> int:
             resolved_qrels = _resolve_qrels_or_raise(
                 db, items, runtime_root=runtime_root
             )
+        parent_map: Dict[str, str] = {}
+        if args.retrieval_profile == "parent-child-v1":
+            from app.services.data_integrity import (
+                open_readonly_sqlalchemy_database,
+            )
+            from app.services.parent_child import build_parent_map
+
+            parent_database_engine, parent_session_factory = (
+                open_readonly_sqlalchemy_database(Path(args.parent_database))
+            )
+            parent_db = parent_session_factory()
+            try:
+                parent_map = build_parent_map(db, parent_db)
+            except ValueError as exc:
+                print(f"[eval] Parent-Child 映射审计失败: {exc}", file=sys.stderr)
+                return 2
         retriever = Retriever(
             db,
             top_k=args.top_k,
@@ -928,7 +1021,30 @@ def run_eval(args: argparse.Namespace) -> int:
                 args.semantic_rerank == "on"
                 if args.semantic_rerank is not None else None
             ),
+            parent_map=parent_map,
         )
+        parent_audit: Dict[str, Any] = {}
+        parent_contract: Dict[str, Any] = {}
+        if args.retrieval_profile == "parent-child-v1":
+            if retriever._store is None:
+                print("[eval] Parent-Child 向量快照不可用", file=sys.stderr)
+                return 2
+            try:
+                parent_audit = _audit_parent_child_snapshot(
+                    db, retriever._store, parent_db, parent_map
+                )
+            except ValueError as exc:
+                print(f"[eval] Parent-Child 快照审计失败: {exc}", file=sys.stderr)
+                return 2
+            parent_contract = parent_child_contract_metadata()
+            benchmark.update({
+                "parent_manifest_sha256": (
+                    parent_audit["parent_manifest_sha256"]
+                ),
+                "parent_child_contract_sha256": (
+                    parent_contract["contract_sha256"]
+                ),
+            })
         print(f"[eval] 检索模式: {retriever.mode}"
               + (f"（{retriever.degrade_reason}）" if retriever.degraded else ""))
 
@@ -1091,6 +1207,8 @@ def run_eval(args: argparse.Namespace) -> int:
             args.lexical_profile,
             args.evidence_resolver,
             benchmark.get("page_text_manifest_sha256", "none"),
+            benchmark.get("parent_manifest_sha256", "none"),
+            benchmark.get("parent_child_contract_sha256", "none"),
             str(args.top_k),
         ))
         runtime_valid = retriever.runtime_degraded_count == 0
@@ -1134,11 +1252,13 @@ def run_eval(args: argparse.Namespace) -> int:
                 "split": args.split,
                 "evidence_resolver": args.evidence_resolver,
                 "top_k": args.top_k,
+                **({"parent_child": parent_contract} if parent_contract else {}),
             },
             "diagnostics": {
                 "unresolved_qrels": [],
                 "runtime_degraded_count": retriever.runtime_degraded_count,
                 "rerank": retriever.rerank_diagnostics,
+                **({"parent_child_snapshot": parent_audit} if parent_audit else {}),
             },
             "gate": gate,
             "dataset": Path(args.dataset).name if args.fixture else str(args.dataset),
@@ -1228,6 +1348,10 @@ def run_eval(args: argparse.Namespace) -> int:
             fixture_database.close()
         if explicit_database_engine is not None:
             explicit_database_engine.dispose()
+        if parent_db is not None:
+            parent_db.close()
+        if parent_database_engine is not None:
+            parent_database_engine.dispose()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1244,6 +1368,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--database",
         default=None,
         help="显式只读候选 SQLite；用于隔离评测，不连接生产 SessionLocal",
+    )
+    parser.add_argument(
+        "--parent-database",
+        default=None,
+        help="Parent-Child 实验显式只读粗粒度 parent SQLite 快照",
     )
     parser.add_argument(
         "--corpus-root",
@@ -1287,11 +1416,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--retrieval-profile",
         choices=(
-            "hybrid", "hybrid-local-neighbor", "semantic-production"
+            "hybrid", "hybrid-local-neighbor", "semantic-production",
+            "parent-child-v1",
         ),
         default="hybrid",
         help=("评测检索管线；hybrid-local-neighbor 为 Batch21 候选；"
-              "semantic-production 严格仅跑生产语义 top5"),
+              "semantic-production 严格仅跑生产语义 top5；"
+              "parent-child-v1 为 Batch22E 隔离候选"),
     )
     parser.add_argument(
         "--vector-dir",
@@ -1340,8 +1471,8 @@ def _validate_cli_args(args: argparse.Namespace) -> Optional[str]:
         return "--max-p95-ms 必须为正数"
     if args.fixture and not args.keyword_only:
         return "fixture 评测必须显式使用 --keyword-only"
-    if args.fixture and (args.database or args.corpus_root):
-        return "fixture 评测不得指定 --database/--corpus-root"
+    if args.fixture and (args.database or args.parent_database or args.corpus_root):
+        return "fixture 评测不得指定 --database/--parent-database/--corpus-root"
     if args.fixture and args.evidence_resolver != "chunk-v1":
         return "fixture 评测只支持 chunk-v1"
     if args.database and not args.corpus_root:
@@ -1367,6 +1498,22 @@ def _validate_cli_args(args: argparse.Namespace) -> Optional[str]:
             return "--with-llm 的 dataset 必须位于 eval/private 内"
         if not report_dir.is_relative_to(private_root):
             return "--with-llm 的 --report-dir 必须位于 eval/private 内"
+    if args.retrieval_profile == "parent-child-v1":
+        if args.keyword_only:
+            return "parent-child-v1 不得使用 --keyword-only"
+        if not args.database or not args.parent_database or not args.corpus_root:
+            return (
+                "parent-child-v1 必须显式指定 --database/--parent-database/"
+                "--corpus-root"
+            )
+        if args.evidence_resolver != "page-span-v2":
+            return "parent-child-v1 必须使用 --evidence-resolver page-span-v2"
+        if args.top_k != 5:
+            return "parent-child-v1 必须使用 top-k=5"
+        if args.qa_id:
+            return "parent-child-v1 检索评测禁止 --qa-id 子集"
+    elif args.parent_database:
+        return "--parent-database 仅适用于 parent-child-v1"
     if args.retrieval_profile == "semantic-production":
         if args.keyword_only:
             return "semantic-production 不得使用 --keyword-only"

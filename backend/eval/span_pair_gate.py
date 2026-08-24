@@ -14,6 +14,8 @@ _PAIR_BENCHMARK_FIELDS = (
     "qrels_sha256",
     "page_text_manifest_sha256",
     "resolver_version",
+    "parent_manifest_sha256",
+    "parent_child_contract_sha256",
 )
 _PAIR_PIPELINE_FIELDS = (
     "profile",
@@ -59,10 +61,40 @@ def evaluate_span_pair(
     """执行 Batch 22D 冻结 Gate，只返回去标识化聚合。"""
     baseline_pair = _pair_payload(baseline)
     candidate_pair = _pair_payload(candidate)
+    parent_mode = any(
+        pair["pipeline"].get("profile") == "parent-child-v1"
+        or pair["benchmark"].get("parent_manifest_sha256") is not None
+        or pair["benchmark"].get("parent_child_contract_sha256") is not None
+        for pair in (baseline_pair, candidate_pair)
+    )
+    if parent_mode:
+        for pair in (baseline_pair, candidate_pair):
+            if (
+                pair["pipeline"].get("profile") != "parent-child-v1"
+                or pair["pipeline"].get("effective_profile")
+                != "parent-child-v1"
+            ):
+                raise ValueError(
+                    "Parent-Child 配对必须有效运行 parent-child-v1"
+                )
     if baseline_pair != candidate_pair:
         raise ValueError("配对配置不一致，禁止计算跨粒度差值")
     if baseline_pair["benchmark"]["resolver_version"] != "page-span-v2":
         raise ValueError("配对报告必须使用 page-span-v2")
+    pipeline = baseline_pair["pipeline"]
+    if pipeline["split"] != "train":
+        raise ValueError("配对报告必须使用完整 train 分区")
+    if pipeline["top_k"] != 5:
+        raise ValueError("配对报告必须使用 top-k=5")
+    if pipeline["evidence_resolver"] != "page-span-v2":
+        raise ValueError("配对报告管线必须使用 page-span-v2")
+    if parent_mode:
+        for field in (
+            "parent_manifest_sha256", "parent_child_contract_sha256"
+        ):
+            value = baseline_pair["benchmark"].get(field)
+            if not isinstance(value, str) or len(value) != 64:
+                raise ValueError(f"Parent-Child 配对缺少有效 {field}")
 
     payload_bytes = json.dumps(
         baseline_pair, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -74,6 +106,10 @@ def evaluate_span_pair(
     ndcg_key = f"ndcg@{top_k}"
     baseline_overall = baseline.get("overall") or {}
     candidate_overall = candidate.get("overall") or {}
+    baseline_positive = baseline_overall.get("n_positive")
+    candidate_positive = candidate_overall.get("n_positive")
+    if baseline_positive != 24 or candidate_positive != 24:
+        raise ValueError("配对报告必须各含完整 24 条 train 正例")
 
     def number(block: dict, key: str) -> float:
         value = block.get(key)
@@ -92,7 +128,10 @@ def evaluate_span_pair(
     base_factoid = _factoid_coverage(baseline)
     cand_factoid = _factoid_coverage(candidate)
     candidate_p95 = number(candidate.get("latency") or {}, "p95")
-    runtime_degraded = int(
+    baseline_runtime_degraded = int(
+        (baseline.get("diagnostics") or {}).get("runtime_degraded_count", -1)
+    )
+    candidate_runtime_degraded = int(
         (candidate.get("diagnostics") or {}).get("runtime_degraded_count", -1)
     )
 
@@ -131,11 +170,17 @@ def evaluate_span_pair(
         "operator": "<",
         "passed": candidate_p95 < maximum_p95_ms,
     }
-    checks["runtime_degraded_count"] = {
-        "actual": runtime_degraded,
+    checks["baseline_runtime_degraded_count"] = {
+        "actual": baseline_runtime_degraded,
         "threshold": 0,
         "operator": "==",
-        "passed": runtime_degraded == 0,
+        "passed": baseline_runtime_degraded == 0,
+    }
+    checks["candidate_runtime_degraded_count"] = {
+        "actual": candidate_runtime_degraded,
+        "threshold": 0,
+        "operator": "==",
+        "passed": candidate_runtime_degraded == 0,
     }
     return {
         "gate_version": "page-span-pair-v1",
