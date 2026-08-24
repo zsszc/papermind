@@ -119,6 +119,7 @@ def _report(
             "page_text_manifest_sha256": "d" * 64,
             "resolver_version": "page-span-v2",
             "vector_manifest_sha256": "e" * 64,
+            "weighted_rrf_formula_sha256": "f" * 64,
         },
         "pipeline": {
             "profile": profile,

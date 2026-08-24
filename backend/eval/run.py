@@ -38,6 +38,7 @@ import json
 import math
 import platform
 import re
+import struct
 import subprocess
 import sys
 import time
@@ -82,6 +83,17 @@ _PARENT_CHILD_CONTRACT = {
     "parent_weights": [1.0, 0.5, 0.25],
     "max_scoring_children": 3,
     "routing": "parent-round-robin",
+}
+
+_WEIGHTED_RRF_FORMULA = {
+    "algorithm": "weighted-rrf-v1",
+    "rrf_k": 60,
+    "rank_base": 1,
+    "dedup": "first-per-route",
+    "tie": "chunk-id-asc",
+    "metadata": "semantic-first",
+    "semantic_weight": 1.0,
+    "lexical_weight_grid": [1.0, 1.25, 1.5, 2.0],
 }
 
 
@@ -573,6 +585,80 @@ def parent_child_contract_metadata() -> Dict[str, Any]:
     }
 
 
+def weighted_rrf_contract_metadata(lexical_weight: float) -> Dict[str, Any]:
+    """返回不含权重的公式 SHA 与包含本次权重的配置 SHA。"""
+    if lexical_weight not in {1.0, 1.25, 1.5, 2.0}:
+        raise ValueError("Weighted-RRF 词法权重不在冻结网格")
+    formula_payload = json.dumps(
+        _WEIGHTED_RRF_FORMULA,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    formula_sha = _sha256_bytes(formula_payload)
+    configuration = {
+        "formula_sha256": formula_sha,
+        "semantic_weight": 1.0,
+        "lexical_weight": float(lexical_weight),
+    }
+    configuration_payload = json.dumps(
+        configuration,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return {
+        "semantic_weight": 1.0,
+        "lexical_weight": float(lexical_weight),
+        "rrf_k": 60,
+        "formula_sha256": formula_sha,
+        "configuration_sha256": _sha256_bytes(configuration_payload),
+    }
+
+
+def _audit_vector_snapshot(db, store) -> Dict[str, Any]:
+    """校验 SQLite/Chroma 全量 ID、维度并生成 embedding 内容指纹。"""
+    from app.models import Chunk
+
+    rows = db.query(Chunk).order_by(Chunk.paper_id, Chunk.chunk_index).all()
+    database_ids = [f"p{row.paper_id}_c{row.chunk_index}" for row in rows]
+    if len(database_ids) != len(set(database_ids)):
+        raise ValueError("候选 SQLite 存在重复 chunk 自然 ID")
+    snapshot = store.collection.get(include=["embeddings"])
+    vector_ids = [str(value) for value in snapshot.get("ids") or []]
+    embeddings = snapshot.get("embeddings")
+    if embeddings is None:
+        embeddings = []
+    if len(vector_ids) != len(set(vector_ids)):
+        raise ValueError("Chroma 存在重复向量 ID")
+    missing = set(database_ids) - set(vector_ids)
+    extra = set(vector_ids) - set(database_ids)
+    if missing or extra:
+        raise ValueError("SQLite/Chroma chunk ID 不一致")
+    if len(embeddings) != len(vector_ids):
+        raise ValueError("Chroma embedding 数量与 ID 数量不一致")
+    dimensions = {len(embedding) for embedding in embeddings}
+    if len(dimensions) != 1 or dimensions != {1024}:
+        raise ValueError("评测向量维度必须统一为 1024")
+
+    digest = hashlib.sha256()
+    for vector_id, embedding in sorted(
+        zip(vector_ids, embeddings), key=lambda pair: pair[0]
+    ):
+        digest.update(vector_id.encode("utf-8"))
+        digest.update(b"\0")
+        for value in embedding:
+            digest.update(struct.pack("<f", float(value)))
+    return {
+        "database_chunk_count": len(database_ids),
+        "vector_count": len(vector_ids),
+        "missing_vector_ids": len(missing),
+        "extra_vector_ids": len(extra),
+        "embedding_dimension": next(iter(dimensions)),
+        "vector_manifest_sha256": digest.hexdigest(),
+    }
+
+
 def _audit_parent_child_snapshot(db, store, parent_db, parent_map) -> Dict[str, Any]:
     """在检索前校验 child SQLite、Chroma、映射和 parent 快照。"""
     from app.models import Chunk
@@ -580,25 +666,9 @@ def _audit_parent_child_snapshot(db, store, parent_db, parent_map) -> Dict[str, 
 
     rows = db.query(Chunk).order_by(Chunk.paper_id, Chunk.chunk_index).all()
     database_ids = [f"p{row.paper_id}_c{row.chunk_index}" for row in rows]
-    if len(database_ids) != len(set(database_ids)):
-        raise ValueError("候选 SQLite 存在重复 chunk 自然 ID")
     if set(parent_map) != set(database_ids):
         raise ValueError("child→parent 映射未覆盖全部 SQLite chunk")
-
-    snapshot = store.collection.get(include=["embeddings"])
-    vector_ids = [str(value) for value in snapshot.get("ids") or []]
-    if len(vector_ids) != len(set(vector_ids)):
-        raise ValueError("Chroma 存在重复向量 ID")
-    missing = set(database_ids) - set(vector_ids)
-    extra = set(vector_ids) - set(database_ids)
-    if missing or extra:
-        raise ValueError("SQLite/Chroma chunk ID 不一致")
-    embeddings = snapshot.get("embeddings")
-    if embeddings is None:
-        embeddings = []
-    dimensions = {len(embedding) for embedding in embeddings}
-    if len(dimensions) != 1 or dimensions != {1024}:
-        raise ValueError("Parent-Child 评测向量维度必须统一为 1024")
+    vector_audit = _audit_vector_snapshot(db, store)
 
     mapping_payload = json.dumps(
         sorted(parent_map.items()),
@@ -606,11 +676,7 @@ def _audit_parent_child_snapshot(db, store, parent_db, parent_map) -> Dict[str, 
         separators=(",", ":"),
     ).encode("utf-8")
     return {
-        "database_chunk_count": len(database_ids),
-        "vector_count": len(vector_ids),
-        "missing_vector_ids": len(missing),
-        "extra_vector_ids": len(extra),
-        "embedding_dimension": next(iter(dimensions)),
+        **vector_audit,
         "mapped_child_count": len(parent_map),
         "parent_manifest_sha256": parent_manifest_sha256(parent_db),
         "mapping_manifest_sha256": _sha256_bytes(mapping_payload),
@@ -630,6 +696,7 @@ class Retriever:
         retrieval_profile: str = "hybrid",
         semantic_rerank: Optional[bool] = None,
         parent_map: Optional[Dict[str, str]] = None,
+        rrf_lexical_weight: Optional[float] = None,
     ):
         self.db = db
         self.top_k = top_k
@@ -641,6 +708,7 @@ class Retriever:
         self.retrieval_profile = retrieval_profile
         self.semantic_rerank = semantic_rerank
         self.parent_map = dict(parent_map or {})
+        self.rrf_lexical_weight = rrf_lexical_weight
         self.rerank_diagnostics: Dict[str, Any] = {
             "requested": semantic_rerank,
             "effective": False,
@@ -674,6 +742,10 @@ class Retriever:
 
     @property
     def mode(self) -> str:
+        if self.retrieval_profile == "weighted-rrf-v1" and not self.degraded:
+            return "weighted-rrf-v1"
+        if self.retrieval_profile == "weighted-rrf-v1":
+            return "weighted-rrf-v1(degraded)"
         if self.retrieval_profile == "parent-child-v1" and not self.degraded:
             return "parent-child-v1"
         if self.retrieval_profile == "parent-child-v1":
@@ -705,6 +777,8 @@ class Retriever:
             profile = "hybrid-local-neighbor"
         elif self.retrieval_profile == "parent-child-v1":
             profile = "parent-child-v1"
+        elif self.retrieval_profile == "weighted-rrf-v1":
+            profile = "weighted-rrf-v1"
         else:
             profile = "hybrid"
 
@@ -727,6 +801,10 @@ class Retriever:
             rerank=self.semantic_rerank,
             diagnostics=pipeline_diagnostics,
             rerank_diagnostics=self.rerank_diagnostics,
+            rrf_lexical_weight=(
+                self.rrf_lexical_weight
+                if profile == "weighted-rrf-v1" else None
+            ),
         )
 
         if self.keyword_only:
@@ -1022,9 +1100,25 @@ def run_eval(args: argparse.Namespace) -> int:
                 if args.semantic_rerank is not None else None
             ),
             parent_map=parent_map,
+            rrf_lexical_weight=args.rrf_lexical_weight,
         )
         parent_audit: Dict[str, Any] = {}
         parent_contract: Dict[str, Any] = {}
+        vector_audit: Dict[str, Any] = {}
+        weighted_contract: Dict[str, Any] = {}
+        if (
+            args.vector_dir
+            and args.database
+            and retriever._store is not None
+        ):
+            try:
+                vector_audit = _audit_vector_snapshot(db, retriever._store)
+            except ValueError as exc:
+                print(f"[eval] 向量快照审计失败: {exc}", file=sys.stderr)
+                return 2
+            benchmark["vector_manifest_sha256"] = (
+                vector_audit["vector_manifest_sha256"]
+            )
         if args.retrieval_profile == "parent-child-v1":
             if retriever._store is None:
                 print("[eval] Parent-Child 向量快照不可用", file=sys.stderr)
@@ -1045,6 +1139,13 @@ def run_eval(args: argparse.Namespace) -> int:
                     parent_contract["contract_sha256"]
                 ),
             })
+        if args.retrieval_profile == "weighted-rrf-v1":
+            weighted_contract = weighted_rrf_contract_metadata(
+                args.rrf_lexical_weight
+            )
+            benchmark["weighted_rrf_formula_sha256"] = (
+                weighted_contract["formula_sha256"]
+            )
         print(f"[eval] 检索模式: {retriever.mode}"
               + (f"（{retriever.degrade_reason}）" if retriever.degraded else ""))
 
@@ -1209,6 +1310,8 @@ def run_eval(args: argparse.Namespace) -> int:
             benchmark.get("page_text_manifest_sha256", "none"),
             benchmark.get("parent_manifest_sha256", "none"),
             benchmark.get("parent_child_contract_sha256", "none"),
+            benchmark.get("vector_manifest_sha256", "none"),
+            benchmark.get("weighted_rrf_formula_sha256", "none"),
             str(args.top_k),
         ))
         runtime_valid = retriever.runtime_degraded_count == 0
@@ -1253,12 +1356,14 @@ def run_eval(args: argparse.Namespace) -> int:
                 "evidence_resolver": args.evidence_resolver,
                 "top_k": args.top_k,
                 **({"parent_child": parent_contract} if parent_contract else {}),
+                **({"weighted_rrf": weighted_contract} if weighted_contract else {}),
             },
             "diagnostics": {
                 "unresolved_qrels": [],
                 "runtime_degraded_count": retriever.runtime_degraded_count,
                 "rerank": retriever.rerank_diagnostics,
                 **({"parent_child_snapshot": parent_audit} if parent_audit else {}),
+                **({"vector_snapshot": vector_audit} if vector_audit else {}),
             },
             "gate": gate,
             "dataset": Path(args.dataset).name if args.fixture else str(args.dataset),
@@ -1417,12 +1522,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--retrieval-profile",
         choices=(
             "hybrid", "hybrid-local-neighbor", "semantic-production",
-            "parent-child-v1",
+            "parent-child-v1", "weighted-rrf-v1",
         ),
         default="hybrid",
         help=("评测检索管线；hybrid-local-neighbor 为 Batch21 候选；"
               "semantic-production 严格仅跑生产语义 top5；"
-              "parent-child-v1 为 Batch22E 隔离候选"),
+              "parent-child-v1 为 Batch22E 隔离候选；"
+              "weighted-rrf-v1 为 Batch22F 隔离候选"),
     )
     parser.add_argument(
         "--vector-dir",
@@ -1434,6 +1540,13 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("off", "on"),
         default=None,
         help="semantic-production 必须显式选择的生产语义重排开关",
+    )
+    parser.add_argument(
+        "--rrf-lexical-weight",
+        type=float,
+        choices=(1.0, 1.25, 1.5, 2.0),
+        default=None,
+        help="weighted-rrf-v1 的冻结词法权重",
     )
     parser.add_argument(
         "--lexical-profile",
@@ -1498,6 +1611,32 @@ def _validate_cli_args(args: argparse.Namespace) -> Optional[str]:
             return "--with-llm 的 dataset 必须位于 eval/private 内"
         if not report_dir.is_relative_to(private_root):
             return "--with-llm 的 --report-dir 必须位于 eval/private 内"
+    if args.retrieval_profile == "weighted-rrf-v1":
+        if args.keyword_only:
+            return "weighted-rrf-v1 不得使用 --keyword-only"
+        if not args.database or not args.corpus_root or not args.vector_dir:
+            return (
+                "weighted-rrf-v1 必须显式指定 --database/--corpus-root/"
+                "--vector-dir"
+            )
+        if args.parent_database:
+            return "weighted-rrf-v1 不得指定 --parent-database"
+        if args.evidence_resolver != "page-span-v2":
+            return "weighted-rrf-v1 必须使用 --evidence-resolver page-span-v2"
+        if args.top_k != 5:
+            return "weighted-rrf-v1 必须使用 top-k=5"
+        if args.split not in {"train", "dev"}:
+            return "weighted-rrf-v1 只允许 train/dev，禁止 holdout"
+        if args.lexical_profile != "bm25-bilingual":
+            return "weighted-rrf-v1 必须使用 --lexical-profile bm25-bilingual"
+        if args.rrf_lexical_weight is None:
+            return "weighted-rrf-v1 必须指定 --rrf-lexical-weight"
+        if args.qa_id:
+            return "weighted-rrf-v1 检索评测禁止 --qa-id 子集"
+        if args.with_llm:
+            return "weighted-rrf-v1 禁止 --with-llm"
+    elif args.rrf_lexical_weight is not None:
+        return "--rrf-lexical-weight 仅适用于 weighted-rrf-v1"
     if args.retrieval_profile == "parent-child-v1":
         if args.keyword_only:
             return "parent-child-v1 不得使用 --keyword-only"
