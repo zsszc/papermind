@@ -16,6 +16,8 @@ os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 class TextChunker:
     """基于内容类型的简单智能分块策略。"""
 
+    _SPLIT_BOUNDARIES = frozenset("。！？!?；;.")
+
     _SECTION_KEYWORDS = {
         "abstract": ["abstract", "摘要"],
         "intro": ["introduction", "intro", "引言", "前言", "背景"],
@@ -61,27 +63,43 @@ class TextChunker:
         if not text.strip():
             return []
 
-        # 按段落拆分
-        paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+        # 先按段落拆分；超长单段再做有界硬切，避免配置阈值只对段间生效。
+        paragraphs = []
+        for paragraph in re.split(r"\n\s*\n", text):
+            paragraph = paragraph.strip()
+            if paragraph:
+                paragraphs.extend(self._split_long_paragraph(paragraph))
+
         chunks = []
         current = []
         current_len = 0
 
         for para in paragraphs:
             para_len = len(para)
-            if current_len + para_len > self.chunk_size and current:
+            separator_len = 2 if current else 0
+            if current_len + separator_len + para_len > self.chunk_size and current:
                 chunks.append(self._make_chunk(current, page_number))
                 # 保留重叠
                 overlap = []
                 overlap_len = 0
                 for p in reversed(current):
-                    if overlap_len + len(p) > self.chunk_overlap:
+                    added_len = len(p) + (2 if overlap else 0)
+                    if overlap_len + added_len > self._effective_overlap:
                         break
                     overlap.insert(0, p)
-                    overlap_len += len(p)
+                    overlap_len += added_len
                 current = overlap
                 current_len = overlap_len
 
+                # 即使旧块尾段满足 overlap，也不能让它与新段拼接后突破硬上限。
+                while current and current_len + 2 + para_len > self.chunk_size:
+                    removed = current.pop(0)
+                    current_len -= len(removed)
+                    if current:
+                        current_len -= 2
+
+            if current:
+                current_len += 2
             current.append(para)
             current_len += para_len
 
@@ -89,6 +107,48 @@ class TextChunker:
             chunks.append(self._make_chunk(current, page_number))
 
         return chunks
+
+    @property
+    def _effective_overlap(self) -> int:
+        """把异常的大 overlap 收敛到可前进范围，保证硬切不会死循环。"""
+        return min(max(int(self.chunk_overlap), 0), max(int(self.chunk_size) - 1, 0))
+
+    def _split_long_paragraph(self, paragraph: str) -> List[str]:
+        """按句末/分号/空白优先切分超长段落，无边界时使用固定窗口。
+
+        下一窗口从 ``end-overlap`` 开始；overlap 最大为 ``chunk_size-1``，
+        因此每轮至少前进一个字符。切片仅去掉首尾空白，不丢弃正文字符。
+        """
+        if len(paragraph) <= self.chunk_size:
+            return [paragraph]
+        if self.chunk_size <= 0:
+            raise ValueError("chunk_size 必须大于 0")
+
+        pieces = []
+        start = 0
+        paragraph_len = len(paragraph)
+        while start < paragraph_len:
+            hard_end = min(start + self.chunk_size, paragraph_len)
+            end = hard_end
+            if hard_end < paragraph_len:
+                minimum = start + max(1, self.chunk_size // 2)
+                for index in range(hard_end - 1, minimum - 1, -1):
+                    char = paragraph[index]
+                    if char in self._SPLIT_BOUNDARIES:
+                        end = index + 1
+                        break
+                    if char.isspace():
+                        end = index
+                        break
+
+            piece = paragraph[start:end].strip()
+            if piece:
+                pieces.append(piece)
+            if end >= paragraph_len:
+                break
+            start = max(end - self._effective_overlap, start + 1)
+
+        return pieces
 
     def _infer_chunk_type(self, paragraphs: List[str]) -> str:
         """根据段落开头关键词推断内容类型。"""
