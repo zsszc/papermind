@@ -130,7 +130,30 @@ def _common_payload(report: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _parity(production: dict[str, Any], weighted: dict[str, Any]) -> dict[str, Any]:
+def evaluate_weighted_baseline_parity(
+    production: dict[str, Any], weighted: dict[str, Any]
+) -> dict[str, Any]:
+    """在运行权重网格前独立验证旧 hybrid 与新等权逐题顺序。"""
+    _validate_complete_report(production, split="train", weighted=False)
+    _validate_complete_report(weighted, split="train", weighted=True)
+    weight = weighted["pipeline"]["weighted_rrf"]["lexical_weight"]
+    if weight != 1.0:
+        raise ValueError("baseline parity 必须使用词法权重 1.0")
+    production_common = _common_payload(production)
+    weighted_common = _common_payload(weighted)
+    for key in (
+        "dataset_sha256", "qrels_sha256", "corpus_manifest_sha256",
+        "page_text_manifest_sha256", "resolver_version",
+        "vector_manifest_sha256",
+    ):
+        if (
+            production_common["benchmark"].get(key)
+            != weighted_common["benchmark"].get(key)
+        ):
+            raise ValueError("baseline parity 快照指纹不一致")
+    if production_common["git_sha"] != weighted_common["git_sha"]:
+        raise ValueError("baseline parity git_sha 不一致")
+
     production_items = {
         item["qa_id"]: item.get("retrieved_ids")
         for item in production.get("items", [])
@@ -139,18 +162,28 @@ def _parity(production: dict[str, Any], weighted: dict[str, Any]) -> dict[str, A
         item["qa_id"]: item.get("retrieved_ids")
         for item in weighted.get("items", [])
     }
-    if production_items != weighted_items:
-        raise ValueError("生产 hybrid 与 weighted 1.0 baseline parity 失败")
+    if set(production_items) != set(weighted_items):
+        raise ValueError("baseline parity QA 集合不一致")
+    matched = sum(
+        production_items[qa_id] == weighted_items[qa_id]
+        for qa_id in production_items
+    )
+    result = {
+        "gate_version": "weighted-rrf-baseline-parity-v1",
+        "passed": matched == len(production_items),
+        "matched_queries": matched,
+        "total_queries": len(production_items),
+    }
+    if not result["passed"]:
+        return result
     payload = json.dumps(
         sorted(production_items.items()),
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
-    return {
-        "matched_queries": len(production_items),
-        "retrieved_ids_sha256": hashlib.sha256(payload).hexdigest(),
-    }
+    result["retrieved_ids_sha256"] = hashlib.sha256(payload).hexdigest()
+    return result
 
 
 def _candidate_gate(
@@ -231,7 +264,11 @@ def select_weighted_rrf_train(
             raise ValueError("生产 baseline 与 Weighted-RRF 快照指纹不一致")
     if production_common["git_sha"] != common["git_sha"]:
         raise ValueError("生产 baseline 与 Weighted-RRF git_sha 不一致")
-    parity = _parity(production_baseline, weighted_baseline)
+    parity = evaluate_weighted_baseline_parity(
+        production_baseline, weighted_baseline
+    )
+    if not parity["passed"]:
+        raise ValueError("生产 hybrid 与 weighted 1.0 baseline parity 失败")
 
     rows: list[dict[str, Any]] = []
     passed_reports: list[tuple[dict[str, Any], dict[str, Any]]] = []
@@ -335,7 +372,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--production-baseline", required=True)
     parser.add_argument("--weighted-baseline", required=True)
-    parser.add_argument("--candidate", action="append", required=True)
+    parser.add_argument("--candidate", action="append", default=[])
+    parser.add_argument("--parity-only", action="store_true")
     parser.add_argument("--output", default=None)
     return parser
 
@@ -343,11 +381,16 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     load = lambda path: json.loads(Path(path).read_text(encoding="utf-8"))
-    result = select_weighted_rrf_train(
-        load(args.production_baseline),
-        load(args.weighted_baseline),
-        [load(path) for path in args.candidate],
-    )
+    production = load(args.production_baseline)
+    weighted = load(args.weighted_baseline)
+    if args.parity_only:
+        if args.candidate:
+            raise ValueError("--parity-only 不得指定 --candidate")
+        result = evaluate_weighted_baseline_parity(production, weighted)
+    else:
+        result = select_weighted_rrf_train(
+            production, weighted, [load(path) for path in args.candidate]
+        )
     rendered = json.dumps(result, ensure_ascii=False, indent=2)
     if args.output:
         output = Path(args.output)
