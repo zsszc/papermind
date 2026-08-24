@@ -92,4 +92,3 @@ Gate 失败。按规格停止在向量构建之前，避免约 2904 次无效向
 - 下一批 Batch 22D 先建立版本化跨块 evidence Benchmark v2：同一个新 resolver 下同时重跑
   旧粒度基线与新候选，报告 any-hit 和 span-coverage，禁止把 v1/v2 指标直接拼接。
 - 真实 Kimi 生成评测和主库数据换入仍分别等待用户明确授权。
-

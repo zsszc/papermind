@@ -184,4 +184,3 @@ def test_cli_only_builds_candidate_and_has_no_activate_flag():
 
     assert args.candidate == "/tmp/candidate.db"
     assert not hasattr(args, "activate")
-

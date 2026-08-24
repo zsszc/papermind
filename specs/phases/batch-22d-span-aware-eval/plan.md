@@ -7,4 +7,3 @@
 5. TRAIN：同一 v2 Benchmark 下比较两者，只执行冻结 train Gate。
 6. DEV：仅 train 通过时运行一次；不看 holdout、不调用 Kimi。
 7. TRACE：完整 Harness、测试报告、路线图、分批提交与 push。
-
