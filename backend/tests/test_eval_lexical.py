@@ -76,6 +76,30 @@ def test_bilingual_profile_expands_only_explicit_domain_terms():
     }.issubset(expanded)
 
 
+def test_bilingual_v2_appends_only_frozen_pathology_terms_in_order():
+    """v2 只追加四个已冻结 token，缩写、数字与旧 v1 结果保持原序。"""
+    query = "T3 WSI 87.3% 的切片肿瘤特征提取与特征"
+
+    baseline = _query_technical_terms(query, bilingual=True)
+    expanded = _query_technical_terms(
+        query, bilingual=True, bilingual_profile="v2"
+    )
+
+    assert baseline == ["t3", "wsi", "87.3%"]
+    assert expanded == baseline + [
+        "slide", "tumor", "feature", "extraction"
+    ]
+    assert expanded.count("feature") == 1
+
+
+def test_bilingual_v2_unknown_terms_are_not_guessed():
+    query = "未知中文术语与 XQZ-Model"
+
+    assert _query_technical_terms(
+        query, bilingual=True, bilingual_profile="v2"
+    ) == ["xqz-model"]
+
+
 def test_bilingual_bm25_can_retrieve_english_evidence_for_chinese_query(db):
     _add_paper_with_chunks(db, [
         "unrelated background",
@@ -87,6 +111,27 @@ def test_bilingual_bm25_can_retrieve_english_evidence_for_chinese_query(db):
         db, "原型分类的可解释推理", limit=2, bilingual=True
     )
     assert results[0]["chunk_id"] == "p1_c1"
+
+
+def test_bilingual_v2_is_opt_in_and_can_rank_pathology_evidence(db):
+    _add_paper_with_chunks(db, [
+        "unrelated background",
+        "slide tumor feature extraction evidence",
+    ])
+    query = "切片肿瘤特征提取"
+
+    baseline = _keyword_chunk_search(
+        db, query, limit=2, lexical_profile="bm25-bilingual"
+    )
+    candidate = _keyword_chunk_search(
+        db, query, limit=2, lexical_profile="bm25-bilingual-v2"
+    )
+
+    assert baseline == []
+    assert [item["chunk_id"] for item in candidate] == ["p1_c1"]
+    assert {item["source"] for item in candidate} == {
+        "keyword-bm25-bilingual-v2"
+    }
 
 
 def test_neighbor_profile_uses_same_paper_adjacent_scores_only():
@@ -168,3 +213,13 @@ def test_parser_accepts_neighbor_profile():
     ])
 
     assert args.lexical_profile == "bm25-bilingual-neighbor"
+
+
+def test_parser_accepts_bilingual_v2_profile():
+    args = build_parser().parse_args([
+        "--keyword-only",
+        "--lexical-profile",
+        "bm25-bilingual-v2",
+    ])
+
+    assert args.lexical_profile == "bm25-bilingual-v2"
