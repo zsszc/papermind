@@ -18,13 +18,45 @@ Batch 22C 证明 512 字符硬切能消除 Embedding 前 512 词截断风险，�
   晋级主 Gate 预先冻结，不能在看到结果后切换指标。
 - 只运行 private train；train 晋级后才允许一次 dev。不得运行 holdout 或 Kimi。
 
-## 3. 安全与数据
+## 3. Benchmark v2 冻结契约
+
+### 3.1 Chunk 页内坐标
+
+- `chunks.page_start` / `chunks.page_end` 为可空整数，采用相对 `PDFParser.extract_text()`
+  返回页文本的 Python 字符下标半开区间 `[page_start, page_end)`。
+- 正文 chunk 必须满足 `0 <= page_start < page_end <= len(page_text)`；摘要 sentinel
+  (`chunk_index=-1`) 不参与 span qrel，坐标保持 `NULL`。
+- v1 历史库不会自动假装拥有坐标。v2 resolver 遇到目标页正文坐标缺失、越界或无法完整
+  覆盖证据 span 时必须 fail-close。
+
+### 3.2 Evidence resolver v2
+
+1. 先按稳定 `paper_uid` 唯一解析论文。
+2. 在该论文每一页的原始解析文本中逐字查找 quote；整篇必须且只能命中一次。
+3. quote 若只能通过拼接相邻页才能命中，视为跨页证据并拒绝。
+4. 将唯一 `[quote_start, quote_end)` 映射到同页所有相交正文 chunk；相交区间并集必须
+   完整覆盖 quote span。
+5. 每条 evidence 保留独立 chunk ID 组；报告不得写入 quote、问题或论文正文。
+
+### 3.3 指标与主 Gate
+
+对每条正例 QA 的 evidence 组 `G={g1...gn}`、检索前 k 个 ID 集合 `Rk`：
+
+- `any_hit@k = mean(1[Rk ∩ gi != ∅] for gi in G)`；
+- `span_coverage@k = |Rk ∩ union(G)| / |union(G)|`；
+- MRR/NDCG 继续对 `union(G)` 计算，仅用于排序诊断。
+
+报告 overall 为所有正例 QA 单题分数的宏平均。Batch 22D 的冻结晋级条件为：候选 train
+`any_hit@5` 不低于同次旧基线，`span_coverage@5`、MRR、NDCG 全部报告但不允许在看到
+结果后替换主 Gate。解析失败、运行时降级、指纹不一致均直接拒绝候选。
+
+## 4. 安全与数据
 
 - 所有 schema/offset 重建仍在复制 SQLite 与 stage Chroma 上执行，生产库只读。
 - PDF 原文、QA、quote、逐题报告只留 `eval/private`；Git 仅提交聚合数字与原创合成 Harness。
 - v1 resolver 保持兼容；报告必须记录 benchmark/resolver 版本，版本不同的 comparison key 不同。
 
-## 4. 验收标准
+## 5. 验收标准
 
 1. 合成测试覆盖单块、跨两块、overlap 重复、跨页拒绝、quote 多处原文命中 fail-close。
 2. chunk 坐标连续、页内有效，旧数据库空坐标不被误当 v2 证据。
