@@ -45,12 +45,20 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from eval.dataset import load_dataset, resolve_relevant_chunks, validate_dataset
+from eval.dataset import (
+    _default_page_loader,
+    load_dataset,
+    resolve_relevant_chunks,
+    resolve_relevant_spans_v2,
+    validate_dataset,
+)
 from eval.metrics import (
     citation_f1,
     citation_precision,
     citation_recall,
     contains_refusal,
+    evidence_any_hit_at_k,
+    evidence_span_coverage_at_k,
     keyword_hit_rate,
     latency_stats,
     mrr,
@@ -204,6 +212,85 @@ def _resolve_qrels_or_raise(
             "正例 qrels 无法解析，评测已中止: " + ", ".join(unresolved)
         )
     return resolved
+
+
+class _CachedPageLoader:
+    """一次评测内缓存 PDF 页解析，并生成不含原文的稳定页文本指纹。"""
+
+    def __init__(self, runtime_root: Path):
+        self.runtime_root = Path(runtime_root)
+        self._load = _default_page_loader(self.runtime_root)
+        self._cache: Dict[int, list[dict]] = {}
+        self._paper_uids: Dict[int, str] = {}
+
+    def __call__(self, paper) -> list[dict]:
+        from eval.private_benchmark import paper_uid
+
+        if paper.id not in self._cache:
+            self._cache[paper.id] = self._load(paper)
+            self._paper_uids[paper.id] = paper_uid(paper, self.runtime_root)
+        return self._cache[paper.id]
+
+    def manifest_sha256(self) -> str:
+        manifest = [
+            {
+                "paper_uid": self._paper_uids[paper_id],
+                "pages": [
+                    {
+                        "page_number": page.get("page_number"),
+                        "text_sha256": _sha256_bytes(
+                            (page.get("text") or "").encode("utf-8")
+                        ),
+                    }
+                    for page in pages
+                ],
+            }
+            for paper_id, pages in self._cache.items()
+        ]
+        manifest.sort(key=lambda item: item["paper_uid"])
+        payload = json.dumps(
+            manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return _sha256_bytes(payload)
+
+
+def _resolve_span_qrels_or_raise(
+    db,
+    items: List[Dict[str, Any]],
+    runtime_root: Path,
+    page_loader=None,
+) -> tuple[Dict[str, List[str]], Dict[str, list[dict]], str]:
+    """预解析 page-span-v2 qrels，并返回页文本指纹。"""
+    loader = page_loader or _CachedPageLoader(runtime_root)
+    resolved: Dict[str, List[str]] = {}
+    spans: Dict[str, list[dict]] = {}
+    unresolved: List[str] = []
+    for entry in items:
+        groups = resolve_relevant_spans_v2(
+            db,
+            entry,
+            runtime_root=runtime_root,
+            page_loader=loader,
+        )
+        ids = list(dict.fromkeys(
+            chunk["chunk_id"]
+            for group in groups
+            for chunk in group["chunks"]
+        ))
+        resolved[entry["qa_id"]] = ids
+        spans[entry["qa_id"]] = groups
+        if entry["has_answer"] and not ids:
+            unresolved.append(entry["qa_id"])
+    if unresolved:
+        raise ValueError(
+            "正例 span qrels 无法解析，评测已中止: " + ", ".join(unresolved)
+        )
+    manifest = (
+        loader.manifest_sha256()
+        if hasattr(loader, "manifest_sha256")
+        else "injected-page-loader"
+    )
+    return resolved, spans, manifest
 
 
 # ---------------------------------------------------------------------------
@@ -653,9 +740,10 @@ def _build_quality_gate(
     min_factoid_recall: Optional[float] = None,
     max_p95_ms: Optional[float] = None,
     runtime_valid: bool,
+    primary_metric: Optional[str] = None,
 ) -> Dict[str, Any]:
     """构造可审计多指标 Gate；未显式配置的可选指标不进入 checks。"""
-    recall_key = f"recall@{top_k}"
+    recall_key = primary_metric or f"recall@{top_k}"
     ndcg_key = f"ndcg@{top_k}"
     checks: Dict[str, Dict[str, Any]] = {
         recall_key: {
@@ -682,9 +770,14 @@ def _build_quality_gate(
         (row for row in type_rows if row.get("question_type") == "factoid"),
         None,
     )
+    factoid_field = (
+        "span_coverage" if primary_metric and primary_metric.startswith(
+            "span_coverage@"
+        ) else "recall"
+    )
     _minimum(
         "factoid_recall",
-        factoid_row.get("recall") if factoid_row else None,
+        factoid_row.get(factoid_field) if factoid_row else None,
         min_factoid_recall,
     )
     if max_p95_ms is not None:
@@ -808,12 +901,22 @@ def run_eval(args: argparse.Namespace) -> int:
         benchmark.update({
             "qrels_sha256": _qrels_sha256(items),
             "benchmark_id": fixture_metadata.get("benchmark_id", "private-local-observation"),
+            "resolver_version": args.evidence_resolver,
         })
         if fixture_metadata:
             benchmark["fixture_license"] = fixture_metadata["license"]
-        resolved_qrels = _resolve_qrels_or_raise(
-            db, items, runtime_root=runtime_root
-        )
+        span_qrels: Dict[str, list[dict]] = {}
+        if args.evidence_resolver == "page-span-v2":
+            resolved_qrels, span_qrels, page_manifest = (
+                _resolve_span_qrels_or_raise(
+                    db, items, runtime_root=runtime_root
+                )
+            )
+            benchmark["page_text_manifest_sha256"] = page_manifest
+        else:
+            resolved_qrels = _resolve_qrels_or_raise(
+                db, items, runtime_root=runtime_root
+            )
         retriever = Retriever(
             db,
             top_k=args.top_k,
@@ -831,7 +934,10 @@ def run_eval(args: argparse.Namespace) -> int:
 
         per_item: List[Dict[str, Any]] = []
         by_type: Dict[str, Dict[str, List[float]]] = defaultdict(
-            lambda: {"recall": [], "mrr": [], "ndcg": []})
+            lambda: {
+                "recall": [], "mrr": [], "ndcg": [],
+                "any_hit": [], "span_coverage": [],
+            })
         gen_metrics = {
             "citation_precision": [],
             "citation_recall": [],
@@ -876,6 +982,22 @@ def run_eval(args: argparse.Namespace) -> int:
                 grp["recall"].append(rec)
                 grp["mrr"].append(rr)
                 grp["ndcg"].append(nd)
+                if args.evidence_resolver == "page-span-v2":
+                    groups = span_qrels[entry["qa_id"]]
+                    any_hit = evidence_any_hit_at_k(
+                        retrieved_ids, groups, args.top_k
+                    )
+                    span_coverage = evidence_span_coverage_at_k(
+                        retrieved_ids, groups, args.top_k
+                    )
+                    record.update({
+                        "relevant_span_count": len(groups),
+                        "relevant_chunk_count": len(relevant_ids),
+                        "any_hit": any_hit,
+                        "span_coverage": span_coverage,
+                    })
+                    grp["any_hit"].append(any_hit)
+                    grp["span_coverage"].append(span_coverage)
             else:
                 negative_total += 1
 
@@ -939,10 +1061,25 @@ def run_eval(args: argparse.Namespace) -> int:
             "n_positive": len(all_recall),
             "n_negative": negative_total,
         }
+        if args.evidence_resolver == "page-span-v2":
+            all_any_hit = [
+                value for group in by_type.values()
+                for value in group["any_hit"]
+            ]
+            all_span_coverage = [
+                value for group in by_type.values()
+                for value in group["span_coverage"]
+            ]
+            overall[f"any_hit@{args.top_k}"] = _mean(all_any_hit)
+            overall[f"span_coverage@{args.top_k}"] = _mean(all_span_coverage)
         type_rows = [
             {"question_type": qtype, "n": len(g["recall"]),
              "recall": _mean(g["recall"]), "mrr": _mean(g["mrr"]),
-             "ndcg": _mean(g["ndcg"])}
+             "ndcg": _mean(g["ndcg"]),
+             **({
+                 "any_hit": _mean(g["any_hit"]),
+                 "span_coverage": _mean(g["span_coverage"]),
+             } if args.evidence_resolver == "page-span-v2" else {})}
             for qtype, g in sorted(by_type.items())
         ]
 
@@ -952,6 +1089,8 @@ def run_eval(args: argparse.Namespace) -> int:
             benchmark["corpus_manifest_sha256"],
             retriever.mode,
             args.lexical_profile,
+            args.evidence_resolver,
+            benchmark.get("page_text_manifest_sha256", "none"),
             str(args.top_k),
         ))
         runtime_valid = retriever.runtime_degraded_count == 0
@@ -967,6 +1106,10 @@ def run_eval(args: argparse.Namespace) -> int:
             min_factoid_recall=args.min_factoid_recall,
             max_p95_ms=args.max_p95_ms,
             runtime_valid=runtime_valid,
+            primary_metric=(
+                f"span_coverage@{args.top_k}"
+                if args.evidence_resolver == "page-span-v2" else None
+            ),
         )
         passed = gate["passed"]
         effective_profile = (
@@ -989,6 +1132,7 @@ def run_eval(args: argparse.Namespace) -> int:
                 "lexical_profile": args.lexical_profile,
                 "semantic_rerank": args.semantic_rerank,
                 "split": args.split,
+                "evidence_resolver": args.evidence_resolver,
                 "top_k": args.top_k,
             },
             "diagnostics": {
@@ -1105,6 +1249,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="解析稳定 PDF 身份的只读语料根目录",
     )
+    parser.add_argument(
+        "--evidence-resolver",
+        choices=("chunk-v1", "page-span-v2"),
+        default="chunk-v1",
+        help="证据解析契约；历史默认 chunk-v1，跨块评测须显式选 page-span-v2",
+    )
     parser.add_argument("--top-k", type=int, default=5,
                         help="检索截断位置 k（默认 5，即 recall@5 / NDCG@5）")
     parser.add_argument(
@@ -1191,8 +1341,15 @@ def _validate_cli_args(args: argparse.Namespace) -> Optional[str]:
         return "fixture 评测必须显式使用 --keyword-only"
     if args.fixture and (args.database or args.corpus_root):
         return "fixture 评测不得指定 --database/--corpus-root"
+    if args.fixture and args.evidence_resolver != "chunk-v1":
+        return "fixture 评测只支持 chunk-v1"
     if args.database and not args.corpus_root:
         return "显式 --database 必须同时指定 --corpus-root"
+    if args.evidence_resolver == "page-span-v2":
+        if not args.database or not args.corpus_root:
+            return "page-span-v2 必须显式指定 --database/--corpus-root"
+        if args.split == "all":
+            return "page-span-v2 必须显式指定 train/dev/holdout 分区"
     if args.fixture and args.with_llm:
         return "fixture 评测不得使用 --with-llm"
     if args.with_llm and args.split != "dev":

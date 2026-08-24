@@ -109,6 +109,87 @@ def test_parser_accepts_explicit_candidate_database_and_corpus_root(tmp_path):
     assert args.corpus_root == str(tmp_path / "corpus")
 
 
+def test_page_span_v2_requires_isolated_database_split_and_corpus(tmp_path):
+    parser = run.build_parser()
+    args = parser.parse_args(["--evidence-resolver", "page-span-v2"])
+    assert "--database/--corpus-root" in run._validate_fixture_args(args)
+
+    args = parser.parse_args([
+        "--evidence-resolver", "page-span-v2",
+        "--database", str(tmp_path / "candidate.db"),
+        "--corpus-root", str(tmp_path / "corpus"),
+    ])
+    assert "train/dev/holdout" in run._validate_fixture_args(args)
+
+
+def test_page_span_v2_report_uses_character_coverage_gate(tmp_path, monkeypatch):
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from app.database import Base
+    from app.models import Chunk, Paper
+
+    database = tmp_path / "candidate.db"
+    engine = create_engine(f"sqlite:///{database}")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    with Session() as db:
+        db.add(Paper(
+            id=1, title="fixture", doi="10.1/span", filename="x.pdf",
+            file_path="papers/x.pdf", processed="done",
+        ))
+        db.add(Chunk(
+            paper_id=1, chunk_index=0, page_number=1,
+            page_start=0, page_end=30, content="target evidence span",
+        ))
+        db.commit()
+    engine.dispose()
+
+    entry = {
+        "qa_id": "span-1", "question": "target evidence",
+        "ground_truth": "target", "question_type": "factoid",
+        "source": "synthetic", "has_answer": True, "split": "train",
+        "relevant_evidence": [{
+            "paper_uid": "doi:10.1/span",
+            "quote": "target evidence span long enough",
+        }],
+    }
+    dataset = tmp_path / "qa.jsonl"
+    dataset.write_text(json.dumps(entry) + "\n", encoding="utf-8")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    report_dir = tmp_path / "reports"
+    group = {
+        "paper_id": 1, "page_number": 1, "page_start": 0, "page_end": 20,
+        "chunks": [{
+            "chunk_id": "p1_c0", "page_start": 0, "page_end": 20,
+        }],
+    }
+    monkeypatch.setattr(
+        run,
+        "_resolve_span_qrels_or_raise",
+        lambda *args, **kwargs: (
+            {"span-1": ["p1_c0"]}, {"span-1": [group]}, "a" * 64
+        ),
+    )
+
+    assert run.main([
+        "--database", str(database), "--corpus-root", str(corpus),
+        "--dataset", str(dataset), "--split", "train",
+        "--evidence-resolver", "page-span-v2", "--keyword-only",
+        "--threshold", "0", "--report-dir", str(report_dir),
+    ]) == 0
+    report = json.loads(next(report_dir.glob("*.json")).read_text())
+
+    assert report["benchmark"]["resolver_version"] == "page-span-v2"
+    assert report["benchmark"]["page_text_manifest_sha256"] == "a" * 64
+    assert report["pipeline"]["evidence_resolver"] == "page-span-v2"
+    assert report["overall"]["any_hit@5"] == pytest.approx(1.0)
+    assert report["overall"]["span_coverage@5"] == pytest.approx(1.0)
+    assert report["gate"]["metric"] == "span_coverage@5"
+    assert "chunks" not in report["items"][0]
+
+
 def test_explicit_database_does_not_use_production_session(
     tmp_path, monkeypatch
 ):
