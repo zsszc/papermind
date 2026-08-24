@@ -209,7 +209,7 @@ cd ../electron && npm test       # node:test（health / wait / restart / kill �
 ```
 
 前端测试依赖包含 MSW，新增网络交互测试不得连接真实后端；Electron 生命周期与安全策略纯模块不得
-`require('electron')`，确保 CI 无 GUI 也能运行。当前后端 623 个测试、前端 39 个测试、Electron 26 个测试。
+`require('electron')`，确保 CI 无 GUI 也能运行。当前后端 633 个测试、前端 39 个测试、Electron 26 个测试。
 
 ### RAG 评测（backend/eval/）
 
@@ -231,6 +231,7 @@ env -u PYTHONPATH venv/bin/python -m eval.run \
 - `eval/private/` 为已忽略的真实语料评测目录；v1 共 72 条已审 QA / 18 篇论文，train/dev/holdout 各 24 条，证据 72/72 唯一解析
 - **真实库留出基线**：BM25 Recall@5/MRR/NDCG@5 为 0.542/0.308/0.365；中英术语扩展为 0.583/0.353/0.410
 - **生产聊天当前 shared hybrid（private dev）**：显式 464-chunk 快照，Recall@5/MRR/NDCG@5 为 0.625/0.39375/0.4517186825，factoid Recall=0.333，P95=275.7ms、零降级；聊天与 eval 有逐项排序 parity Harness。该结果只用于开发诊断，不替代 holdout
+- **Batch 21 邻域候选未晋级**：`hybrid-local-neighbor`（semantic top20、同论文 ±2、固定 rank-distance 衰减）dev 为 0.625/0.36389/0.43005，factoid 仍 0.333、P95=270.1ms；MRR/NDCG/factoid Gate 失败，生产默认保持 shared hybrid。候选仅供显式复现
 - **历史纯语义对齐基线**：`semantic-production` 为 0.500/0.268/0.324，P95=245.6ms、factoid=0；保留为改进起点，不再是生产默认
 - 私有真实库不可与公开基准混算趋势；公开集用于链路正确性和回归，不替代真实论文质量评测
 
@@ -277,4 +278,4 @@ env -u PYTHONPATH venv/bin/python -m eval.run \
 
 ---
 
-> 最后更新：2026-08-24，Batch 20 共享检索管线与生产 Hybrid 晋级后同步。
+> 最后更新：2026-08-24，Batch 21 论文内语义邻域候选被多指标 Gate 拒绝后同步。
