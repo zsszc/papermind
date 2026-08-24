@@ -507,6 +507,59 @@ def weighted_rrf_fuse_chunks(
     return [copy.deepcopy(metas[chunk_id]) for chunk_id in ordered[:top_k]]
 
 
+def weighted_rrf_compat_fuse_chunks(
+    semantic_results: List[Dict[str, Any]],
+    keyword_results: List[Dict[str, Any]],
+    top_k: int,
+    *,
+    semantic_weight: float = 1.0,
+    keyword_weight: float = 1.0,
+    k: int = 60,
+) -> List[Dict[str, Any]]:
+    """只改变分支分子的旧版兼容 Weighted-RRF。
+
+    该函数有意保留 ``rrf_fuse_chunks`` 的原始 rank、重复贡献、ID
+    fallback、首次 metadata、tie 与切片/异常语义；新增校验只约束新引入的
+    两个权重。等权时应与旧函数逐值相等。
+    """
+    for name, value in (
+        ("semantic_weight", semantic_weight),
+        ("keyword_weight", keyword_weight),
+    ):
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+            or float(value) <= 0
+        ):
+            raise WeightedRRFError(f"{name} 必须是有限正数")
+
+    scores: Dict[Any, float] = {}
+    metas: Dict[Any, Dict[str, Any]] = {}
+    order: Dict[Any, int] = {}
+
+    def _add(results: List[Dict[str, Any]], weight: float) -> None:
+        for rank, item in enumerate(results):
+            chunk_id = item.get("chunk_id")
+            if chunk_id is None and _CHUNK_ID_FULL_RE.fullmatch(
+                str(item.get("source", ""))
+            ):
+                chunk_id = str(item["source"])
+            if chunk_id is None:
+                continue
+            scores[chunk_id] = (
+                scores.get(chunk_id, 0.0) + float(weight) / (k + rank + 1)
+            )
+            if chunk_id not in metas:
+                order[chunk_id] = len(order)
+                metas[chunk_id] = copy.deepcopy(item)
+
+    _add(semantic_results, semantic_weight)
+    _add(keyword_results, keyword_weight)
+    ordered = sorted(scores, key=lambda cid: (-scores[cid], order[cid], cid))
+    return [copy.deepcopy(metas[cid]) for cid in ordered[:top_k]]
+
+
 def parent_child_fuse_chunks(
     semantic_results: List[Dict[str, Any]],
     keyword_results: List[Dict[str, Any]],
@@ -657,17 +710,19 @@ class RetrievalPipeline:
             lexical_profile = "bm25-bilingual"
         if profile not in {
             "semantic", "hybrid", "hybrid-local-neighbor",
-            "parent-child-v1", "weighted-rrf-v1", "keyword"
+            "parent-child-v1", "weighted-rrf-v1",
+            "weighted-rrf-compat-v1", "keyword"
         }:
             raise ValueError(f"不支持的检索 profile: {requested_profile}")
-        if profile != "weighted-rrf-v1" and rrf_lexical_weight is not None:
-            raise ValueError("rrf_lexical_weight 仅适用于 weighted-rrf-v1")
+        weighted_profiles = {"weighted-rrf-v1", "weighted-rrf-compat-v1"}
+        if profile not in weighted_profiles and rrf_lexical_weight is not None:
+            raise ValueError("rrf_lexical_weight 仅适用于 Weighted-RRF profile")
 
         keyword_results: List[Dict[str, Any]] = []
         keyword_error = False
         if profile in {
             "hybrid", "hybrid-local-neighbor", "parent-child-v1",
-            "weighted-rrf-v1", "keyword"
+            "weighted-rrf-v1", "weighted-rrf-compat-v1", "keyword"
         }:
             try:
                 keyword_results = keyword_chunk_search(
@@ -746,7 +801,7 @@ class RetrievalPipeline:
             )
             return copy.deepcopy(semantic_results[:top_k])
 
-        if profile == "weighted-rrf-v1":
+        if profile in weighted_profiles:
             if semantic_reason is not None:
                 self._write_diagnostics(
                     diagnostics, requested_profile, "empty",
@@ -760,7 +815,12 @@ class RetrievalPipeline:
                 )
                 return []
             try:
-                results = weighted_rrf_fuse_chunks(
+                fuse = (
+                    weighted_rrf_compat_fuse_chunks
+                    if profile == "weighted-rrf-compat-v1"
+                    else weighted_rrf_fuse_chunks
+                )
+                results = fuse(
                     semantic_results,
                     keyword_results,
                     top_k,
@@ -778,7 +838,7 @@ class RetrievalPipeline:
                 )
                 return []
             self._write_diagnostics(
-                diagnostics, requested_profile, "weighted-rrf-v1",
+                diagnostics, requested_profile, profile,
                 degraded=False, reason=None,
             )
             return results
