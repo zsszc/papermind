@@ -23,6 +23,8 @@ Batch 22D/22E 连续证明细粒度重分块及 parent 聚合都会损害真实�
 - 选优采用词典序：先满足硬 Gate，再最大化 factoid Recall、总体 Recall、MRR、NDCG；仍并列时
   选择更接近等权的较小词法权重。
 - 基线与三组候选统一使用显式 `weighted-rrf-v1` profile；权重不编码进 profile 名，报告单独记录。
+- 进入网格前，使用同一快照另跑一次旧生产 `hybrid` 控制；其 24 条 train 的 QA ID 与 top-5
+  `retrieved_ids` 顺序必须与 weighted `1.0/1.0` 逐题完全一致，否则立即停止本批。
 
 ## 3. 数据协议与 Gate
 
@@ -35,7 +37,8 @@ Batch 22D/22E 连续证明细粒度重分块及 parent 聚合都会损害真实�
   的自动语料统计方案，不继续调网格。
 - 自动选择器必须一次接收恰好一份 `1.0/1.0` 基线及三份冻结候选，输入顺序不影响结果；缺失、
   重复或额外权重均 fail-close。公共配对指纹至少包含 dataset、qrels、corpus、page text、resolver、
-  SQLite/Chroma ID 与 embedding、融合公式 contract。
+  SQLite/Chroma ID 与 embedding、不含权重的融合公式 SHA。每次运行另记录包含权重的配置 SHA，
+  该字段必须按冻结权重不同，不能错误加入公共相等键。
 
 ## 4. 工程范围
 
