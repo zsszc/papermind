@@ -172,7 +172,8 @@ class TestGraphOutputs:
             paper_id=7,
         )
         assert store.search_calls[0]["filters"] == {"paper_id": 7}
-        assert store.search_calls[0]["top_k"] == agent_graph.RETRIEVE_TOP_K
+        # Batch20 dev/公开 Gate 通过后，缺省策略晋级为 hybrid，语义候选池为 2*k。
+        assert store.search_calls[0]["top_k"] == agent_graph.RETRIEVE_TOP_K * 2
 
     def test_retrieve_uses_configured_hybrid_pipeline(
         self, db, conversation, monkeypatch, chunk

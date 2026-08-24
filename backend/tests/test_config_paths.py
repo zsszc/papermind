@@ -35,6 +35,17 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def test_public_template_uses_gated_production_defaults():
+    """新安装必须获得已通过 Batch20 Gate 的检索策略与当前可用 Kimi 模型。"""
+    public = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
+
+    assert public["retrieval"]["chat_profile"] == "hybrid"
+    assert public["retrieval"]["lexical_profile"] == "bm25-bilingual"
+    assert public["retrieval"]["rerank"] is False
+    assert public["llm"]["model"] == "kimi-k2.6"
+    assert public["llm"]["temperature"] == 1.0
+
+
 @pytest.fixture(autouse=True)
 def _reset_config_singleton(monkeypatch):
     """每个用例前重置 Config 单例并清除 PAPERMIND_DATA_DIR，结束后同样复位。"""
