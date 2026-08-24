@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 from app.models import Chunk, Conversation, Message, Paper
 from app.services import agent_graph
 from app.services.agent_graph import run_pre_orchestration
@@ -59,7 +61,12 @@ def _add_corpus(db):
     return conversation
 
 
-def test_chat_and_eval_hybrid_return_identical_chunk_order(db, monkeypatch):
+@pytest.mark.parametrize(
+    "lexical_profile", ["bm25-bilingual", "bm25-bilingual-v2"]
+)
+def test_chat_and_eval_hybrid_return_identical_chunk_order(
+    db, monkeypatch, lexical_profile
+):
     conversation = _add_corpus(db)
     store = _Store([
         {
@@ -82,7 +89,7 @@ def test_chat_and_eval_hybrid_return_identical_chunk_order(db, monkeypatch):
         if key == "retrieval.chat_profile":
             return "hybrid"
         if key == "retrieval.lexical_profile":
-            return "bm25-bilingual"
+            return lexical_profile
         return original_get(key, default)
 
     monkeypatch.setattr(agent_graph.config, "get", fake_config_get)
@@ -98,7 +105,7 @@ def test_chat_and_eval_hybrid_return_identical_chunk_order(db, monkeypatch):
         top_k=5,
         vector_dir=Path("explicit-snapshot"),
         retrieval_profile="hybrid",
-        lexical_profile="bm25-bilingual",
+        lexical_profile=lexical_profile,
         semantic_rerank=False,
     )
     eval_results = retriever.search("targetanchor")
