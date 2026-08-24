@@ -22,11 +22,27 @@ Batch 22D 证明纯 512/50 child 分块虽然解决了单块超长问题，却�
 
 ## 4. 预冻结算法
 
-1. child 语义与 BM25 各取 top-40，使用 RRF 生成 child 基础分。
-2. 按同页连续 parent 坐标聚合；parent 分数取最高 child 分，加不超过两个不同 child 的折扣
-   补充分，避免单一 parent 因 child 数多获益。
-3. 按 parent 分数选取候选，再从每个 parent 依基础分取 child，最终仍返回 5 个可引用 child ID。
-4. 相同 child、parent 或 overlap 区间必须确定性去重；排序并列按稳定 chunk ID。
+### 4.1 Parent 映射
+
+- `--parent-database` 必须显式指向只读旧粗分块候选；基线和 child 候选使用同一 parent 库与
+  parent manifest。
+- 正文 child 只与同论文、同页、坐标有效的 parent 比较，选择字符交集最大的 parent；零交集
+  fail-close，并列按数值 `parent.chunk_index` 升序。
+- 摘要 sentinel `c-1` 映射到同论文 parent `c-1`；parent 坐标/身份重复或缺失均 fail-close。
+- 2026-08-25 结果前聚合审计：2,904/2,904 child 可映射，零并列、零未命中；3 个 child
+  跨两个 parent，最大交集归属比例最小 0.816、均值 0.9995。该审计未读取 QA/quote。
+
+### 4.2 检索与聚合
+
+1. child 语义与 BM25 各取 top-40，使用 `k=60` 的 RRF 生成 child 基础分。
+2. 每个 parent 按 child 基础分降序，仅取前三个不同 child，parent 分数固定为
+   `s1 + 0.5*s2 + 0.25*s3`；多余 child 不加分，避免 parent 因 child 数量获益。
+3. parent 按 `(-parent_score, parent_chunk_id)` 稳定排序；parent 内 child 按
+   `(-child_score, child_chunk_id)` 稳定排序。
+4. 最终结果按 parent round-robin：第一轮每个 parent 最多取一个 child，后续轮次再取各 parent
+   的第二、第三个 child，直到返回 5 个可引用 child ID。
+5. 相同 child 只计一次；任一初召回 child 缺 parent 映射时整个 profile fail-close，不回退成
+   看似有效的普通 hybrid。
 
 ## 5. Gate
 
