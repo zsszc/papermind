@@ -123,20 +123,31 @@ def _reciprocal_rank_fusion(
 
 @router.post("", response_model=SearchResponse)
 def search(request: SearchRequest, db: Session = Depends(get_db)):
-    store = get_vector_store()
     filters = request.filters or {}
     top_k = request.top_k or 10
 
     semantic_results: List[Dict[str, Any]] = []
     keyword_results: List[Dict[str, Any]] = []
 
-    if request.use_semantic and store.available():
-        semantic_results = store.search(
-            query=request.query,
-            top_k=top_k * 2,
-            filters=filters,
-        )
-        semantic_results = [dict(r, source="semantic") for r in semantic_results]
+    if request.use_semantic:
+        try:
+            store = get_vector_store()
+            if store.available():
+                semantic_results = store.search(
+                    query=request.query,
+                    top_k=top_k * 2,
+                    filters=filters,
+                )
+                semantic_results = [
+                    dict(r, source="semantic") for r in semantic_results
+                ]
+        except Exception as e:
+            # 论文发现页的关键词检索与语义适配器相互独立；局部失败不能使
+            # 仍可用的关键词路径升级为 500。异常详情仅写日志。
+            logger.warning(
+                f"[search] 语义检索失败，降级为关键词检索: {e}",
+                exc_info=True,
+            )
 
     if request.use_keyword:
         keyword_results = _keyword_search(
