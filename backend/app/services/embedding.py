@@ -133,13 +133,14 @@ class TextChunker:
             if hard_end < paragraph_len:
                 minimum = start + max(1, self.chunk_size // 2)
                 for index in range(hard_end - 1, minimum - 1, -1):
-                    char = paragraph[index]
-                    if char in self._SPLIT_BOUNDARIES:
+                    if paragraph[index] in self._SPLIT_BOUNDARIES:
                         end = index + 1
                         break
-                    if char.isspace():
-                        end = index
-                        break
+                else:
+                    for index in range(hard_end - 1, minimum - 1, -1):
+                        if paragraph[index].isspace():
+                            end = index
+                            break
 
             piece = paragraph[start:end].strip()
             if piece:
