@@ -34,21 +34,23 @@ Batch 22C 证明 512 字符硬切能消除 Embedding 前 512 词截断风险，�
 1. 先按稳定 `paper_uid` 唯一解析论文。
 2. 在该论文每一页的原始解析文本中逐字查找 quote；整篇必须且只能命中一次。
 3. quote 若只能通过拼接相邻页才能命中，视为跨页证据并拒绝。
-4. 将唯一 `[quote_start, quote_end)` 映射到同页所有相交正文 chunk；相交区间并集必须
-   完整覆盖 quote span。
+4. 将唯一 `[quote_start, quote_end)` 映射到同页所有相交正文 chunk，并保留每个 chunk
+   与证据的交集区间；全部交集的并集必须完整覆盖 quote span。
 5. 每条 evidence 保留独立 chunk ID 组；报告不得写入 quote、问题或论文正文。
 
 ### 3.3 指标与主 Gate
 
-对每条正例 QA 的 evidence 组 `G={g1...gn}`、检索前 k 个 ID 集合 `Rk`：
+对每条正例 QA 的 evidence span 集合 `E={e1...en}`、检索前 k 个 ID 集合 `Rk`：
 
-- `any_hit@k = mean(1[Rk ∩ gi != ∅] for gi in G)`；
-- `span_coverage@k = |Rk ∩ union(G)| / |union(G)|`；
-- MRR/NDCG 继续对 `union(G)` 计算，仅用于排序诊断。
+- `any_hit@k = mean(1[Rk 命中 ei 的任一 chunk] for ei in E)`；
+- `span_coverage@k = mean(|ei ∩ union(Rk 对应 chunk span)| / |ei| for ei in E)`；
+- overlap 字符只计一次；MRR/NDCG 继续对所有 evidence chunk ID 的并集计算。
 
-报告 overall 为所有正例 QA 单题分数的宏平均。Batch 22D 的冻结晋级条件为：候选 train
-`any_hit@5` 不低于同次旧基线，`span_coverage@5`、MRR、NDCG 全部报告但不允许在看到
-结果后替换主 Gate。解析失败、运行时降级、指纹不一致均直接拒绝候选。
+报告 overall 为所有正例 QA 单题分数的宏平均。此定义避免粗/细分块的 chunk 数差异改变
+分母。Batch 22D 的冻结晋级条件为：候选 train `span_coverage@5` 至少比同次旧基线提升
+`1/24`，`any_hit@5` 与 factoid `span_coverage@5` 均不回退，MRR/NDCG 回退不超过
+`0.02`，P95 小于 1 秒且零运行时降级。不得在看到结果后切换主 Gate；解析失败、页文本
+指纹或配对配置不一致也直接拒绝候选。
 
 ## 4. 安全与数据
 
