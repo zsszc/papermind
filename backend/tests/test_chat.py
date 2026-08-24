@@ -212,7 +212,8 @@ class TestDeepReview:
     - 复用 chat.py 的 SSE 帧格式与落库前 Guardrails 校验（citations 仅本地 chunk）；
     - plan / synthesize 失败 → {error} 帧；单个子问题失败降级、不阻塞整体；
     - 服务层 services/deep_review.py（F1 并行开发）全程以假模块注入 mock，
-      仅依赖契约接口 plan(topic) / execute(sub_question) / synthesize(topic, sub_answers)。
+      仅依赖契约接口 plan(topic) / execute(sub_question, db=...) /
+      synthesize(topic, sub_answers)。
     """
 
     # ---------- 测试工具 ----------
@@ -279,7 +280,7 @@ class TestDeepReview:
             calls["plan"].append(topic)
             return qs
 
-        async def fake_execute(q):
+        async def fake_execute(q, db=None):
             calls["execute"].append(q)
             return {"question": q, "answer": "子答案", "citations": cits}
 
@@ -408,7 +409,7 @@ class TestDeepReview:
         async def fake_plan(topic):
             return ["q1", "q2"]
 
-        async def fake_execute(q):
+        async def fake_execute(q, db=None):
             if q == "q2":
                 raise RuntimeError("检索超时")
             return {"question": q, "answer": "答案1", "citations": []}
@@ -513,7 +514,7 @@ class TestDeepReview:
         async def fake_plan(topic):
             return ["q1"]
 
-        async def fake_execute(q):
+        async def fake_execute(q, db=None):
             # F1 真实 SubAnswer 的引用字段名为 chunks
             return {"question": q, "answer": "子答案", "chunks": [chunk]}
 

@@ -115,8 +115,22 @@ def thesis_env(client, db, monkeypatch):
     db.add(thesis)
     db.commit()
 
-    # 向量库桩掉（/suggest-citations 内部惰性 import，patch 模块属性即可）
-    fake_store = SimpleNamespace(available=lambda: False, search=lambda **kwargs: [])
+    # 引用推荐成功/LLM 失败用例需要至少一条本地证据；零证据用例单独覆盖。
+    fake_store = SimpleNamespace(
+        available=lambda: True,
+        search=lambda **kwargs: [{
+            "chunk_id": "p1_c0",
+            "paper_id": 1,
+            "title": "测试本地文献",
+            "authors": "测试作者",
+            "year": 2024,
+            "content": "多实例学习本地证据",
+            "page_number": 1,
+            "chunk_type": "result",
+            "score": 0.9,
+            "source": "semantic",
+        }],
+    )
     monkeypatch.setattr("app.services.retrieval.get_vector_store", lambda: fake_store)
     try:
         yield client, thesis
@@ -304,6 +318,12 @@ class TestSuggestCitationsSanitize:
         client, thesis = thesis_env
         completion = AsyncMock(return_value="不应生成")
         monkeypatch.setattr(thesis_router.llm_service, "chat_completion", completion)
+        empty_store = SimpleNamespace(
+            available=lambda: False, search=lambda **kwargs: []
+        )
+        monkeypatch.setattr(
+            "app.services.retrieval.get_vector_store", lambda: empty_store
+        )
 
         r = client.post(
             f"/api/thesis/{thesis.id}/suggest-citations",

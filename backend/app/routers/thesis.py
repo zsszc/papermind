@@ -451,12 +451,27 @@ async def suggest_citations(
     if not thesis:
         raise HTTPException(status_code=404, detail="Thesis not found")
 
-    # 语义检索相关文献片段
+    # 与聊天/eval 共用生产 chunk 检索；语义不可用时仍可在相同范围内关键词降级。
     from app.services.retrieval import get_vector_store
-    store = get_vector_store()
-    retrieved = []
-    if store.available():
-        retrieved = store.search(query=paragraph, top_k=5)
+    from app.services.retrieval_pipeline import RetrievalPipeline
+
+    retrieved = RetrievalPipeline(
+        db, vector_store=get_vector_store()
+    ).search(
+        paragraph,
+        top_k=5,
+        filters={},
+        profile=config.get("retrieval.chat_profile", "hybrid"),
+        lexical_profile=config.get(
+            "retrieval.lexical_profile", "bm25-bilingual"
+        ),
+    )
+    if not retrieved:
+        return {
+            "thesis_id": thesis_id,
+            "suggestions": "未找到可引用的本地文献证据，请补充或处理相关论文后重试。",
+            "citations": [],
+        }
 
     context = "\n\n".join([
         f"[{i}] {r.get('title') or '未知文献'}\n{r.get('content')}"

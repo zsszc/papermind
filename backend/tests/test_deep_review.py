@@ -150,13 +150,15 @@ class TestExecute:
     """execute(sub_question) -> SubAnswer：检索 + 生成，带本地引用；失败降级不抛出。"""
 
     @pytest.mark.asyncio
-    async def test_answer_and_citation_passthrough(self, monkeypatch):
+    async def test_answer_and_citation_passthrough(self, db, monkeypatch):
         """LLM 答案原文返回（含 [^n^] 标记），检索片段原样挂在 SubAnswer.chunks。"""
         chunks = [_chunk("p1_c0"), _chunk("p1_c1")]
         store, llm = _FakeStore(chunks=chunks), _FakeLLM(["答案正文[^1^][^2^]"])
         _patch_deps(monkeypatch, store=store, llm=llm)
 
-        result = await deep_review.execute(SubQuestion(index=1, question="MIL 方法有哪些？"))
+        result = await deep_review.execute(
+            SubQuestion(index=1, question="MIL 方法有哪些？"), db=db
+        )
 
         assert result.ok is True
         assert result.answer == "答案正文[^1^][^2^]"
@@ -209,26 +211,28 @@ class TestExecute:
         assert len(llm.calls) == 1
 
     @pytest.mark.asyncio
-    async def test_prompt_uses_rag_citation_format(self, monkeypatch):
+    async def test_prompt_uses_rag_citation_format(self, db, monkeypatch):
         """发给 LLM 的上下文沿用 build_rag_prompt 引用格式（[i] 编号 + [^i^] 标注约定）。"""
         store = _FakeStore(chunks=[_chunk("p1_c0")])
         llm = _FakeLLM(["答案[^1^]"])
         _patch_deps(monkeypatch, store=store, llm=llm)
 
-        await deep_review.execute(SubQuestion(index=1, question="子问题A"))
+        await deep_review.execute(SubQuestion(index=1, question="子问题A"), db=db)
 
         sent = "\n".join(m.get("content", "") for m in llm.calls[0])
         assert "[1] 结直肠癌T分期研究" in sent    # build_rag_prompt 的片段头格式
         assert "[^i^]" in sent or "[^1^]" in sent  # 引用标注约定进入 prompt
 
     @pytest.mark.asyncio
-    async def test_retrieval_exception_degrades(self, monkeypatch):
+    async def test_retrieval_exception_degrades(self, db, monkeypatch):
         """检索抛异常 → 不抛出，ok=False，答案为「该子问题检索不足」标记。"""
         store = _FakeStore(exc=RuntimeError("chromadb 连接失败"))
         llm = _FakeLLM(["不应被用到"])
         _patch_deps(monkeypatch, store=store, llm=llm)
 
-        result = await deep_review.execute(SubQuestion(index=1, question="子问题A"))
+        result = await deep_review.execute(
+            SubQuestion(index=1, question="子问题A"), db=db
+        )
 
         assert result.ok is False
         assert INSUFFICIENT_NOTICE in result.answer
@@ -236,38 +240,46 @@ class TestExecute:
         assert result.error is not None
 
     @pytest.mark.asyncio
-    async def test_llm_error_string_degrades(self, monkeypatch):
+    async def test_llm_error_string_degrades(self, db, monkeypatch):
         """LLM 返回带内错误串 → 同样降级为检索不足标记（不抛出）。"""
         store = _FakeStore(chunks=[_chunk("p1_c0")])
         llm = _FakeLLM(["[调用 LLM 出错: Kimi API 当前负载过高或请求频繁，请稍后再试。]"])
         _patch_deps(monkeypatch, store=store, llm=llm)
 
-        result = await deep_review.execute(SubQuestion(index=1, question="子问题A"))
+        result = await deep_review.execute(
+            SubQuestion(index=1, question="子问题A"), db=db
+        )
 
         assert result.ok is False
         assert INSUFFICIENT_NOTICE in result.answer
 
     @pytest.mark.asyncio
-    async def test_zero_chunks_marks_insufficient_without_llm_call(self, monkeypatch):
+    async def test_zero_chunks_marks_insufficient_without_llm_call(
+        self, db, monkeypatch
+    ):
         """零检索片段 → 跳过 LLM 调用（避免无依据编造），直接标记检索不足。"""
         store = _FakeStore(chunks=[])
         llm = _FakeLLM(["不应被用到"])
         _patch_deps(monkeypatch, store=store, llm=llm)
 
-        result = await deep_review.execute(SubQuestion(index=1, question="子问题A"))
+        result = await deep_review.execute(
+            SubQuestion(index=1, question="子问题A"), db=db
+        )
 
         assert result.ok is False
         assert INSUFFICIENT_NOTICE in result.answer
         assert llm.calls == []                    # 零检索不发起 LLM 调用
 
     @pytest.mark.asyncio
-    async def test_store_unavailable_degrades(self, monkeypatch):
+    async def test_store_unavailable_degrades(self, db, monkeypatch):
         """向量库不可用（embedding 未就绪）→ 降级标记，不抛异常。"""
         store = _FakeStore(available=False)
         llm = _FakeLLM(["不应被用到"])
         _patch_deps(monkeypatch, store=store, llm=llm)
 
-        result = await deep_review.execute(SubQuestion(index=1, question="子问题A"))
+        result = await deep_review.execute(
+            SubQuestion(index=1, question="子问题A"), db=db
+        )
 
         assert result.ok is False
         assert INSUFFICIENT_NOTICE in result.answer
@@ -348,7 +360,7 @@ class TestThreeStageChain:
     """plan → execute × N → synthesize 全链路（全 mock）：单点失败不阻塞整体。"""
 
     @pytest.mark.asyncio
-    async def test_chain_with_one_failed_subquestion(self, monkeypatch):
+    async def test_chain_with_one_failed_subquestion(self, db, monkeypatch):
         """plan 拆 2 题；第 1 题检索抛异常降级，第 2 题正常；汇总仍产出 Review。"""
         plan_json = '{"questions": ["子问题A", "子问题B"]}'
         answer_b = "子问题B答案[^1^]"
@@ -369,7 +381,7 @@ class TestThreeStageChain:
             if q.index == 2:
                 store._exc = None
                 store._chunks = [_chunk("p1_c0")]
-            sub_answers.append(await deep_review.execute(q))
+            sub_answers.append(await deep_review.execute(q, db=db))
 
         assert sub_answers[0].ok is False
         assert INSUFFICIENT_NOTICE in sub_answers[0].answer

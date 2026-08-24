@@ -432,7 +432,7 @@ async def deep_review(request: DeepReviewRequest, db: Session = Depends(get_db))
     事件序列：{type:"plan", questions:[...]} → 多个 {delta} → {finished, citations}；
     plan / synthesize 失败 → {error} 帧；单个子问题失败降级、不阻塞整体。
     服务层 services/deep_review.py（F1）按契约调用：plan(topic) /
-    execute(sub_question) / synthesize(topic, sub_answers)。
+    execute(sub_question, db=...) / synthesize(topic, sub_answers)。
     """
     logger.info(f"[deep-review] 收到请求: conversation_id={request.conversation_id}, topic={request.topic[:50]}")
     if request.conversation_id:
@@ -472,7 +472,7 @@ async def deep_review(request: DeepReviewRequest, db: Session = Depends(get_db))
             sub_answers = []
             for q in questions:
                 try:
-                    sub_answers.append(await svc.execute(q))
+                    sub_answers.append(await svc.execute(q, db=db))
                 except Exception as e:
                     logger.error(f"[deep-review] 子问题执行失败，降级处理: {e}")
                     sub_answers.append({

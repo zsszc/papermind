@@ -8,7 +8,7 @@
 三段行为契约（spec §3.1）：
 
     plan(topic, n_papers?) -> List[SubQuestion]   # LLM 拆 3-5 个子问题（硬上限 5）
-    execute(sub_question) -> SubAnswer            # 现有 retrieve + llm 生成，带本地引用
+    execute(sub_question, db=...) -> SubAnswer    # 统一检索管线 + LLM 生成，带本地引用
     synthesize(topic, sub_answers) -> Review      # LLM 汇总结构化综述，保留 [^n^] 引用
 
 - 中间产物全部内存态，不落库；
@@ -23,10 +23,14 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+from sqlalchemy.orm import Session
+
+from app.core.config import config
 from app.core.logger import logger
 from app.services.agent_graph import build_rag_prompt
 from app.services.llm import llm_service
 from app.services.retrieval import get_vector_store
+from app.services.retrieval_pipeline import RetrievalPipeline
 
 # 子问题数硬上限（spec §7：5 子问题 × 生成 60-120s，防长任务失控）
 MAX_SUB_QUESTIONS = 5
@@ -136,21 +140,29 @@ async def plan(topic: str, n_papers: Optional[int] = None) -> List[SubQuestion]:
     return [SubQuestion(index=i, question=q) for i, q in enumerate(questions, start=1)]
 
 
-async def execute(sub_question: SubQuestion) -> SubAnswer:
+async def execute(sub_question: SubQuestion, *, db: Session) -> SubAnswer:
     """第二段：单个子问题走现有检索 + LLM 生成，带本地引用。
 
-    降级契约（绝不抛出）：检索异常 / 向量库不可用 / 零检索片段 / LLM 出错
-    一律返回 ok=False、answer=INSUFFICIENT_NOTICE 的 SubAnswer；
+    降级契约（绝不抛出）：语义不可用时先尝试同范围关键词检索；检索异常 /
+    混合检索零片段 / LLM 出错一律返回 ok=False、answer=INSUFFICIENT_NOTICE；
     零检索时跳过 LLM 调用，避免无依据编造。
     """
     base = {"index": sub_question.index, "question": sub_question.question}
     chunks: List[Dict[str, Any]] = []
+    diagnostics: Dict[str, Any] = {}
     try:
-        store = get_vector_store()
-        if store.available():
-            chunks = store.search(
-                query=sub_question.question, top_k=SUB_QUESTION_TOP_K, filters={}
-            )
+        chunks = RetrievalPipeline(
+            db, vector_store=get_vector_store()
+        ).search(
+            sub_question.question,
+            top_k=SUB_QUESTION_TOP_K,
+            filters={},
+            profile=config.get("retrieval.chat_profile", "hybrid"),
+            lexical_profile=config.get(
+                "retrieval.lexical_profile", "bm25-bilingual"
+            ),
+            diagnostics=diagnostics,
+        )
     except Exception as e:
         logger.error(f"[deep_review] 子问题 {sub_question.index} 检索失败: {e}")
         return SubAnswer(
@@ -158,7 +170,13 @@ async def execute(sub_question: SubQuestion) -> SubAnswer:
         )
     if not chunks:
         logger.info(f"[deep_review] 子问题 {sub_question.index} 零检索片段，跳过 LLM 生成")
-        return SubAnswer(**base, answer=INSUFFICIENT_NOTICE, chunks=[], ok=False)
+        return SubAnswer(
+            **base,
+            answer=INSUFFICIENT_NOTICE,
+            chunks=[],
+            ok=False,
+            error=diagnostics.get("reason"),
+        )
 
     messages = [
         {"role": "system", "content": SUB_ANSWER_SYSTEM_PROMPT},
