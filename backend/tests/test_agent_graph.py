@@ -29,8 +29,26 @@ class _FakeStore:
     def available(self):
         return self._available
 
-    def search(self, query, top_k, filters):
-        self.search_calls.append({"query": query, "top_k": top_k, "filters": filters})
+    def search(
+        self,
+        query,
+        top_k,
+        filters,
+        rerank=None,
+        rerank_diagnostics=None,
+    ):
+        self.search_calls.append({
+            "query": query,
+            "top_k": top_k,
+            "filters": filters,
+            "rerank": rerank,
+        })
+        if rerank_diagnostics is not None:
+            rerank_diagnostics.update({
+                "requested": bool(rerank),
+                "effective": False,
+                "error": None,
+            })
         return self._chunks
 
 
@@ -156,6 +174,33 @@ class TestGraphOutputs:
         assert store.search_calls[0]["filters"] == {"paper_id": 7}
         assert store.search_calls[0]["top_k"] == agent_graph.RETRIEVE_TOP_K
 
+    def test_retrieve_uses_configured_hybrid_pipeline(
+        self, db, conversation, monkeypatch, chunk
+    ):
+        """显式 hybrid 配置应让共享管线扩大两路候选池，证明聊天已接线。"""
+        store = _FakeStore(chunks=[chunk])
+        _patch_store(monkeypatch, store)
+        original_get = agent_graph.config.get
+
+        def fake_config_get(key, default=None):
+            if key == "retrieval.chat_profile":
+                return "hybrid"
+            if key == "retrieval.lexical_profile":
+                return "bm25-bilingual"
+            return original_get(key, default)
+
+        monkeypatch.setattr(agent_graph.config, "get", fake_config_get)
+
+        run_pre_orchestration(
+            db=db,
+            conversation_id=conversation.id,
+            user_message="什么是MIL？",
+            paper_id=chunk["paper_id"],
+        )
+
+        assert store.search_calls[0]["top_k"] == agent_graph.RETRIEVE_TOP_K * 2
+        assert store.search_calls[0]["filters"] == {"paper_id": chunk["paper_id"]}
+
 
 class TestSkillInjection:
     """skill 参数流经图后注入对应角色 prompt。"""
@@ -201,7 +246,7 @@ class TestEmptyRetrieval:
 
     def test_store_raises_returns_empty_context(self, db, conversation, monkeypatch):
         class _BoomStore(_FakeStore):
-            def search(self, query, top_k, filters):
+            def search(self, query, top_k, filters, **kwargs):
                 raise RuntimeError("embedding 挂了")
 
         _patch_store(monkeypatch, _BoomStore(chunks=[], available=True))
