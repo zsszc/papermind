@@ -14,6 +14,7 @@ import re
 from collections import Counter
 from typing import Any, Dict, List, Optional
 
+from sqlalchemy import tuple_
 from sqlalchemy.orm import Session
 
 from app.core.logger import logger
@@ -59,6 +60,11 @@ _BILINGUAL_TERM_MAP = (
 
 _CHUNK_ID_FULL_RE = re.compile(r"^p(-?\d+)_c(-?\d+)$")
 
+_LOCAL_NEIGHBOR_SEED_POOL = 20
+_LOCAL_NEIGHBOR_RADIUS = 2
+_LOCAL_NEIGHBOR_DECAY = 0.5
+_LOCAL_NEIGHBOR_EXPANDED_CAP = 20
+
 
 def tokenize_technical_terms(text: str) -> List[str]:
     """提取 ASCII 技术锚点，保留连字符、小数、科学计数法和百分号。"""
@@ -75,7 +81,8 @@ def query_technical_terms(text: str, *, bilingual: bool = False) -> List[str]:
     return list(dict.fromkeys(tokens))
 
 
-def _filtered_chunk_rows(db: Session, filters: Optional[Dict[str, Any]]):
+def _filtered_chunk_query(db: Session, filters: Optional[Dict[str, Any]]):
+    """构造应用统一范围约束的 chunk 查询，不在调用方重复过滤逻辑。"""
     filters = filters or {}
     supported = {"paper_id", "year_gte", "year_lte"}
     unknown = sorted(set(filters) - supported)
@@ -89,7 +96,124 @@ def _filtered_chunk_rows(db: Session, filters: Optional[Dict[str, Any]]):
         query = query.filter(Paper.year >= filters["year_gte"])
     if "year_lte" in filters:
         query = query.filter(Paper.year <= filters["year_lte"])
-    return query.order_by(Chunk.paper_id, Chunk.chunk_index).all()
+    return query
+
+
+def _filtered_chunk_rows(db: Session, filters: Optional[Dict[str, Any]]):
+    return _filtered_chunk_query(db, filters).order_by(
+        Chunk.paper_id, Chunk.chunk_index
+    ).all()
+
+
+def expand_semantic_chunk_neighbors(
+    db: Session,
+    semantic_results: List[Dict[str, Any]],
+    *,
+    filters: Optional[Dict[str, Any]] = None,
+    radius: int = _LOCAL_NEIGHBOR_RADIUS,
+    decay: float = _LOCAL_NEIGHBOR_DECAY,
+    limit: int = _LOCAL_NEIGHBOR_EXPANDED_CAP,
+) -> List[Dict[str, Any]]:
+    """按语义 rank prior 在同论文内传播分数，并以一次 SQL 读取真实邻块。
+
+    摘要使用 ``chunk_index=-1`` 哨兵，不能因为数字相邻而传播到正文。无效
+    seed 不参与传播；多个 seed 覆盖同一候选时只保留最大传播分。
+    """
+    if radius < 0:
+        raise ValueError("语义邻域半径不能为负")
+    if not 0.0 <= decay <= 1.0:
+        raise ValueError("语义邻域衰减必须位于 0 到 1")
+    if limit <= 0:
+        return []
+
+    anchors: List[tuple[int, int, int]] = []
+    requested_keys: set[tuple[int, int]] = set()
+    for rank, item in enumerate(semantic_results, start=1):
+        match = _CHUNK_ID_FULL_RE.fullmatch(str(item.get("chunk_id", "")))
+        if match is None:
+            continue
+        paper_id, chunk_index = (int(value) for value in match.groups())
+        if item.get("paper_id") != paper_id:
+            continue
+        anchors.append((paper_id, chunk_index, rank))
+        if chunk_index == -1:
+            requested_keys.add((paper_id, -1))
+            continue
+        for offset in range(-radius, radius + 1):
+            candidate_index = chunk_index + offset
+            if candidate_index >= 0:
+                requested_keys.add((paper_id, candidate_index))
+
+    if not anchors or not requested_keys:
+        return []
+
+    rows = (
+        _filtered_chunk_query(db, filters)
+        .filter(tuple_(Chunk.paper_id, Chunk.chunk_index).in_(requested_keys))
+        .order_by(Chunk.paper_id, Chunk.chunk_index, Chunk.id)
+        .all()
+    )
+    row_by_key: Dict[tuple[int, int], tuple[Chunk, Paper]] = {}
+    duplicate_keys: set[tuple[int, int]] = set()
+    for chunk, paper in rows:
+        key = (chunk.paper_id, chunk.chunk_index)
+        if key in row_by_key:
+            duplicate_keys.add(key)
+            continue
+        row_by_key[key] = (chunk, paper)
+    if duplicate_keys:
+        logger.warning(
+            f"[retrieval_pipeline] 检测到重复 chunk 坐标: {len(duplicate_keys)}"
+        )
+
+    # 候选值为 (传播分, 距离, seed rank)，先确认 seed 自身真实存在。
+    propagated: Dict[tuple[int, int], tuple[float, int, int]] = {}
+    for paper_id, chunk_index, rank in anchors:
+        if (paper_id, chunk_index) not in row_by_key:
+            continue
+        candidate_indexes = (
+            (chunk_index,)
+            if chunk_index == -1
+            else range(max(0, chunk_index - radius), chunk_index + radius + 1)
+        )
+        for candidate_index in candidate_indexes:
+            key = (paper_id, candidate_index)
+            if key not in row_by_key:
+                continue
+            distance = abs(candidate_index - chunk_index)
+            score = (decay ** distance) / rank
+            previous = propagated.get(key)
+            candidate_order = (-score, distance, rank)
+            if previous is None or candidate_order < (
+                -previous[0], previous[1], previous[2]
+            ):
+                propagated[key] = (score, distance, rank)
+
+    expanded: List[Dict[str, Any]] = []
+    for key, (score, distance, rank) in propagated.items():
+        chunk, paper = row_by_key[key]
+        expanded.append({
+            "chunk_id": f"p{chunk.paper_id}_c{chunk.chunk_index}",
+            "paper_id": chunk.paper_id,
+            "title": paper.title,
+            "authors": paper.authors,
+            "year": paper.year,
+            "content": chunk.content or "",
+            "page_number": chunk.page_number,
+            "chunk_type": chunk.chunk_type,
+            "score": score,
+            "source": "semantic-neighbor",
+            "neighbor_score": score,
+            "neighbor_distance": distance,
+            "best_seed_rank": rank,
+        })
+    expanded.sort(key=lambda item: (
+        -item["neighbor_score"],
+        item["neighbor_distance"],
+        item["best_seed_rank"],
+        item["chunk_id"],
+    ))
+    return expanded[:limit]
 
 
 def bm25_chunk_search(
@@ -322,12 +446,14 @@ class RetrievalPipeline:
             # RED 测试与早期实验名的兼容别名；正式配置使用 profile=hybrid。
             profile = "hybrid"
             lexical_profile = "bm25-bilingual"
-        if profile not in {"semantic", "hybrid", "keyword"}:
+        if profile not in {
+            "semantic", "hybrid", "hybrid-local-neighbor", "keyword"
+        }:
             raise ValueError(f"不支持的检索 profile: {requested_profile}")
 
         keyword_results: List[Dict[str, Any]] = []
         keyword_error = False
-        if profile in {"hybrid", "keyword"}:
+        if profile in {"hybrid", "hybrid-local-neighbor", "keyword"}:
             try:
                 keyword_results = keyword_chunk_search(
                     self.db,
@@ -360,9 +486,14 @@ class RetrievalPipeline:
             if not store.available():
                 semantic_reason = "semantic_unavailable"
             else:
+                semantic_top_k = (
+                    _LOCAL_NEIGHBOR_SEED_POOL
+                    if profile == "hybrid-local-neighbor"
+                    else top_k if profile == "semantic" else top_k * 2
+                )
                 search_kwargs = {
                     "query": query,
-                    "top_k": top_k if profile == "semantic" else top_k * 2,
+                    "top_k": semantic_top_k,
                     "filters": filters,
                 }
                 # 生产旧调用方不显式控制 rerank 时保持三参数兼容；评测或
@@ -397,6 +528,26 @@ class RetrievalPipeline:
             )
             return copy.deepcopy(semantic_results[:top_k])
 
+        baseline_semantic_results = semantic_results[:top_k * 2]
+        neighbor_error = False
+        if profile == "hybrid-local-neighbor" and semantic_reason is None:
+            try:
+                semantic_results = expand_semantic_chunk_neighbors(
+                    self.db,
+                    semantic_results,
+                    filters=filters,
+                    radius=_LOCAL_NEIGHBOR_RADIUS,
+                    decay=_LOCAL_NEIGHBOR_DECAY,
+                    limit=_LOCAL_NEIGHBOR_EXPANDED_CAP,
+                )
+            except Exception as exc:
+                neighbor_error = True
+                semantic_results = baseline_semantic_results
+                logger.warning(
+                    "[retrieval_pipeline] 语义邻域扩展失败: "
+                    f"{type(exc).__name__}"
+                )
+
         if semantic_reason is not None:
             effective = "keyword-only" if not keyword_error else "empty"
             self._write_diagnostics(
@@ -407,6 +558,18 @@ class RetrievalPipeline:
                 reason=semantic_reason if not keyword_error else "both_routes_failed",
             )
             return copy.deepcopy(keyword_results[:top_k])
+        if neighbor_error:
+            effective = "hybrid" if not keyword_error else "semantic-only"
+            self._write_diagnostics(
+                diagnostics,
+                requested_profile,
+                effective,
+                degraded=True,
+                reason="semantic_neighbor_expansion_failed",
+            )
+            if keyword_error:
+                return copy.deepcopy(semantic_results[:top_k])
+            return rrf_fuse_chunks(semantic_results, keyword_results, top_k)
         if keyword_error:
             self._write_diagnostics(
                 diagnostics,
@@ -417,7 +580,11 @@ class RetrievalPipeline:
             )
             return copy.deepcopy(semantic_results[:top_k])
 
-        effective = requested_profile if requested_profile == "hybrid-bilingual" else "hybrid"
+        effective = (
+            requested_profile
+            if requested_profile in {"hybrid-bilingual", "hybrid-local-neighbor"}
+            else "hybrid"
+        )
         self._write_diagnostics(
             diagnostics,
             requested_profile,
