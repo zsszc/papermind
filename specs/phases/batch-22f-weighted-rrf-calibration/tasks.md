@@ -1,6 +1,6 @@
 # Batch 22F 任务清单
 
-- [ ] T1：冻结 Weighted-RRF 网格、选优规则与 Gate。
+- [x] T1：冻结 Weighted-RRF 网格、选优规则与 Gate。
 - [ ] T2：提交加权融合、配置指纹与配对 Gate RED。
 - [ ] T3：实现隔离评测 profile GREEN，验证等权 parity。
 - [ ] T4：运行三组 private train 候选并自动选优。

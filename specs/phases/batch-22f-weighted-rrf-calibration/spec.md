@@ -15,10 +15,14 @@ Batch 22D/22E 连续证明细粒度重分块及 parent 聚合都会损害真实�
 - 基线：现有等权 RRF，语义/词法权重 `1.0/1.0`。
 - 候选网格仅允许：`1.0/1.25`、`1.0/1.5`、`1.0/2.0`；RRF `k=60`、两路召回深度与
   `bm25-bilingual` 保持不变。
-- 同一路先按 canonical chunk ID 去重，重复不得占 rank；tie 以 chunk ID 稳定排序。
+- 同一路先按 canonical chunk ID 去重，重复不得占 rank；总分 tie 以 chunk ID 稳定排序；元数据
+  固定优先取 semantic 分支，否则取 lexical 分支。
+- 旧等权 parity 只定义在生产可达规范域：两路各自 ID 唯一且总分无并列。在该域 `1.0/1.0`
+  必须与旧函数顺序及元数据完全一致；异常域按新函数的去重/tie 契约测试，旧函数保持零改动。
 - 不按 QA ID、论文、具体术语或 evidence quote 写规则；运行 train 前冻结整个网格和选优顺序。
 - 选优采用词典序：先满足硬 Gate，再最大化 factoid Recall、总体 Recall、MRR、NDCG；仍并列时
   选择更接近等权的较小词法权重。
+- 基线与三组候选统一使用显式 `weighted-rrf-v1` profile；权重不编码进 profile 名，报告单独记录。
 
 ## 3. 数据协议与 Gate
 
@@ -29,12 +33,17 @@ Batch 22D/22E 连续证明细粒度重分块及 parent 聚合都会损害真实�
   且至少一个主指标严格提升，才允许提出生产激活。
 - holdout 保持封存；本批不调用 Kimi。若所有候选 train 失败，记录拒绝并转向 query expansion
   的自动语料统计方案，不继续调网格。
+- 自动选择器必须一次接收恰好一份 `1.0/1.0` 基线及三份冻结候选，输入顺序不影响结果；缺失、
+  重复或额外权重均 fail-close。公共配对指纹至少包含 dataset、qrels、corpus、page text、resolver、
+  SQLite/Chroma ID 与 embedding、融合公式 contract。
 
 ## 4. 工程范围
 
 - 新增不改变旧 `rrf_fuse_chunks()` 默认行为的加权纯函数或显式参数。
 - 候选仅通过评测 profile 接线；dev Gate 通过前不改变聊天/搜索生产配置。
 - 报告记录权重、公式 SHA、SQLite/Chroma manifest、split、完整样本数和两侧降级计数。
+- CLI 权重仅允许 `1.0/1.25/1.5/2.0`，并强制显式 database/corpus/vector、page-span-v2、top-5、
+  `bm25-bilingual`、train/dev；禁止 QA 子集、keyword-only、reranker、parent DB 与 LLM。
 - 继续遵循 SDD → RED → GREEN → private train → 条件 dev → Harness → 报告 → Git。
 
 ## 5. 验收标准
