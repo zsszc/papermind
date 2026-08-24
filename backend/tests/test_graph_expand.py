@@ -225,6 +225,27 @@ class TestGraphExpansion:
         # 扩展覆盖出边（文献2）与入边（文献3）两侧
         assert {gc["paper_id"] for gc in graph_chunks} == {p2.id, p3.id}
 
+    def test_explicit_paper_scope_never_expands_to_other_papers(
+        self, db, citation_table, conversation, monkeypatch
+    ):
+        """用户显式限定单篇论文时，graph 开关不得扩大检索作用域。"""
+        p1, p2, _ = self._build_library(db)
+        vector_chunks = [_vchunk(p1.id, 0, "命中片段", title="命中文献")]
+        monkeypatch.setattr(
+            agent_graph, "get_vector_store", lambda: _FakeStore(vector_chunks)
+        )
+        monkeypatch.setattr(agent_graph, "config", _fake_config(True, 1))
+
+        state = run_pre_orchestration(
+            db=db,
+            conversation_id=conversation.id,
+            user_message="只分析这篇论文",
+            paper_id=p1.id,
+        )
+
+        assert {item["paper_id"] for item in state["context_chunks"]} == {p1.id}
+        assert all(item["paper_id"] != p2.id for item in state["context_chunks"])
+
     def test_abstract_preferred_and_max_two_per_paper(
         self, db, citation_table, conversation, monkeypatch
     ):
