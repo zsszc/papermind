@@ -506,6 +506,11 @@ class Retriever:
             return "semantic-production"
         if self.retrieval_profile == "semantic-production":
             return "semantic-production(degraded)"
+        if (
+            self.retrieval_profile == "hybrid-local-neighbor"
+            and not self.degraded
+        ):
+            return "hybrid-local-neighbor"
         return "keyword-only(degraded)" if self.degraded else "hybrid"
 
     def search(self, query: str) -> List[Dict[str, Any]]:
@@ -520,6 +525,8 @@ class Retriever:
             profile = "keyword"
         elif self.retrieval_profile == "semantic-production":
             profile = "semantic"
+        elif self.retrieval_profile == "hybrid-local-neighbor":
+            profile = "hybrid-local-neighbor"
         else:
             profile = "hybrid"
 
@@ -1080,9 +1087,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="强制仅关键词检索（不加载语义模型，速度快）")
     parser.add_argument(
         "--retrieval-profile",
-        choices=("hybrid", "semantic-production"),
+        choices=(
+            "hybrid", "hybrid-local-neighbor", "semantic-production"
+        ),
         default="hybrid",
-        help="评测检索管线；semantic-production 严格仅跑生产语义 top5",
+        help=("评测检索管线；hybrid-local-neighbor 为 Batch21 候选；"
+              "semantic-production 严格仅跑生产语义 top5"),
     )
     parser.add_argument(
         "--vector-dir",
