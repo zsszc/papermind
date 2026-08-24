@@ -163,6 +163,95 @@ class TestSearchApi:
         assert results[0]["paper_id"] == paper.id
 
 
+@pytest.fixture()
+def filter_papers(db):
+    """三篇共享检索词、年份不同的论文，用于锁定关键词过滤契约。"""
+    ensure_papers_fts(engine)
+    papers = [
+        Paper(
+            title="Eligible sharedanchor paper",
+            authors="A",
+            year=2022,
+            abstract="sharedanchor eligible evidence",
+            file_path="papers/filter-2022.pdf",
+            filename="filter-2022.pdf",
+        ),
+        Paper(
+            title="Old sharedanchor paper",
+            authors="B",
+            year=2019,
+            abstract="sharedanchor old evidence",
+            file_path="papers/filter-2019.pdf",
+            filename="filter-2019.pdf",
+        ),
+        Paper(
+            title="Future sharedanchor paper",
+            authors="C",
+            year=2025,
+            abstract="sharedanchor future evidence",
+            file_path="papers/filter-2025.pdf",
+            filename="filter-2025.pdf",
+        ),
+    ]
+    db.add_all(papers)
+    db.commit()
+    for item in papers:
+        db.refresh(item)
+    return papers
+
+
+class TestKeywordSearchFilters:
+    """关键词路必须与语义路遵守相同的限制性 filters，避免 hybrid 越界。"""
+
+    @staticmethod
+    def _search(client, filters):
+        return client.post(
+            "/api/search",
+            json={
+                "query": "sharedanchor",
+                "use_keyword": True,
+                "use_semantic": False,
+                "filters": filters,
+                "top_k": 10,
+            },
+        )
+
+    def test_keyword_search_honors_paper_id(self, client, filter_papers):
+        eligible = filter_papers[0]
+
+        response = self._search(client, {"paper_id": eligible.id})
+
+        assert response.status_code == 200
+        assert [item["paper_id"] for item in response.json()["results"]] == [
+            eligible.id
+        ]
+
+    def test_keyword_search_honors_year_range(self, client, filter_papers):
+        response = self._search(
+            client,
+            {"year_gte": 2020, "year_lte": 2024},
+        )
+
+        assert response.status_code == 200
+        actual = [
+            (item["paper_id"], item["year"])
+            for item in response.json()["results"]
+        ]
+        assert actual == [(filter_papers[0].id, 2022)]
+
+    def test_combined_restrictive_filters_fail_closed(self, client, filter_papers):
+        """paper_id 与年份矛盾时返回空集，不能忽略任一条件退化为宽检索。"""
+        old = filter_papers[1]
+
+        response = self._search(
+            client,
+            {"paper_id": old.id, "year_gte": 2020, "year_lte": 2024},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["results"] == []
+
+
 # ---------- _build_where 组合过滤契约（Batch 7 / F1） ----------
 # ChromaDB 0.4.24 的 where 只接受「单字段单操作符」或「$and/$or 组合」，
 # 多条件必须包装为 $and，否则 query 抛 ValueError → /api/search 500。
@@ -216,11 +305,23 @@ class TestBuildWhere:
         assert VectorStore._build_where({}) is None
         assert VectorStore._build_where({"paper_id": 7}) == {"paper_id": 7}
 
-    def test_query_degrades_on_invalid_where(self):
-        """非法 where 不向上抛异常（防 500），降级为无过滤查询并返回结果。"""
+    def test_restrictive_query_fails_closed_on_invalid_where(self):
+        """限制性 where 被 Chroma 拒绝时返回空集，不得降级为无过滤而泄漏结果。"""
         from app.services.retrieval import VectorStore
 
         coll = self._chroma_collection()
         bad_where = {"year": {"$gte": 2020, "$lte": 2024}}  # 修复前的非法形状
         res = VectorStore._query_with_fallback(coll, [1.0, 0.0], 3, bad_where)
-        assert len(res["ids"][0]) == 3  # 降级为无过滤，返回全部
+        assert res == {
+            "ids": [[]],
+            "documents": [[]],
+            "metadatas": [[]],
+            "distances": [[]],
+        }
+
+    def test_unknown_restrictive_filter_is_rejected(self):
+        """未知 filter 不得静默变成 where=None；调用方必须能识别并 fail-close。"""
+        from app.services.retrieval import VectorStore
+
+        with pytest.raises(ValueError, match="不支持"):
+            VectorStore._build_where({"journal": "target journal"})
