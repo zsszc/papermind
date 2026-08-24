@@ -11,6 +11,7 @@
 
 import pytest
 
+from app.models import Chunk, Paper
 from app.services import deep_review
 from app.services.deep_review import (
     INSUFFICIENT_NOTICE,
@@ -164,17 +165,48 @@ class TestExecute:
         assert result.error is None
 
     @pytest.mark.asyncio
-    async def test_independent_retrieval_per_subquestion(self, monkeypatch):
-        """每个子问题独立触发一次检索，query 为子问题原文，top_k 与主对话一致（5）。"""
+    async def test_independent_retrieval_per_subquestion(self, db, monkeypatch):
+        """每个子问题走 shared hybrid，语义候选池与主对话一致为 2*top_k。"""
         store = _FakeStore(chunks=[_chunk("p1_c0")])
         llm = _FakeLLM(["答案一[^1^]", "答案二[^1^]"])
         _patch_deps(monkeypatch, store=store, llm=llm)
 
-        await deep_review.execute(SubQuestion(index=1, question="子问题A"))
-        await deep_review.execute(SubQuestion(index=2, question="子问题B"))
+        await deep_review.execute(SubQuestion(index=1, question="子问题A"), db=db)
+        await deep_review.execute(SubQuestion(index=2, question="子问题B"), db=db)
 
         assert [c["query"] for c in store.search_calls] == ["子问题A", "子问题B"]
-        assert all(c["top_k"] == 5 for c in store.search_calls)
+        assert all(c["top_k"] == 10 for c in store.search_calls)
+
+    @pytest.mark.asyncio
+    async def test_keyword_fallback_still_answers_with_local_evidence(
+        self, db, monkeypatch
+    ):
+        """Embedding 不可用时，共享管线应使用同范围 BM25，而非误报检索不足。"""
+        db.add(Paper(
+            id=7,
+            title="fallback paper",
+            filename="fallback.pdf",
+            file_path="papers/fallback.pdf",
+            year=2024,
+        ))
+        db.add(Chunk(
+            paper_id=7,
+            chunk_index=0,
+            content="fallbackanchor precise local evidence",
+            chunk_type="result",
+        ))
+        db.commit()
+        store = _FakeStore(available=False)
+        llm = _FakeLLM(["基于本地证据的答案[^1^]"])
+        _patch_deps(monkeypatch, store=store, llm=llm)
+
+        result = await deep_review.execute(
+            SubQuestion(index=1, question="fallbackanchor"), db=db
+        )
+
+        assert result.ok is True
+        assert [item["chunk_id"] for item in result.chunks] == ["p7_c0"]
+        assert len(llm.calls) == 1
 
     @pytest.mark.asyncio
     async def test_prompt_uses_rag_citation_format(self, monkeypatch):

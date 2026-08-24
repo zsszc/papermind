@@ -14,6 +14,7 @@ import shutil
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -296,10 +297,13 @@ class TestSuggestCitationsSanitize:
         assert SECRET_STRING not in r.text
         assert "引用推荐失败" in r.json()["detail"]
 
-    def test_success_path_unchanged(self, thesis_env, monkeypatch):
-        """不回归：向量库不可用时仍 200 且 citations 为空列表。"""
+    def test_zero_evidence_skips_llm_and_returns_local_notice(
+        self, thesis_env, monkeypatch
+    ):
+        """零本地证据时不得让 LLM 猜测推荐文献。"""
         client, thesis = thesis_env
-        monkeypatch.setattr(thesis_router.llm_service, "chat_completion", _fake_chat_ok)
+        completion = AsyncMock(return_value="不应生成")
+        monkeypatch.setattr(thesis_router.llm_service, "chat_completion", completion)
 
         r = client.post(
             f"/api/thesis/{thesis.id}/suggest-citations",
@@ -307,9 +311,55 @@ class TestSuggestCitationsSanitize:
         )
         assert r.status_code == 200
         data = r.json()
-        assert data["suggestions"].startswith("## 评审/概括")
+        assert "未找到" in data["suggestions"]
         assert data["citations"] == []
         assert "paragraph" not in data
+        completion.assert_not_awaited()
+
+    def test_healthy_retrieval_uses_shared_hybrid_candidate_pool(
+        self, thesis_env, monkeypatch
+    ):
+        """引用推荐与聊天使用相同 hybrid top-10 语义候选池，最终仍返回 top-5。"""
+        client, thesis = thesis_env
+        calls = []
+        chunk = {
+            "chunk_id": "p8_c2",
+            "paper_id": 8,
+            "title": "本地证据",
+            "authors": "测试作者",
+            "year": 2024,
+            "content": "targetanchor evidence",
+            "page_number": 3,
+            "chunk_type": "result",
+            "score": 0.9,
+            "source": "semantic",
+        }
+
+        class Store:
+            def available(self):
+                return True
+
+            def search(self, **kwargs):
+                calls.append(kwargs)
+                return [chunk]
+
+        monkeypatch.setattr(
+            "app.services.retrieval.get_vector_store", lambda: Store()
+        )
+        monkeypatch.setattr(
+            thesis_router.llm_service, "chat_completion", _fake_chat_ok
+        )
+
+        response = client.post(
+            f"/api/thesis/{thesis.id}/suggest-citations",
+            json={"paragraph": "targetanchor"},
+        )
+
+        assert response.status_code == 200
+        assert calls == [{"query": "targetanchor", "top_k": 10, "filters": {}}]
+        assert [item["chunk_id"] for item in response.json()["citations"]] == [
+            "p8_c2"
+        ]
 
     @pytest.mark.parametrize("paragraph", ["", "   \n\t"])
     def test_blank_paragraph_rejected(self, thesis_env, paragraph):
