@@ -135,6 +135,9 @@ def _build_benchmark_metadata(
         {
             "paper_uid": _manifest_chunk_paper_uid(row, uid_by_id),
             "chunk_index": row.chunk_index,
+            "page_number": row.page_number,
+            "page_start": row.page_start,
+            "page_end": row.page_end,
             "content_sha256": _sha256_bytes((row.content or "").encode("utf-8")),
         }
         for row in chunks

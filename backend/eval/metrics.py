@@ -67,6 +67,59 @@ def recall_at_k(retrieved_ids: Sequence, relevant_ids: Sequence, k: int) -> floa
     return hits / len(relevant)
 
 
+def evidence_any_hit_at_k(
+    retrieved_ids: Sequence, evidence_groups: Sequence[dict], k: int
+) -> float:
+    """Evidence 级 any-hit：每组至少命中一个 chunk 的组比例。"""
+    groups = [
+        {item["chunk_id"] for item in group.get("chunks", [])}
+        for group in (evidence_groups or [])
+        if group.get("chunks")
+    ]
+    if not groups or k <= 0:
+        return 0.0
+    top_k = set(list(retrieved_ids or [])[:k])
+    return sum(bool(top_k & group) for group in groups) / len(groups)
+
+
+def evidence_span_coverage_at_k(
+    retrieved_ids: Sequence, evidence_groups: Sequence[dict], k: int
+) -> float:
+    """证据字符覆盖率：检索 chunk 交集区间并集占原证据 span 的比例。"""
+    if not evidence_groups or k <= 0:
+        return 0.0
+    top_k = set(list(retrieved_ids or [])[:k])
+    scores: list[float] = []
+    for group in evidence_groups:
+        span_start = group.get("page_start")
+        span_end = group.get("page_end")
+        if (
+            not isinstance(span_start, int)
+            or not isinstance(span_end, int)
+            or span_start >= span_end
+        ):
+            continue
+        intervals = sorted(
+            (
+                max(span_start, item["page_start"]),
+                min(span_end, item["page_end"]),
+            )
+            for item in group.get("chunks", [])
+            if item.get("chunk_id") in top_k
+        )
+        covered = 0
+        cursor = span_start
+        for start, end in intervals:
+            if end <= cursor:
+                continue
+            start = max(start, cursor)
+            if end > start:
+                covered += end - start
+                cursor = end
+        scores.append(covered / (span_end - span_start))
+    return sum(scores) / len(scores) if scores else 0.0
+
+
 def mrr(retrieved_ids: Sequence, relevant_ids: Sequence) -> float:
     """MRR（单条）：第一个命中位置的倒数。
 

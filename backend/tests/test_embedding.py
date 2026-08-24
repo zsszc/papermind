@@ -113,6 +113,7 @@ class TestChunkerHardLimit:
 
         assert [item["content"] for item in chunks] == ["12345", "67890"]
         assert all(item["token_count"] == len(item["content"]) for item in chunks)
+        assert chunks[0]["page_end"] >= chunks[1]["page_start"]
 
     def test_overlap_larger_than_chunk_size_cannot_stall(self):
         chunker = TextChunker(chunk_size=8, chunk_overlap=50)

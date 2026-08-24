@@ -51,7 +51,10 @@ def test_single_chunk_evidence_resolves_one_group(db):
         ),
     )
 
-    assert groups == [["p1_c0"]]
+    assert [item["chunk_id"] for item in groups[0]["chunks"]] == ["p1_c0"]
+    assert (groups[0]["page_start"], groups[0]["page_end"]) == (
+        text.index(quote), text.index(quote) + len(quote)
+    )
 
 
 def test_cross_chunk_evidence_maps_to_both_chunks(db):
@@ -66,7 +69,9 @@ def test_cross_chunk_evidence_maps_to_both_chunks(db):
     )
 
     assert paper.id == 1
-    assert groups == [["p1_c0", "p1_c1"]]
+    assert [item["chunk_id"] for item in groups[0]["chunks"]] == [
+        "p1_c0", "p1_c1"
+    ]
 
 
 def test_overlap_can_make_multiple_chunks_relevant_without_duplicate_error(db):
@@ -81,7 +86,9 @@ def test_overlap_can_make_multiple_chunks_relevant_without_duplicate_error(db):
         page_loader=lambda row: [{"page_number": 1, "text": text}],
     )
 
-    assert groups == [["p1_c0", "p1_c1"]]
+    assert [item["chunk_id"] for item in groups[0]["chunks"]] == [
+        "p1_c0", "p1_c1"
+    ]
 
 
 def test_quote_repeated_in_original_pages_fails_closed(db):
@@ -141,7 +148,23 @@ def test_missing_offsets_are_not_treated_as_v2_qrels(db):
 
 
 def test_span_metrics_keep_any_hit_separate_from_chunk_coverage():
-    groups = [["p1_c0", "p1_c1"], ["p2_c0"]]
+    groups = [
+        {
+            "page_start": 0,
+            "page_end": 30,
+            "chunks": [
+                {"chunk_id": "p1_c0", "page_start": 0, "page_end": 20},
+                {"chunk_id": "p1_c1", "page_start": 10, "page_end": 30},
+            ],
+        },
+        {
+            "page_start": 0,
+            "page_end": 10,
+            "chunks": [
+                {"chunk_id": "p2_c0", "page_start": 0, "page_end": 10},
+            ],
+        },
+    ]
     retrieved = ["p1_c1", "noise"]
 
     assert evidence_any_hit_at_k(retrieved, groups, 5) == pytest.approx(0.5)

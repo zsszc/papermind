@@ -15,6 +15,10 @@ engine = create_engine(
 # 版本化 Schema 迁移记录：映射 {表名: {列名: (SQL 类型, 默认值)}}
 # 新增模型字段时，只需在这里登记，启动时会自动 ALTER TABLE ADD COLUMN
 SCHEMA_MIGRATIONS = {
+    "chunks": {
+        "page_start": ("INTEGER", None),
+        "page_end": ("INTEGER", None),
+    },
     "papers": {
         "last_read_page": ("INTEGER", 1),
         "metadata_json": ("JSON", "'{}'"),
@@ -41,10 +45,11 @@ def _set_sqlite_pragma(dbapi_conn, connection_record):
     cursor.close()
 
 
-def _apply_schema_migrations():
+def apply_schema_migrations(target_engine=None):
     """执行轻量级 Schema 迁移：自动为旧表补齐模型中新增的列。"""
+    eng = target_engine or engine
     try:
-        with engine.connect() as conn:
+        with eng.connect() as conn:
             for table_name, columns in SCHEMA_MIGRATIONS.items():
                 # 查询表是否存在
                 table_exists = conn.exec_driver_sql(
@@ -114,7 +119,7 @@ def ensure_paper_citations_table(target_engine=None):
 
 def ensure_schema():
     """在 Base.metadata.create_all 之后调用，保证旧数据库也能对齐新列。"""
-    _apply_schema_migrations()
+    apply_schema_migrations()
     ensure_paper_citations_table()
 
 

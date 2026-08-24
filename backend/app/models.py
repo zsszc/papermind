@@ -57,6 +57,9 @@ class Chunk(Base):
     paper_id = Column(Integer, ForeignKey("papers.id"), nullable=False)
     content = Column(Text, nullable=False)
     page_number = Column(Integer, nullable=True)
+    # 相对 PDFParser 页文本的 0-based 半开字符区间；旧库/摘要允许为空。
+    page_start = Column(Integer, nullable=True)
+    page_end = Column(Integer, nullable=True)
     chunk_index = Column(Integer, nullable=False, default=0)
     section_title = Column(String(500), nullable=True)
     chunk_type = Column(String(50), default="paragraph")  # abstract / intro / method / result / conclusion

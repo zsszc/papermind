@@ -14,6 +14,7 @@ from typing import Any
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.database import apply_schema_migrations
 from app.models import Chunk, Paper
 from app.services.data_integrity import audit_database, repair_database_copy
 from app.services.embedding import TextChunker
@@ -82,6 +83,20 @@ def _replace_paper_chunks(
 ) -> tuple[int, int]:
     """只在当前候选事务内替换单篇论文 chunks。"""
     chunks_data = chunker.chunk_pages(pages)
+    page_lengths = {
+        page.get("page_number"): len(page.get("text") or "") for page in pages
+    }
+    for item in chunks_data:
+        page_number = item.get("page_number")
+        start = item.get("page_start")
+        end = item.get("page_end")
+        if (
+            page_number not in page_lengths
+            or not isinstance(start, int)
+            or not isinstance(end, int)
+            or not 0 <= start < end <= page_lengths[page_number]
+        ):
+            raise ValueError(f"paper_id={paper.id} 的 chunk 页内坐标无效")
     nonempty_pages = {
         page.get("page_number")
         for page in pages
@@ -99,6 +114,8 @@ def _replace_paper_chunks(
             paper_id=paper.id,
             content=item["content"],
             page_number=item.get("page_number"),
+            page_start=item.get("page_start"),
+            page_end=item.get("page_end"),
             chunk_index=index,
             section_title=item.get("section_title"),
             chunk_type=item.get("chunk_type", "paragraph"),
@@ -112,6 +129,8 @@ def _replace_paper_chunks(
             paper_id=paper.id,
             content=abstract["content"],
             page_number=abstract.get("page_number"),
+            page_start=None,
+            page_end=None,
             chunk_index=-1,
             section_title=None,
             chunk_type="abstract",
@@ -146,6 +165,8 @@ def _validate_candidate_chunks(db: Session, *, chunk_size: int) -> dict[str, int
             if not (row.content or "").strip():
                 raise ValueError("候选数据库存在空 chunk")
             if row.chunk_index == -1:
+                if row.page_start is not None or row.page_end is not None:
+                    raise ValueError("候选摘要 chunk 不应记录页内坐标")
                 abstract_count += 1
                 continue
             length = len(row.content)
@@ -153,6 +174,13 @@ def _validate_candidate_chunks(db: Session, *, chunk_size: int) -> dict[str, int
                 raise ValueError("候选正文 chunk 超过字符硬上限")
             if row.page_number is None:
                 raise ValueError("候选正文 chunk 缺少页码")
+            if (
+                row.page_start is None
+                or row.page_end is None
+                or row.page_start < 0
+                or row.page_start >= row.page_end
+            ):
+                raise ValueError("候选正文 chunk 页内坐标无效")
             if row.token_count != length:
                 raise ValueError("候选正文 token_count 未记录字符长度")
             body_count += 1
@@ -201,6 +229,7 @@ def build_staged_chunk_database(
         # 修复仅发生在候选副本，使候选可通过 foreign_key_check；源库不变。
         repair = repair_database_copy(source, temporary, dry_run=False)
         engine = _candidate_engine(temporary)
+        apply_schema_migrations(engine)
         SessionLocal = sessionmaker(
             autocommit=False, autoflush=False, bind=engine
         )

@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Callable, Optional, Union
 
 # 默认种子集路径
 DEFAULT_SEED_PATH = Path(__file__).resolve().parent / "dataset" / "qa_seed.jsonl"
@@ -305,3 +305,168 @@ def resolve_relevant_chunks(db, entry: dict, runtime_root: Optional[Path] = None
 
     ordered = sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))
     return [f"p{pid}_c{ci}" for (pid, ci), _ in ordered]
+
+
+def _find_all_occurrences(text: str, quote: str) -> list[int]:
+    """返回包含重叠情况的全部逐字命中起点。"""
+    starts: list[int] = []
+    cursor = 0
+    while True:
+        index = text.find(quote, cursor)
+        if index < 0:
+            return starts
+        starts.append(index)
+        cursor = index + 1
+
+
+def _resolve_evidence_paper(db, paper_uid: str, runtime_root: Path):
+    """按稳定 UID 唯一解析论文，错误契约与 v1 保持一致。"""
+    from app.models import Paper
+    from eval.private_benchmark import normalize_doi, sha256_file
+
+    if paper_uid.startswith("doi:"):
+        target_doi = normalize_doi(paper_uid.removeprefix("doi:"))
+        matches = [
+            paper for paper in db.query(Paper).all()
+            if normalize_doi(paper.doi) == target_doi
+        ]
+    else:
+        target_hash = paper_uid.removeprefix("sha256:").lower()
+        matches = []
+        for candidate in db.query(Paper).all():
+            source = runtime_root / candidate.file_path
+            if source.is_file() and sha256_file(source) == target_hash:
+                matches.append(candidate)
+    if len(matches) > 1:
+        raise ValueError(f"evidence paper_uid 多篇命中: {paper_uid}")
+    if not matches:
+        raise ValueError(f"evidence paper_uid 未命中: {paper_uid}")
+    return matches[0]
+
+
+def _default_page_loader(runtime_root: Path) -> Callable[[Any], list[dict]]:
+    """创建单次 resolver 可用的安全 PDF 页加载器。"""
+    from app.services.pdf_parser import PDFParser
+
+    parser = PDFParser()
+    root = runtime_root.resolve()
+
+    def load(paper) -> list[dict]:
+        source = (root / paper.file_path).resolve()
+        if not source.is_relative_to(root):
+            raise ValueError("论文路径不得逃逸语料根目录")
+        if not source.is_file():
+            raise FileNotFoundError(f"论文源文件不存在: {paper.file_path}")
+        return parser.extract_text(str(source))
+
+    return load
+
+
+def resolve_relevant_spans_v2(
+    db,
+    entry: dict,
+    runtime_root: Optional[Path] = None,
+    page_loader: Optional[Callable[[Any], list[dict]]] = None,
+) -> list[dict[str, Any]]:
+    """按原始页唯一 quote 与页内坐标解析 Benchmark v2 evidence 组。
+
+    返回值保留每条 evidence 的独立 chunk ID 组；负例返回空列表。目标页任一
+    正文 chunk 坐标缺失/越界或相关区间无法完整覆盖 quote 时均 fail-close。
+    """
+    from app.core.config import config
+    from app.models import Chunk
+
+    root = Path(runtime_root) if runtime_root is not None else config.runtime_root
+    loader = page_loader or _default_page_loader(root)
+    groups: list[dict[str, Any]] = []
+    for evidence in entry.get("relevant_evidence", []):
+        paper_uid = evidence["paper_uid"]
+        paper = _resolve_evidence_paper(db, paper_uid, root)
+        pages = loader(paper)
+        quote = evidence["quote"].strip()
+
+        occurrences: list[tuple[int, int, str]] = []
+        ordered_pages: list[tuple[int, str]] = []
+        for page in pages:
+            page_number = page.get("page_number")
+            text = page.get("text") or ""
+            if not isinstance(page_number, int):
+                raise ValueError("原始页缺少有效页码")
+            ordered_pages.append((page_number, text))
+            occurrences.extend(
+                (page_number, start, text)
+                for start in _find_all_occurrences(text, quote)
+            )
+
+        if not occurrences:
+            for (_, left), (_, right) in zip(ordered_pages, ordered_pages[1:]):
+                if quote in left + right:
+                    raise ValueError(
+                        f"evidence quote 跨页: qa_id={entry.get('qa_id')} "
+                        f"paper_uid={paper_uid}"
+                    )
+            raise ValueError(
+                f"evidence quote 原文未命中: qa_id={entry.get('qa_id')} "
+                f"paper_uid={paper_uid}"
+            )
+        if len(occurrences) > 1:
+            raise ValueError(
+                f"evidence quote 原文多处命中: qa_id={entry.get('qa_id')} "
+                f"paper_uid={paper_uid}"
+            )
+
+        page_number, quote_start, page_text = occurrences[0]
+        quote_end = quote_start + len(quote)
+        rows = (
+            db.query(Chunk)
+            .filter(
+                Chunk.paper_id == paper.id,
+                Chunk.page_number == page_number,
+                Chunk.chunk_index >= 0,
+            )
+            .order_by(Chunk.chunk_index, Chunk.id)
+            .all()
+        )
+        if not rows:
+            raise ValueError("evidence 目标页没有正文 chunk")
+        for row in rows:
+            if row.page_start is None or row.page_end is None:
+                raise ValueError("evidence 目标页正文 chunk 坐标缺失")
+            if not (0 <= row.page_start < row.page_end <= len(page_text)):
+                raise ValueError("evidence 目标页正文 chunk 坐标越界")
+
+        relevant = [
+            row for row in rows
+            if row.page_start < quote_end and row.page_end > quote_start
+        ]
+        if not relevant:
+            raise ValueError("evidence span 未映射到正文 chunk")
+
+        # 相关 chunk 与 quote 的交集并集必须无缝覆盖完整证据。
+        intersections = sorted(
+            (max(row.page_start, quote_start), min(row.page_end, quote_end))
+            for row in relevant
+        )
+        covered_until = quote_start
+        for start, end in intersections:
+            if start > covered_until:
+                raise ValueError("evidence span 的 chunk 坐标覆盖存在空洞")
+            covered_until = max(covered_until, end)
+        if covered_until < quote_end:
+            raise ValueError("evidence span 未被 chunk 坐标完整覆盖")
+
+        groups.append({
+            "paper_id": paper.id,
+            "page_number": page_number,
+            "page_start": quote_start,
+            "page_end": quote_end,
+            "chunks": [
+                {
+                    "chunk_id": f"p{paper.id}_c{row.chunk_index}",
+                    "page_start": max(row.page_start, quote_start),
+                    "page_end": min(row.page_end, quote_end),
+                }
+                for row in relevant
+            ],
+        })
+    return groups

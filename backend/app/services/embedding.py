@@ -65,17 +65,25 @@ class TextChunker:
 
         # 先按段落拆分；超长单段再做有界硬切，避免配置阈值只对段间生效。
         paragraphs = []
-        for paragraph in re.split(r"\n\s*\n", text):
-            paragraph = paragraph.strip()
-            if paragraph:
-                paragraphs.extend(self._split_long_paragraph(paragraph))
+        for match in re.finditer(
+            r"\S(?:.*?\S)?(?=[ \t]*(?:\n\s*\n|\Z))", text, re.DOTALL
+        ):
+            paragraph = match.group(0)
+            paragraphs.extend(
+                self._split_long_paragraph_spans(paragraph, match.start())
+            )
+        # 分段落后若因 chunk_size 分属相邻块，把空白分隔符归入后一个
+        # source window，确保页内坐标并集没有证据覆盖空洞。
+        for previous, current in zip(paragraphs, paragraphs[1:]):
+            if previous["page_end"] < current["page_start"]:
+                current["page_start"] = previous["page_end"]
 
         chunks = []
         current = []
         current_len = 0
 
         for para in paragraphs:
-            para_len = len(para)
+            para_len = len(para["content"])
             separator_len = 2 if current else 0
             if current_len + separator_len + para_len > self.chunk_size and current:
                 chunks.append(self._make_chunk(current, page_number))
@@ -83,7 +91,7 @@ class TextChunker:
                 overlap = []
                 overlap_len = 0
                 for p in reversed(current):
-                    added_len = len(p) + (2 if overlap else 0)
+                    added_len = len(p["content"]) + (2 if overlap else 0)
                     if overlap_len + added_len > self._effective_overlap:
                         break
                     overlap.insert(0, p)
@@ -94,7 +102,7 @@ class TextChunker:
                 # 即使旧块尾段满足 overlap，也不能让它与新段拼接后突破硬上限。
                 while current and current_len + 2 + para_len > self.chunk_size:
                     removed = current.pop(0)
-                    current_len -= len(removed)
+                    current_len -= len(removed["content"])
                     if current:
                         current_len -= 2
 
@@ -119,8 +127,21 @@ class TextChunker:
         下一窗口从 ``end-overlap`` 开始；overlap 最大为 ``chunk_size-1``，
         因此每轮至少前进一个字符。切片仅去掉首尾空白，不丢弃正文字符。
         """
+        return [
+            item["content"]
+            for item in self._split_long_paragraph_spans(paragraph, 0)
+        ]
+
+    def _split_long_paragraph_spans(
+        self, paragraph: str, source_start: int
+    ) -> List[Dict[str, Any]]:
+        """切分段落并保留其在原始页文本中的半开区间。"""
         if len(paragraph) <= self.chunk_size:
-            return [paragraph]
+            return [{
+                "content": paragraph,
+                "page_start": source_start,
+                "page_end": source_start + len(paragraph),
+            }]
         if self.chunk_size <= 0:
             raise ValueError("chunk_size 必须大于 0")
 
@@ -144,27 +165,34 @@ class TextChunker:
 
             piece = paragraph[start:end].strip()
             if piece:
-                pieces.append(piece)
+                pieces.append({
+                    "content": piece,
+                    # 坐标保留原始窗口，不因 content.strip() 留下证据覆盖空洞。
+                    "page_start": source_start + start,
+                    "page_end": source_start + end,
+                })
             if end >= paragraph_len:
                 break
             start = max(end - self._effective_overlap, start + 1)
 
         return pieces
 
-    def _infer_chunk_type(self, paragraphs: List[str]) -> str:
+    def _infer_chunk_type(self, paragraphs: List[Dict[str, Any]]) -> str:
         """根据段落开头关键词推断内容类型。"""
-        first = " ".join(paragraphs[:2]).lower()
+        first = " ".join(item["content"] for item in paragraphs[:2]).lower()
         for ctype, keywords in self._SECTION_KEYWORDS.items():
             for kw in keywords:
                 if kw in first:
                     return ctype
         return "paragraph"
 
-    def _make_chunk(self, paragraphs: List[str], page_number: Optional[int]) -> Dict[str, Any]:
-        content = "\n\n".join(paragraphs)
+    def _make_chunk(self, paragraphs: List[Dict[str, Any]], page_number: Optional[int]) -> Dict[str, Any]:
+        content = "\n\n".join(item["content"] for item in paragraphs)
         return {
             "content": content,
             "page_number": page_number,
+            "page_start": paragraphs[0]["page_start"],
+            "page_end": paragraphs[-1]["page_end"],
             "chunk_type": self._infer_chunk_type(paragraphs),
             "token_count": len(content),
         }

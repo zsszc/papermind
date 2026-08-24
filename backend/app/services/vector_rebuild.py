@@ -30,6 +30,9 @@ def expected_chunk_records(db: Any) -> list[dict[str, Any]]:
             metadata["year"] = paper.year
         if row.page_number is not None:
             metadata["page_number"] = row.page_number
+        if row.page_start is not None and row.page_end is not None:
+            metadata["page_start"] = row.page_start
+            metadata["page_end"] = row.page_end
         records.append({
             "id": f"p{row.paper_id}_c{row.chunk_index}",
             "document": row.content or "",
