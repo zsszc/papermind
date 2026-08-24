@@ -99,6 +99,50 @@ def test_parser_accepts_explicit_vector_snapshot(tmp_path):
     assert args.vector_dir == str(tmp_path)
 
 
+def test_parser_accepts_explicit_candidate_database_and_corpus_root(tmp_path):
+    args = run.build_parser().parse_args([
+        "--database", str(tmp_path / "candidate.db"),
+        "--corpus-root", str(tmp_path / "corpus"),
+    ])
+
+    assert args.database == str(tmp_path / "candidate.db")
+    assert args.corpus_root == str(tmp_path / "corpus")
+
+
+def test_explicit_database_does_not_use_production_session(
+    tmp_path, monkeypatch
+):
+    from sqlalchemy import create_engine
+
+    from app.database import Base
+
+    database = tmp_path / "candidate.db"
+    engine = create_engine(f"sqlite:///{database}")
+    Base.metadata.create_all(engine)
+    engine.dispose()
+    corpus_root = tmp_path / "corpus"
+    corpus_root.mkdir()
+    dataset = tmp_path / "empty.jsonl"
+    dataset.write_text("", encoding="utf-8")
+    report_dir = tmp_path / "reports"
+
+    def forbidden_real_database():
+        raise AssertionError("显式候选评测不得连接生产 SessionLocal")
+
+    monkeypatch.setattr("app.database.SessionLocal", forbidden_real_database)
+    monkeypatch.setattr(run, "_prepare_eval_items", lambda args: ([], None))
+    args = run.build_parser().parse_args([
+        "--database", str(database),
+        "--corpus-root", str(corpus_root),
+        "--dataset", str(dataset),
+        "--keyword-only",
+        "--threshold", "0",
+        "--report-dir", str(report_dir),
+    ])
+
+    assert run.run_eval(args) == 0
+
+
 def test_qrels_hash_changes_when_evidence_changes():
     original = [{
         "qa_id": "qa",

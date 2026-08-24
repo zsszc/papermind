@@ -80,6 +80,25 @@ def test_build_staged_store_batches_upsert_and_validates(db, tmp_path):
     assert set(collection.ids) == {"p1_c-1", "p1_c0"}
 
 
+def test_required_embedding_dimension_fails_and_cleans_stage(db, tmp_path):
+    _seed_chunks(db)
+    collection = _FakeCollection()
+    embedder = MagicMock()
+    embedder.embed.side_effect = lambda texts: [[0.1, 0.2] for _ in texts]
+    stage = tmp_path / "stage-wrong-dimension"
+
+    with pytest.raises(ValueError, match="1024"):
+        build_staged_vector_store(
+            db,
+            stage,
+            embedder=embedder,
+            client_factory=lambda _: _FakeClient(collection),
+            required_dimension=1024,
+        )
+
+    assert not stage.exists()
+
+
 def test_validation_fails_closed_on_id_or_dimension_mismatch():
     with pytest.raises(ValueError, match="ID 集合"):
         validate_vector_collection(
@@ -144,6 +163,15 @@ def test_cli_requires_explicit_activate_flag():
 
     activated = build_parser().parse_args(["--activate"])
     assert activated.activate is True
+    assert staged.required_dimension == 1024
+
+
+def test_cli_accepts_explicit_candidate_database():
+    args = build_parser().parse_args([
+        "--stage-only", "--database", "/tmp/candidate.db"
+    ])
+
+    assert args.database == "/tmp/candidate.db"
 
 
 def test_cli_paths_are_resolved_before_same_parent_check(tmp_path):

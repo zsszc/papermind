@@ -77,6 +77,29 @@ def test_startup_preflight_reports_foreign_keys_without_blocking(tmp_path):
     assert report["orphan_paper_tags_count"] == 1
 
 
+def test_explicit_readonly_sqlalchemy_session_rejects_writes(tmp_path):
+    from sqlalchemy.exc import OperationalError
+
+    from app.services.data_integrity import open_readonly_sqlalchemy_database
+
+    database = tmp_path / "readonly.db"
+    with sqlite3.connect(database) as conn:
+        conn.execute("CREATE TABLE sample (value INTEGER)")
+        conn.execute("INSERT INTO sample VALUES (1)")
+    engine, session_factory = open_readonly_sqlalchemy_database(database)
+    try:
+        with session_factory() as db:
+            connection = db.connection()
+            assert connection.exec_driver_sql(
+                "SELECT value FROM sample"
+            ).scalar() == 1
+            with pytest.raises(OperationalError):
+                connection.exec_driver_sql("INSERT INTO sample VALUES (2)")
+                db.commit()
+    finally:
+        engine.dispose()
+
+
 def test_delete_paper_removes_incoming_and_outgoing_citation_edges(
     client, db, monkeypatch
 ):
