@@ -55,16 +55,17 @@ Harness 还确认了三项正确性风险：
   支持为这些指标设置显式阈值，任一失败均退出 1。
 - private 只运行 `dev`；本批不读取、不运行 holdout，不调用外部 LLM。
 - 重构 parity Gate：共享 hybrid 必须与 Batch 18 有效 hybrid 的逐题结果一致。
-- 生产晋级 Gate：Recall@5 >= 0.625、MRR >= 0.394、NDCG@5 >= 0.452、factoid Recall
-  >= 0.333、P95 < 1000ms、runtime degradation=0。
+- 生产晋级 Gate：Recall@5 >= 0.625、MRR >= 0.39375、NDCG@5 >=
+  0.4517186824830735、factoid Recall >= 1/3、P95 < 1000ms、runtime degradation=0。
+  三位小数仅用于展示，Gate 使用历史报告未舍入精确值。
 - 公开冻结 BM25 继续保持 0.900/0.783/0.813，Recall@5 Gate >= 0.85。
 
 ## 3. 配置与兼容
 
 - 新增 `retrieval.chat_profile`（`semantic`/`hybrid`）与
   `retrieval.lexical_profile`（本批生产仅允许 `bm25-bilingual`）。
-- 先以 `semantic` 完成代码 parity；仅在全部晋级 Gate 通过后，单独提交把生产默认改为
-  `hybrid`。已有私有配置缺少字段时使用代码默认值，默认值必须与公开模板一致。
+- 已先以 `semantic` 完成代码 parity，再在全部晋级 Gate 通过后单独提交把生产默认改为
+  `hybrid`。已有私有配置缺少字段时使用代码默认 `hybrid`，与公开模板一致。
 - `retrieval.rerank` 保持 `false`；`graph_expand` 保持 `false`；历史
   `retrieval.hybrid_weight` 本批不改变含义，也不得偷偷参与 RRF。
 

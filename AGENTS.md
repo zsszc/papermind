@@ -71,7 +71,7 @@ Kimi API (kimi-k2.6) —— 对话 / 概括 / 联网搜索 / 图片分析
 - **启动流程**（`backend/app/main.py` lifespan）：`Base.metadata.create_all` → `ensure_schema()` 轻量迁移 → `ensure_papers_fts()` 建 FTS5 虚拟表与触发器 → LLM 健康检查（结果存 `app.state.llm_ready`，暴露在 `/api/health`）→ 启动每日凌晨 3 点自动备份线程。
 - **静态服务**：`/static` 为白名单静态路由（`routers/static.py`），仅放行 `papers/`、`notes/`、`my-thesis/`、`summaries/` 四个目录，`resolve()` 防 `../` 穿越与软链接逃逸；项目根不再整体暴露。
 - **配置加载**（`backend/app/core/config.py`，单例 `Config`）：开发模式优先读项目根 `config.yaml`，缺失时回退 `config.yaml.example`；若设了 `PAPERMIND_DATA_DIR`，只在首次启动复制公开模板，真实配置保存在应用数据目录且升级不覆盖。`runtime_root` 统一重定向所有可变数据。
-- **检索**（`backend/app/routers/search.py`）：语义检索（ChromaDB cosine，Embedding 用 BGE-M3）与关键词检索（SQLite FTS5 `papers_fts` 表）可独立开关，同时开启时用 RRF（Reciprocal Rank Fusion）融合；语义检索结果有 60 秒内存缓存（`services/cache.py`）。`config.yaml` 里 `retrieval.rerank` 默认为 `false`，BGE-Reranker 相关代码是预留。
+- **检索**：`services/retrieval_pipeline.py` 是聊天与 eval 共用的 chunk 级管线，生产默认 BGE-M3 semantic + `bm25-bilingual` + chunk RRF；`paper_id/year` 同时限制两路，运行异常显式诊断并按相同范围降级。`routers/search.py` 保留论文级 FTS/RRF 适配层。语义结果缓存 60 秒且读写复制隔离；限制性 Chroma where 失败必须返回空，禁止降级为无过滤。`retrieval.rerank` 默认 `false`。
 - **Skill 系统**（`backend/app/services/skills.py`）：`SkillRegistry` 可注册注册表（Skill-as-Tool 基础），`Skill` dataclass 预留 `tools` 字段供后续工具化；模块级 `build_skill_prompt()` / `list_skills()` 保持原签名。现有 6 个默认 Skill：translator、proofreader、method_comparator、outline_generator、data_analyst、writing_assistant。根目录 `skills/` 目录为空，属预留。
 - **对话**（`routers/chat.py`）：`POST /api/chat` 为 SSE 流式。LLM 调用前的编排（记忆加载 → 向量检索 → 消息组装）由 `services/agent_graph.py` 的 LangGraph StateGraph 完成；流式生成与 SSE 事件格式（`{delta}` / `{finished, citations}` / `{error}`）由路由层保持。另有会话 CRUD、消息删除/重新生成、`/analyze-image`（多模态）、`/skills` 列表。
 - **MCP Server**（`services/mcp_server.py`）：挂载于 `/mcp`（SSE 握手 `/mcp/sse`），暴露 4 个只读工具 `search_papers` / `list_papers` / `get_paper` / `get_library_stats`，供任意 MCP 客户端连接使用。
@@ -192,7 +192,7 @@ cd ../electron && npm run build    # 产物在 frontend/out/（dmg/zip/exe）
 
 ## 8. 测试与评测
 
-### 单元/集成测试（pytest，601 个用例）
+### 单元/集成测试（pytest，623 个用例）
 
 ```bash
 cd backend
@@ -209,7 +209,7 @@ cd ../electron && npm test       # node:test（health / wait / restart / kill �
 ```
 
 前端测试依赖包含 MSW，新增网络交互测试不得连接真实后端；Electron 生命周期与安全策略纯模块不得
-`require('electron')`，确保 CI 无 GUI 也能运行。当前后端 601 个测试、前端 39 个测试、Electron 26 个测试。
+`require('electron')`，确保 CI 无 GUI 也能运行。当前后端 623 个测试、前端 39 个测试、Electron 26 个测试。
 
 ### RAG 评测（backend/eval/）
 
@@ -230,8 +230,8 @@ env -u PYTHONPATH venv/bin/python -m eval.run \
 - **公开稳定基线**：count 与 BM25 Recall@5 均为 0.900；MRR 分别 0.775/0.783，NDCG@5 分别 0.806/0.813；CI Gate 为 Recall@5 ≥ 0.85
 - `eval/private/` 为已忽略的真实语料评测目录；v1 共 72 条已审 QA / 18 篇论文，train/dev/holdout 各 24 条，证据 72/72 唯一解析
 - **真实库留出基线**：BM25 Recall@5/MRR/NDCG@5 为 0.542/0.308/0.365；中英术语扩展为 0.583/0.353/0.410
-- **真实库 dev 当前有效 hybrid**：重建后的 464 条 BGE-M3 向量经显式快照评测，Recall@5/MRR/NDCG@5 为 0.625/0.394/0.452；该结果只用于开发诊断，不替代 holdout
-- **生产聊天对齐 dev 基线**：`semantic-production` 只复刻聊天的语义 top5，Recall@5/MRR/NDCG@5 为 0.500/0.268/0.324，P95=245.6ms；factoid Recall=0，是后续优先弱项
+- **生产聊天当前 shared hybrid（private dev）**：显式 464-chunk 快照，Recall@5/MRR/NDCG@5 为 0.625/0.39375/0.4517186825，factoid Recall=0.333，P95=275.7ms、零降级；聊天与 eval 有逐项排序 parity Harness。该结果只用于开发诊断，不替代 holdout
+- **历史纯语义对齐基线**：`semantic-production` 为 0.500/0.268/0.324，P95=245.6ms、factoid=0；保留为改进起点，不再是生产默认
 - 私有真实库不可与公开基准混算趋势；公开集用于链路正确性和回归，不替代真实论文质量评测
 
 ### 改动后至少应验证
@@ -260,7 +260,7 @@ env -u PYTHONPATH venv/bin/python -m eval.run \
 - **ChromaDB telemetry 警告**：启动时 `Failed to send telemetry event` 可忽略（已设置 `anonymized_telemetry=False`，残余警告无害）。
 - **Chroma 已完成原子重建**：当前库与 SQLite 的 464 个 chunk ID 完全一致，Embedding 为 1024 维并通过 query smoke；旧失配库保留在已忽略的 `vector_db.backup-*` 目录。后续重建必须继续使用显式 stage/activate CLI，不得原地修补。
 - **真实 SQLite 历史孤儿**：主库 `quick_check=ok`，但仍有 4 条 `paper_tags` 外键孤儿；Batch 18 已生成并验证 FK=0 的修复候选副本，未自动覆盖源库。切换前必须再次备份并由用户明确确认。
-- **Kimi 已恢复但私有生成烟测待授权**：2026-08-14 最小健康检查返回 `ok=true`、模型 `kimi-k2.6`。真实论文固定四题生成烟测会把 QA 与 top-5 证据发送到外部 Kimi，必须获得用户明确的内容出站授权后执行。
+- **Kimi 已恢复但私有生成烟测待授权**：2026-08-24 实际启动 `/api/health` 返回 `status=ok`、`llm_ready=true`，模型 `kimi-k2.6`。真实论文固定四题生成烟测会把 QA 与 top-5 证据发送到外部 Kimi，必须获得用户明确的内容出站授权后执行。
 - **本地 BGE-Reranker 不满足延迟 Gate**：2.1GiB 模型可正常加载，但 CPU 上首题超过约 4 分钟未完成，已安全中止；生产 `retrieval.rerank` 继续保持 `false`。
 - **`backend/=2.6.0` 文件**：是历史上 `pip install 包名=2.6.0`（少写一个 `=`）误生成的空文件，可删。
 - **旧设计文档**（`PaperMind_需求规格说明书_技术设计文档.md` 等）描述的是规划态，与实现有出入时以代码为准（例如 React Query、YAML Skill 注册表、Alembic 均未落地）。
@@ -277,4 +277,4 @@ env -u PYTHONPATH venv/bin/python -m eval.run \
 
 ---
 
-> 最后更新：2026-08-14，Batch 19 前端可靠性与生产语义评测完成后同步。
+> 最后更新：2026-08-24，Batch 20 共享检索管线与生产 Hybrid 晋级后同步。
