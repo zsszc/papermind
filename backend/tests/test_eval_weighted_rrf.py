@@ -84,6 +84,7 @@ class _Collection:
     def __init__(self, ids, dimension=1024):
         self.ids = ids
         self.dimension = dimension
+        self.metadata = {"hnsw:num_threads": 1, "hnsw:search_ef": len(ids)}
 
     def get(self, include):
         assert include == ["embeddings"]
@@ -111,6 +112,9 @@ def test_vector_snapshot_audit_hashes_ids_and_embeddings(tmp_path):
         assert audit["database_chunk_count"] == 1
         assert audit["vector_count"] == 1
         assert audit["embedding_dimension"] == 1024
+        assert audit["hnsw_num_threads"] == 1
+        assert audit["hnsw_search_ef"] == 1
+        assert len(audit["hnsw_config_sha256"]) == 64
         assert len(audit["vector_manifest_sha256"]) == 64
         with pytest.raises(ValueError, match="ID 不一致"):
             run._audit_vector_snapshot(
@@ -150,6 +154,7 @@ def _report(
             "resolver_version": "page-span-v2",
             "vector_manifest_sha256": "e" * 64,
             "weighted_rrf_formula_sha256": contract["formula_sha256"],
+            "hnsw_config_sha256": "1" * 64,
         },
         "pipeline": {
             "profile": profile,
@@ -170,6 +175,9 @@ def _report(
                 "extra_vector_ids": 0,
                 "embedding_dimension": 1024,
                 "vector_manifest_sha256": "e" * 64,
+                "hnsw_num_threads": 1,
+                "hnsw_search_ef": 464,
+                "hnsw_config_sha256": "1" * 64,
             },
         },
         "overall": {
@@ -281,6 +289,17 @@ def test_selector_recomputes_contract_hashes_and_rejects_empty_git_sha():
     with pytest.raises(ValueError, match="配置指纹"):
         module.evaluate_weighted_baseline_parity(
             production, forged, weighted_profile="weighted-rrf-compat-v1"
+        )
+
+
+def test_compat_selector_requires_deterministic_hnsw_contract():
+    module = _selector()
+    production = _production_report()
+    compat = _report(1.0, profile="weighted-rrf-compat-v1")
+    compat["diagnostics"]["vector_snapshot"]["hnsw_search_ef"] = 10
+    with pytest.raises(ValueError, match="HNSW"):
+        module.evaluate_weighted_baseline_parity(
+            production, compat, weighted_profile="weighted-rrf-compat-v1"
         )
 
 

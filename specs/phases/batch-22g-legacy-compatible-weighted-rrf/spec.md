@@ -32,3 +32,15 @@ Batch 22F 的新去重/tie 契约使等权候选仅 11/24 与生产 top-5 完全
 2. CLI/report/profile 与 Batch 22F 严格区分，失败候选不能伪装成生产 hybrid。
 3. 自动 Gate 锁定完整网格、公共快照与两侧零降级。
 4. 未通过 dev 前不修改生产配置。
+
+## 5. Harness 勘误：确定性 HNSW 副本
+
+实现后发现同一生产 hybrid 在未改代码的两个独立进程间仅 21/24 top-5 顺序相同；固定
+PyTorch/BLAS 线程和 CPU device 后仍可复现。定位到 464-vector HNSW 快照的默认
+`search_ef=10` 会在近邻边界产生跨进程候选抖动，令 parity 与权重归因失效。
+
+- 原快照保持只读；由显式 CLI 原子复制出评测副本。
+- 副本冻结 `hnsw:num_threads=1`、`hnsw:search_ef=vector_count(464)`，向量内容指纹必须不变。
+- 报告记录 HNSW 配置指纹，compat Gate 同时校验两侧配置与向量指纹。
+- 先做 production/production 24/24 重复性 Gate，再重新做 production/compat 等权 Gate。
+- 该副本只服务离线可复现实验，不修改生产 `vector_db/` 或聊天配置。
