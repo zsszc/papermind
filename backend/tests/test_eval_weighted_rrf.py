@@ -56,6 +56,30 @@ def test_weighted_contract_separates_formula_and_configuration_hashes():
     assert second["lexical_weight"] == 1.5
 
 
+def test_compat_cli_and_contract_are_explicitly_isolated(tmp_path):
+    parser = run.build_parser()
+    common = [
+        "--retrieval-profile", "weighted-rrf-compat-v1",
+        "--database", str(tmp_path / "papers.db"),
+        "--corpus-root", str(tmp_path / "corpus"),
+        "--vector-dir", str(tmp_path / "vectors"),
+        "--split", "train", "--evidence-resolver", "page-span-v2",
+        "--lexical-profile", "bm25-bilingual",
+    ]
+    missing_weight = parser.parse_args(common)
+    assert "--rrf-lexical-weight" in run._validate_cli_args(missing_weight)
+    valid = parser.parse_args(common + ["--rrf-lexical-weight", "1.25"])
+    assert run._validate_cli_args(valid) is None
+
+    strict = run.weighted_rrf_contract_metadata(1.25)
+    compat = run.weighted_rrf_contract_metadata(
+        1.25, profile="weighted-rrf-compat-v1"
+    )
+    assert compat["algorithm"] == "weighted-rrf-compat-v1"
+    assert compat["formula_sha256"] != strict["formula_sha256"]
+    assert compat["configuration_sha256"] != strict["configuration_sha256"]
+
+
 class _Collection:
     def __init__(self, ids, dimension=1024):
         self.ids = ids
@@ -102,6 +126,12 @@ def _report(
     mrr=0.4, ndcg=0.45, split="train", degraded=0,
     profile="weighted-rrf-v1",
 ):
+    contract_profile = (
+        profile if profile.startswith("weighted-rrf-") else "weighted-rrf-v1"
+    )
+    contract = run.weighted_rrf_contract_metadata(
+        weight, profile=contract_profile
+    )
     items = [
         {
             "qa_id": f"q{index:02d}",
@@ -119,7 +149,7 @@ def _report(
             "page_text_manifest_sha256": "d" * 64,
             "resolver_version": "page-span-v2",
             "vector_manifest_sha256": "e" * 64,
-            "weighted_rrf_formula_sha256": "f" * 64,
+            "weighted_rrf_formula_sha256": contract["formula_sha256"],
         },
         "pipeline": {
             "profile": profile,
@@ -129,13 +159,7 @@ def _report(
             "split": split,
             "top_k": 5,
             "evidence_resolver": "page-span-v2",
-            "weighted_rrf": {
-                "semantic_weight": 1.0,
-                "lexical_weight": weight,
-                "rrf_k": 60,
-                "formula_sha256": "f" * 64,
-                "configuration_sha256": f"{int(weight * 100):064x}",
-            },
+            "weighted_rrf": contract,
         },
         "diagnostics": {
             "runtime_degraded_count": degraded,
@@ -201,6 +225,63 @@ def test_baseline_parity_can_emit_a_stop_artifact_before_running_grid():
         "matched_queries": 23,
         "total_queries": 24,
     }
+
+
+def test_compat_selector_uses_distinct_protocol_and_rejects_strict_reports():
+    module = _selector()
+    production = _production_report()
+    baseline = _report(1.0, profile="weighted-rrf-compat-v1")
+    candidates = [
+        _report(1.25, profile="weighted-rrf-compat-v1", factoid=0.5),
+        _report(1.5, profile="weighted-rrf-compat-v1", factoid=0.5),
+        _report(2.0, profile="weighted-rrf-compat-v1", factoid=0.5),
+    ]
+
+    parity = module.evaluate_weighted_baseline_parity(
+        production, baseline, weighted_profile="weighted-rrf-compat-v1"
+    )
+    assert parity["gate_version"] == "weighted-rrf-compat-baseline-parity-v1"
+    result = module.select_weighted_rrf_train(
+        production, baseline, candidates,
+        weighted_profile="weighted-rrf-compat-v1",
+    )
+    assert result["selector_version"] == "weighted-rrf-compat-train-v1"
+    assert result["weighted_profile"] == "weighted-rrf-compat-v1"
+    with pytest.raises(ValueError, match="weighted-rrf-compat-v1"):
+        module.select_weighted_rrf_train(
+            production, _report(1.0), candidates,
+            weighted_profile="weighted-rrf-compat-v1",
+        )
+
+
+def test_selector_recomputes_contract_hashes_and_rejects_empty_git_sha():
+    module = _selector()
+    production = _production_report()
+    compat = _report(1.0, profile="weighted-rrf-compat-v1")
+    strict_expected = run.weighted_rrf_contract_metadata(1.0)
+    compat_expected = run.weighted_rrf_contract_metadata(
+        1.0, profile="weighted-rrf-compat-v1"
+    )
+    for report in (production, compat):
+        report["run"]["git_sha"] = None
+    with pytest.raises(ValueError, match="git_sha"):
+        module.evaluate_weighted_baseline_parity(
+            production, compat, weighted_profile="weighted-rrf-compat-v1"
+        )
+
+    compat["run"]["git_sha"] = "a" * 40
+    production["run"]["git_sha"] = "a" * 40
+    compat["pipeline"]["weighted_rrf"].update(compat_expected)
+    compat["benchmark"]["weighted_rrf_formula_sha256"] = compat_expected[
+        "formula_sha256"
+    ]
+    assert compat_expected["formula_sha256"] != strict_expected["formula_sha256"]
+    forged = deepcopy(compat)
+    forged["pipeline"]["weighted_rrf"]["configuration_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="配置指纹"):
+        module.evaluate_weighted_baseline_parity(
+            production, forged, weighted_profile="weighted-rrf-compat-v1"
+        )
 
 
 def test_train_selector_fails_closed_on_parity_grid_and_degradation():
