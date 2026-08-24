@@ -192,7 +192,7 @@ cd ../electron && npm run build    # 产物在 frontend/out/（dmg/zip/exe）
 
 ## 8. 测试与评测
 
-### 单元/集成测试（pytest，623 个用例）
+### 单元/集成测试（pytest，697 个用例）
 
 ```bash
 cd backend
@@ -209,7 +209,7 @@ cd ../electron && npm test       # node:test（health / wait / restart / kill �
 ```
 
 前端测试依赖包含 MSW，新增网络交互测试不得连接真实后端；Electron 生命周期与安全策略纯模块不得
-`require('electron')`，确保 CI 无 GUI 也能运行。当前后端 678 个测试、前端 39 个测试、Electron 26 个测试。
+`require('electron')`，确保 CI 无 GUI 也能运行。当前后端 697 个测试、前端 39 个测试、Electron 26 个测试。
 
 ### RAG 评测（backend/eval/）
 
@@ -237,6 +237,7 @@ env -u PYTHONPATH venv/bin/python -m eval.run \
 - **真实 chunk 质量基线**：19 篇/464 chunks 中 437 条超过 512 字符、415 条超过 1024 字符、211 条超过 2048 字符，正文中位 1872 字符、P95 约 5.75k、最大 9776；`section_title` 为 0/464，19 条摘要缺 `token_count`。private train 的 24 条证据中 23 条落在 >512 字符块，下一批优先隔离硬分块重建
 - **Batch 22C 细粒度候选未晋级**：512/50 候选为 2904 chunks（正文 2885，P50/P95/最大 452/510/512），DB 隔离与完整性通过；但 train evidence qrel 仅 16/24 唯一解析，8 条 328–480 字符证据跨块。按 Gate 在向量构建前停止，未跑 train 排序/dev/holdout/LLM，生产仍为 464 chunks
 - **Batch 22D 已修正跨块评测并正式拒绝 512/50 候选**：新增页内半开坐标、原页唯一 quote resolver、字符并集 `span_coverage@5` 与配对 Gate；train 24/24 evidence 在旧/新候选均唯一解析，旧基线 coverage/any-hit/MRR/NDCG 为 0.667/0.667/0.422/0.483，新候选为 0.453/0.500/0.344/0.316，候选质量明显回退，按预案未看 dev。两套 SQLite/Chroma 均为私有 stage，生产仍为 464 chunks/1024 维向量
+- **Batch 22E Parent-Child 候选未晋级**：同一 `parent-child-v1` 下，旧粗粒度/512 child 的 train span coverage@5 为 `0.667/0.324`，MRR 为 `0.394/0.222`；候选五个质量 Gate 失败，按协议未运行 dev/holdout/Kimi。Parent 只用于分组排序，未向 LLM 注入 parent 正文；生产继续使用 464-chunk shared hybrid
 - **候选评测隔离**：`eval.run` 支持显式 `--database` + `--corpus-root` 只读候选库；`vector_rebuild` 支持 `--database` 并默认强制 1024 维。候选路径不得依赖 `PAPERMIND_DATA_DIR` 隐式切库
 - **历史纯语义对齐基线**：`semantic-production` 为 0.500/0.268/0.324，P95=245.6ms、factoid=0；保留为改进起点，不再是生产默认
 - 私有真实库不可与公开基准混算趋势；公开集用于链路正确性和回归，不替代真实论文质量评测
@@ -284,4 +285,4 @@ env -u PYTHONPATH venv/bin/python -m eval.run \
 
 ---
 
-> 最后更新：2026-08-24，Batch 22D 跨块 Benchmark v2 与真实 train 配对 Gate 完成后同步。
+> 最后更新：2026-08-25，Batch 22E Parent-Child 候选拒绝与 Batch 22F 规划完成后同步。
