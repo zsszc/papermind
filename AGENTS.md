@@ -209,7 +209,7 @@ cd ../electron && npm test       # node:test（health / wait / restart / kill �
 ```
 
 前端测试依赖包含 MSW，新增网络交互测试不得连接真实后端；Electron 生命周期与安全策略纯模块不得
-`require('electron')`，确保 CI 无 GUI 也能运行。当前后端 643 个测试、前端 39 个测试、Electron 26 个测试。
+`require('electron')`，确保 CI 无 GUI 也能运行。当前后端 658 个测试、前端 39 个测试、Electron 26 个测试。
 
 ### RAG 评测（backend/eval/）
 
@@ -235,6 +235,8 @@ env -u PYTHONPATH venv/bin/python -m eval.run \
 - **Batch 22 双语 v2 未进入 dev**：`bm25-bilingual-v2` 仅新增四条病理术语映射，train 质量与 v1 完全相同（0.66667/0.42361/0.48529，factoid=0.50），未达到至少新增 1 题的 Gate，因此按预案跳过 dev；生产继续使用 `bm25-bilingual`
 - **Batch 22B 消费者已收敛**：聊天、重新生成、深度综述、论文引用推荐和 eval 的 chunk RAG 都经共享 `RetrievalPipeline`；论文引用零证据时跳过 LLM，显式单篇论文范围禁止 graph 越界，论文发现页语义异常保留 FTS 结果
 - **真实 chunk 质量基线**：19 篇/464 chunks 中 437 条超过 512 字符、415 条超过 1024 字符、211 条超过 2048 字符，正文中位 1872 字符、P95 约 5.75k、最大 9776；`section_title` 为 0/464，19 条摘要缺 `token_count`。private train 的 24 条证据中 23 条落在 >512 字符块，下一批优先隔离硬分块重建
+- **Batch 22C 细粒度候选未晋级**：512/50 候选为 2904 chunks（正文 2885，P50/P95/最大 452/510/512），DB 隔离与完整性通过；但 train evidence qrel 仅 16/24 唯一解析，8 条 328–480 字符证据跨块。按 Gate 在向量构建前停止，未跑 train 排序/dev/holdout/LLM，生产仍为 464 chunks
+- **候选评测隔离**：`eval.run` 支持显式 `--database` + `--corpus-root` 只读候选库；`vector_rebuild` 支持 `--database` 并默认强制 1024 维。候选路径不得依赖 `PAPERMIND_DATA_DIR` 隐式切库
 - **历史纯语义对齐基线**：`semantic-production` 为 0.500/0.268/0.324，P95=245.6ms、factoid=0；保留为改进起点，不再是生产默认
 - 私有真实库不可与公开基准混算趋势；公开集用于链路正确性和回归，不替代真实论文质量评测
 
@@ -281,4 +283,4 @@ env -u PYTHONPATH venv/bin/python -m eval.run \
 
 ---
 
-> 最后更新：2026-08-24，Batch 22B 检索消费者收敛与真实 chunk 质量审计后同步。
+> 最后更新：2026-08-24，Batch 22C 隔离分块候选在 qrel 完整性 Gate 失败后同步。

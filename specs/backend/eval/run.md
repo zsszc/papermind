@@ -1,4 +1,4 @@
-# RAG 评测入口规格（Batch 20 当前实现）
+# RAG 评测入口规格（Batch 22C 当前实现）
 
 > 适用文件：`backend/eval/run.py`。最后核对：2026-08-24。
 
@@ -11,8 +11,11 @@
 ## 2. 隔离与隐私
 
 - 非 `--keyword-only` CLI 必须显式 `--vector-dir`，不得隐式打开主向量库。
+- 候选语料必须显式 `--database` 与 `--corpus-root`；数据库以 SQLite `mode=ro` +
+  `query_only` 打开，不得回连生产 `SessionLocal`，语料根仅用于稳定 DOI/PDF SHA 身份。
 - 公开 fixture 必须 `--keyword-only`，使用隔离内存 SQLite。
-- private 选型只运行 `--split dev`；holdout 由单独验收授权控制。
+- private 选型按阶段规格 train-first；只有冻结的 train Gate 通过才允许一次 dev。holdout 由
+  单独最终验收授权控制，绝不能作为调参集。
 - `--with-llm` 必须 private dev、显式 QA 白名单、显式调用预算、private report 目录；
   执行前健康预检，最多 512 tokens，不启用联网搜索。
 - 未获真实论文内容出站授权时不得运行 private `--with-llm`。
@@ -91,3 +94,4 @@ benchmark 必须记录 dataset/qrels/corpus 指纹与 comparison_key；只有指
 - `test_eval_lexical.py`：token/BM25/bilingual/历史 neighbor profile。
 - `test_eval_latency.py`：逐题延迟、报告与 runtime degradation。
 - `test_eval_reproducible.py` / `test_eval_fixture.py`：指纹和公开 fixture。
+- `test_database_integrity.py`：显式候选 SQLite 的真实只读写拒绝。

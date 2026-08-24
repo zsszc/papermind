@@ -57,9 +57,10 @@ PaperMind 的语义检索依赖本地向量模型，本模块承担两件基础�
 - **输出**：该页的 chunk 列表；`text` 为空白（`strip()` 后为空）时返回 `[]`
 - **行为规则**：
   1. 按正则 `\n\s*\n`（空行）切段，各段 `strip()`、丢弃空段；
-  2. 以 `len()`（**字符数**，非 token 数）贪心累加段落；当 `current_len + para_len > chunk_size` 且当前缓冲非空时，先输出一块，再从刚输出块的**尾部**往回取若干完整段落作为下一块的开头，直到再取一段会使重叠总量超过 `chunk_overlap` 为止；
-  3. 单个段落自身超过 `chunk_size` 时**不再二次切分**，整块保留（块长可超过 `chunk_size`）；
-  4. 循环结束后缓冲非空则输出最后一块。
+  2. 单段超过 `chunk_size` 时执行确定性硬切，只在窗口后半段寻找边界；优先句末/分号，其次空白，均无命中时用固定窗口；
+  3. 硬切下一窗口从 `end-effective_overlap` 开始，`effective_overlap` 被限制在 `[0, chunk_size-1]`，保证每轮至少前进 1 字符；
+  4. 以 `len()`（**字符数**，非 token 数）贪心组合切分后的段落，`"\n\n"` 分隔符也计入上限；旧块尾部完整段落可在不突破硬上限时作为 overlap；
+  5. 所有非空输出满足 `len(content) <= chunk_size`，循环结束后缓冲非空则输出最后一块。
 - **副作用**：无
 
 ### 3.4 `TextChunker._infer_chunk_type(self, paragraphs: List[str]) -> str`
@@ -132,7 +133,8 @@ PaperMind 的语义检索依赖本地向量模型，本模块承担两件基础�
 |------|----------|
 | `embed([])` / `_sync_embed([])` | 返回 `[]`，不触碰模型与队列 |
 | 整页空白文本 | 该页产出 0 个 chunk |
-| 单段长度超过 `chunk_size` | 不切分，整块保留（块长可超限） |
+| 单段长度超过 `chunk_size` | 句末/分号 → 空白 → 固定窗口三级切分，所有块不超过硬上限 |
+| `chunk_overlap >= chunk_size` | 有效 overlap 收敛为 `chunk_size-1`，每轮至少前进 1 字符，不死循环 |
 | 段落恰好使 `current_len + para_len == chunk_size` | 不触发切块，继续累加（严格大于才切） |
 | 中文长文本 | 空白分词截断失效，整段进入 encode（依赖模型自身 8192 token 上限，存在内存峰值风险） |
 | 模型下载/加载失败（无网络、依赖缺失、OOM） | `available()` 返回 `False`；`embed()` 抛 `RuntimeError`（含首次失败原因）；`_failed` 锁存，进程内不再重试 |
@@ -171,13 +173,9 @@ PaperMind 的语义检索依赖本地向量模型，本模块承担两件基础�
 
 ## 7. 现有测试覆盖与盲区
 
-- **已覆盖**：`backend/tests/` 中**没有任何直接针对本模块的测试**（TextChunker 与 EmbeddingService 均未被 import）。间接覆盖仅三处：
-  - `tests/test_search.py`：用 `_StubVectorStore`（`available()` 恒 False）验证检索路由在语义不可用时的降级路径——验证的是路由层，不是本模块；
-  - `tests/test_upload.py`：mock 掉后台处理入口，间接跳过 TextChunker；
-  - `tests/test_agent_graph.py`：`_BoomStore` 抛出 `RuntimeError("embedding 挂了")`，验证 Agent 图在向量库异常时 `context_chunks == []`——同样是消费方行为。
+- **已覆盖**：`tests/test_embedding.py` 直接覆盖配置读取、batch_size 透传、中文/英文句末优先、无边界固定窗口、分隔符计入硬上限、overlap 防死循环、页码与 token_count；processor 摘要路径另有集成测试。
 - **盲区**：
-  - **高**：`TextChunker` 全部行为无测试——切块阈值边界（恰好相等 vs 严格大于）、单段超长不切分、块间重叠计算、空白页、`chunk_type` 关键词优先级与「仅看前两段」规则、`token_count` 实为字符数（AC1–AC4 全部无落点）
-  - **高**：`embed()` 的 `batch_size` 形参被静默丢弃（契约缺陷，见 3.10），无测试暴露；修复前任何依赖批次调优的调用都无效
+  - **中**：空白页、`chunk_type` 全关键词优先级与「仅看前两段」仍未完整参数化；硬切后的后续碎片会重新推断类型，不继承首片类型
   - **中**：`available()` 的失败锁存（`_failed` 置位后不再重试）、`_error` 进入 `RuntimeError` 消息、加载成功路径的 encode 固定参数（AC6/AC8）无测试
   - **中**：单例与 worker 生命周期无测试——毒丸 `None` 无投放点、守护线程随进程退出丢弃未消费任务、`embed()` 无超时永久阻塞的风险（worker 若意外死亡，调用方挂死）
   - **中**：长文本截断仅对空白分词语言（英文）生效、中文不截断的行为无测试（AC10 只覆盖英文）
