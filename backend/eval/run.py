@@ -1213,7 +1213,8 @@ def run_eval(args: argparse.Namespace) -> int:
         print(f"[eval] 报告已写入 {report_path}")
 
         # 退出码判定
-        print(f"[eval] recall@{args.top_k}={overall[f'recall@{args.top_k}']:.3f} "
+        gate_metric = gate["metric"]
+        print(f"[eval] {gate_metric}={gate['actual']:.3f} "
               f"阈值={args.threshold} -> {'PASS' if passed else 'FAIL'}")
         if not runtime_valid:
             print("[eval] hybrid 运行期发生语义检索降级，本次质量门禁无效")
