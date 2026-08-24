@@ -1108,11 +1108,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--lexical-profile",
         choices=(
-            "count", "bm25", "bm25-bilingual", "bm25-bilingual-neighbor"
+            "count", "bm25", "bm25-bilingual", "bm25-bilingual-v2",
+            "bm25-bilingual-neighbor"
         ),
         default="count",
-        help=("chunk 词法检索策略；bm25-bilingual 增加可审计中英术语"
-              "扩展；bm25-bilingual-neighbor 额外增加同论文相邻块分数，"
+        help=("chunk 词法检索策略；bm25-bilingual-v2 为 Batch22 病理术语"
+              "候选；bm25-bilingual-neighbor 额外增加同论文相邻块分数；"
               "默认 count 保持历史行为"),
     )
     parser.add_argument("--with-llm", action="store_true",

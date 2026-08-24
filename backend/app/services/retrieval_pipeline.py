@@ -58,6 +58,15 @@ _BILINGUAL_TERM_MAP = (
     ("指标", ("metric",)),
 )
 
+# Batch 22 train-only 匿名审计后冻结的病理术语增量。保持独立 profile，
+# 不直接修改已晋级生产的 v1 映射，失败实验不会改变旧查询排序。
+_BILINGUAL_TERM_MAP_V2_ADDITIONS = (
+    ("切片", ("slide",)),
+    ("肿瘤", ("tumor",)),
+    ("特征提取", ("feature", "extraction")),
+    ("特征", ("feature",)),
+)
+
 _CHUNK_ID_FULL_RE = re.compile(r"^p(-?\d+)_c(-?\d+)$")
 
 _LOCAL_NEIGHBOR_SEED_POOL = 20
@@ -71,11 +80,21 @@ def tokenize_technical_terms(text: str) -> List[str]:
     return [token.lower() for token in _TECHNICAL_TOKEN_RE.findall(text or "")]
 
 
-def query_technical_terms(text: str, *, bilingual: bool = False) -> List[str]:
+def query_technical_terms(
+    text: str,
+    *,
+    bilingual: bool = False,
+    bilingual_profile: str = "v1",
+) -> List[str]:
     """提取查询锚点，可选扩展显式中英领域术语。"""
+    if bilingual_profile not in {"v1", "v2"}:
+        raise ValueError(f"不支持的双语术语 profile: {bilingual_profile}")
     tokens = tokenize_technical_terms(text)
     if bilingual:
-        for chinese, english_terms in _BILINGUAL_TERM_MAP:
+        term_map = _BILINGUAL_TERM_MAP
+        if bilingual_profile == "v2":
+            term_map += _BILINGUAL_TERM_MAP_V2_ADDITIONS
+        for chinese, english_terms in term_map:
             if chinese in (text or ""):
                 tokens.extend(english_terms)
     return list(dict.fromkeys(tokens))
@@ -222,10 +241,15 @@ def bm25_chunk_search(
     limit: Optional[int] = 20,
     *,
     bilingual: bool = False,
+    bilingual_profile: str = "v1",
     filters: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """以技术锚点对 chunk 内容执行轻量 BM25。"""
-    query_tokens = query_technical_terms(query, bilingual=bilingual)
+    query_tokens = query_technical_terms(
+        query,
+        bilingual=bilingual,
+        bilingual_profile=bilingual_profile,
+    )
     if not query_tokens:
         return []
 
@@ -269,7 +293,11 @@ def bm25_chunk_search(
             "page_number": chunk.page_number,
             "chunk_type": chunk.chunk_type,
             "score": score,
-            "source": "keyword-bm25-bilingual" if bilingual else "keyword-bm25",
+            "source": (
+                "keyword-bm25-bilingual-v2"
+                if bilingual and bilingual_profile == "v2"
+                else "keyword-bm25-bilingual" if bilingual else "keyword-bm25"
+            ),
         })
     scored.sort(key=lambda item: (-item["score"], item["chunk_id"]))
     return scored if limit is None else scored[:limit]
@@ -289,12 +317,17 @@ def keyword_chunk_search(
             db, query, None, bilingual=True, filters=filters
         )
         return rerank_bm25_neighbors(scored)[:limit]
-    if lexical_profile in {"bm25", "bm25-bilingual"}:
+    if lexical_profile in {"bm25", "bm25-bilingual", "bm25-bilingual-v2"}:
         return bm25_chunk_search(
             db,
             query,
             limit,
-            bilingual=lexical_profile == "bm25-bilingual",
+            bilingual=lexical_profile in {
+                "bm25-bilingual", "bm25-bilingual-v2"
+            },
+            bilingual_profile=(
+                "v2" if lexical_profile == "bm25-bilingual-v2" else "v1"
+            ),
             filters=filters,
         )
     if lexical_profile != "count":
