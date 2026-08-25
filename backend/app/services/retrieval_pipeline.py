@@ -75,6 +75,10 @@ _LOCAL_NEIGHBOR_DECAY = 0.5
 _LOCAL_NEIGHBOR_EXPANDED_CAP = 20
 _PARENT_CHILD_POOL = 40
 _PARENT_CHILD_DISCOUNTS = (1.0, 0.5, 0.25)
+_ANCHOR_UNIT_TOKENS = frozenset({
+    "mm", "cm", "m", "km", "ms", "s", "min", "h", "hz", "khz", "mhz",
+    "kb", "mb", "gb", "tb", "mg", "g", "kg", "ml", "l",
+})
 
 
 class ParentMappingError(ValueError):
@@ -112,6 +116,29 @@ def query_technical_terms(
             if chinese in (text or ""):
                 tokens.extend(english_terms)
     return list(dict.fromkeys(tokens))
+
+
+def extract_factoid_anchors(text: str) -> List[str]:
+    """提取查询中的数值、单位和方法/数据集缩写，保持稳定顺序。"""
+    raw_tokens = _TECHNICAL_TOKEN_RE.findall(text or "")
+    anchors: List[str] = []
+    previous_has_digit = False
+    for raw_token in raw_tokens:
+        normalized = raw_token.lower()
+        has_digit = any(char.isdigit() for char in raw_token)
+        letters = [char for char in raw_token if char.isalpha()]
+        uppercase_count = sum(char.isupper() for char in letters)
+        compact_length = len("".join(letters))
+        is_acronym = (
+            2 <= compact_length <= 12
+            and uppercase_count >= 2
+        )
+        is_adjacent_unit = previous_has_digit and normalized in _ANCHOR_UNIT_TOKENS
+        if has_digit or is_acronym or is_adjacent_unit:
+            if normalized not in anchors:
+                anchors.append(normalized)
+        previous_has_digit = has_digit
+    return anchors
 
 
 def _filtered_chunk_query(db: Session, filters: Optional[Dict[str, Any]]):
@@ -317,6 +344,29 @@ def bm25_chunk_search(
     return scored if limit is None else scored[:limit]
 
 
+def anchor_chunk_search(
+    db: Session,
+    query: str,
+    *,
+    limit: int = 10,
+    filters: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """只用冻结 factoid 锚点执行第三路 BM25，不做双语扩展。"""
+    anchors = extract_factoid_anchors(query)
+    if not anchors:
+        return []
+    results = bm25_chunk_search(
+        db,
+        " ".join(anchors),
+        limit,
+        bilingual=False,
+        filters=filters,
+    )
+    for item in results:
+        item["source"] = "keyword-anchor"
+    return results
+
+
 def keyword_chunk_search(
     db: Session,
     query: str,
@@ -440,6 +490,39 @@ def rrf_fuse_chunks(
     ordered = sorted(scores, key=lambda cid: (-scores[cid], order[cid], cid))
     # 保留首个命中分支的 source 与元数据，兼容既有聊天引用契约；
     # 管线级 effective_profile 由 diagnostics 单独表达。
+    return [copy.deepcopy(metas[cid]) for cid in ordered[:top_k]]
+
+
+def anchor_rrf_fuse_chunks(
+    semantic_results: List[Dict[str, Any]],
+    keyword_results: List[Dict[str, Any]],
+    anchor_results: List[Dict[str, Any]],
+    top_k: int,
+    *,
+    k: int = 60,
+) -> List[Dict[str, Any]]:
+    """保留 production legacy RRF 语义并增加等权第三路。"""
+    if not anchor_results:
+        return rrf_fuse_chunks(
+            semantic_results, keyword_results, top_k, k=k
+        )
+    scores: Dict[Any, float] = {}
+    metas: Dict[Any, Dict[str, Any]] = {}
+    order: Dict[Any, int] = {}
+    for route in (semantic_results, keyword_results, anchor_results):
+        for rank, item in enumerate(route):
+            chunk_id = item.get("chunk_id")
+            if chunk_id is None and _CHUNK_ID_FULL_RE.fullmatch(
+                str(item.get("source", ""))
+            ):
+                chunk_id = str(item["source"])
+            if chunk_id is None:
+                continue
+            scores[chunk_id] = scores.get(chunk_id, 0.0) + 1.0 / (k + rank + 1)
+            if chunk_id not in metas:
+                order[chunk_id] = len(order)
+                metas[chunk_id] = copy.deepcopy(item)
+    ordered = sorted(scores, key=lambda cid: (-scores[cid], order[cid], cid))
     return [copy.deepcopy(metas[cid]) for cid in ordered[:top_k]]
 
 
@@ -711,7 +794,7 @@ class RetrievalPipeline:
         if profile not in {
             "semantic", "hybrid", "hybrid-local-neighbor",
             "parent-child-v1", "weighted-rrf-v1",
-            "weighted-rrf-compat-v1", "keyword"
+            "weighted-rrf-compat-v1", "hybrid-anchor-v1", "keyword"
         }:
             raise ValueError(f"不支持的检索 profile: {requested_profile}")
         weighted_profiles = {"weighted-rrf-v1", "weighted-rrf-compat-v1"}
@@ -722,7 +805,8 @@ class RetrievalPipeline:
         keyword_error = False
         if profile in {
             "hybrid", "hybrid-local-neighbor", "parent-child-v1",
-            "weighted-rrf-v1", "weighted-rrf-compat-v1", "keyword"
+            "weighted-rrf-v1", "weighted-rrf-compat-v1",
+            "hybrid-anchor-v1", "keyword"
         }:
             try:
                 keyword_results = keyword_chunk_search(
@@ -736,6 +820,27 @@ class RetrievalPipeline:
                 keyword_error = True
                 logger.warning(
                     f"[retrieval_pipeline] 词法检索失败: {type(exc).__name__}"
+                )
+
+        anchor_results: List[Dict[str, Any]] = []
+        anchor_error = False
+        anchors = (
+            extract_factoid_anchors(query)
+            if profile == "hybrid-anchor-v1" else []
+        )
+        if anchors:
+            try:
+                anchor_results = anchor_chunk_search(
+                    self.db,
+                    query,
+                    limit=top_k * 2,
+                    filters=filters,
+                )
+            except Exception as exc:
+                anchor_error = True
+                logger.warning(
+                    "[retrieval_pipeline] 锚点检索失败: "
+                    f"{type(exc).__name__}"
                 )
 
         if profile == "keyword":
@@ -903,6 +1008,52 @@ class RetrievalPipeline:
                 reason=None,
             )
             return results
+
+        if profile == "hybrid-anchor-v1":
+            if semantic_reason is not None:
+                effective = "keyword-only" if not keyword_error else "empty"
+                self._write_diagnostics(
+                    diagnostics,
+                    requested_profile,
+                    effective,
+                    degraded=True,
+                    reason=(
+                        semantic_reason
+                        if not keyword_error else "both_routes_failed"
+                    ),
+                )
+                return copy.deepcopy(keyword_results[:top_k])
+            if keyword_error:
+                self._write_diagnostics(
+                    diagnostics,
+                    requested_profile,
+                    "semantic-only",
+                    degraded=True,
+                    reason="keyword_search_failed",
+                )
+                return copy.deepcopy(semantic_results[:top_k])
+            baseline = rrf_fuse_chunks(
+                semantic_results, keyword_results, top_k
+            )
+            if anchor_error:
+                self._write_diagnostics(
+                    diagnostics,
+                    requested_profile,
+                    "hybrid",
+                    degraded=True,
+                    reason="anchor_search_failed",
+                )
+                return baseline
+            self._write_diagnostics(
+                diagnostics,
+                requested_profile,
+                "hybrid-anchor-v1",
+                degraded=False,
+                reason=None,
+            )
+            return anchor_rrf_fuse_chunks(
+                semantic_results, keyword_results, anchor_results, top_k
+            )
 
         baseline_semantic_results = semantic_results[:top_k * 2]
         neighbor_error = False

@@ -851,6 +851,10 @@ class Retriever:
             and not self.degraded
         ):
             return "hybrid-local-neighbor"
+        if self.retrieval_profile == "hybrid-anchor-v1" and not self.degraded:
+            return "hybrid-anchor-v1"
+        if self.retrieval_profile == "hybrid-anchor-v1":
+            return "hybrid-anchor-v1(degraded)"
         return "keyword-only(degraded)" if self.degraded else "hybrid"
 
     def search(self, query: str) -> List[Dict[str, Any]]:
@@ -867,6 +871,8 @@ class Retriever:
             profile = "semantic"
         elif self.retrieval_profile == "hybrid-local-neighbor":
             profile = "hybrid-local-neighbor"
+        elif self.retrieval_profile == "hybrid-anchor-v1":
+            profile = "hybrid-anchor-v1"
         elif self.retrieval_profile == "parent-child-v1":
             profile = "parent-child-v1"
         elif self.retrieval_profile in _WEIGHTED_RRF_PROFILES:
@@ -1627,14 +1633,15 @@ def build_parser() -> argparse.ArgumentParser:
         choices=(
             "hybrid", "hybrid-local-neighbor", "semantic-production",
             "parent-child-v1", "weighted-rrf-v1",
-            "weighted-rrf-compat-v1",
+            "weighted-rrf-compat-v1", "hybrid-anchor-v1",
         ),
         default="hybrid",
         help=("评测检索管线；hybrid-local-neighbor 为 Batch21 候选；"
               "semantic-production 严格仅跑生产语义 top5；"
               "parent-child-v1 为 Batch22E 隔离候选；"
               "weighted-rrf-v1 为 Batch22F 严格候选；"
-              "weighted-rrf-compat-v1 为 Batch22G 旧版兼容候选"),
+              "weighted-rrf-compat-v1 为 Batch22G 旧版兼容候选；"
+              "hybrid-anchor-v1 为 Batch22I factoid 锚点候选"),
     )
     parser.add_argument(
         "--vector-dir",
@@ -1747,6 +1754,26 @@ def _validate_cli_args(args: argparse.Namespace) -> Optional[str]:
             "--rrf-lexical-weight 仅适用于 weighted-rrf-v1 或 "
             "weighted-rrf-compat-v1"
         )
+    if args.retrieval_profile == "hybrid-anchor-v1":
+        if args.keyword_only:
+            return "hybrid-anchor-v1 不得使用 --keyword-only"
+        if not args.database or not args.corpus_root or not args.vector_dir:
+            return (
+                "hybrid-anchor-v1 必须显式指定 --database/--corpus-root/"
+                "--vector-dir"
+            )
+        if args.parent_database:
+            return "hybrid-anchor-v1 不得指定 --parent-database"
+        if args.evidence_resolver != "page-span-v2":
+            return "hybrid-anchor-v1 必须使用 --evidence-resolver page-span-v2"
+        if args.top_k != 5:
+            return "hybrid-anchor-v1 必须使用 top-k=5"
+        if args.split not in {"train", "dev"}:
+            return "hybrid-anchor-v1 只允许 train/dev，禁止 holdout"
+        if args.lexical_profile != "bm25-bilingual":
+            return "hybrid-anchor-v1 必须使用 --lexical-profile bm25-bilingual"
+        if args.qa_id or args.with_llm:
+            return "hybrid-anchor-v1 禁止 QA 子集与 LLM"
     if args.retrieval_profile == "parent-child-v1":
         if args.keyword_only:
             return "parent-child-v1 不得使用 --keyword-only"

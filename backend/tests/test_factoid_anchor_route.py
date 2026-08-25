@@ -41,7 +41,7 @@ class _Store:
         ("比较 ABMIL 与 TransMIL 的方法", ["abmil", "transmil"]),
         ("What method improves accuracy?", []),
         ("样本量为 100，重复 100 次", ["100"]),
-        ("普通中文问题，没有 ASCII 实体", []),
+        ("普通中文问题，没有英文实体", []),
     ],
 )
 def test_extract_factoid_anchors_is_frozen_and_deduplicated(query, expected):
