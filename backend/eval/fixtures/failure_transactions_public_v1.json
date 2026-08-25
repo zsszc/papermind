@@ -1,0 +1,15 @@
+{
+  "fixture_schema": "papermind-failure-transactions-fixture-v1",
+  "benchmark_id": "papermind-failure-transactions-public-v1",
+  "license": "CC0-1.0",
+  "synthetic": true,
+  "scenarios": [
+    {"scenario_id": "chat-success-control", "operation": "chat", "failure": "none", "expected_llm_calls": 1},
+    {"scenario_id": "chat-stream-failure", "operation": "chat", "failure": "stream", "expected_llm_calls": 1},
+    {"scenario_id": "chat-cancelled", "operation": "chat", "failure": "cancel", "expected_llm_calls": 1},
+    {"scenario_id": "chat-assistant-commit-failure", "operation": "chat", "failure": "commit", "expected_llm_calls": 1},
+    {"scenario_id": "deep-review-plan-failure", "operation": "deep-review", "failure": "plan", "expected_llm_calls": 1},
+    {"scenario_id": "deep-review-commit-failure", "operation": "deep-review", "failure": "commit", "expected_llm_calls": 3},
+    {"scenario_id": "regenerate-commit-failure", "operation": "regenerate", "failure": "commit", "expected_llm_calls": 1}
+  ]
+}
