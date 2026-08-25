@@ -96,6 +96,45 @@ class TestRegenerate:
         resp = client.post(f"/api/chat/conversations/{conv.id}/messages/{user_msg.id}/regenerate")
         assert resp.status_code == 404
 
+    def test_llm_error_sentinel_rolls_back_original_message(
+        self, client, db, conversation_with_pair, monkeypatch
+    ):
+        """RED：重生成失败只能发脱敏 error，原正文与引用不可被错误串覆盖。"""
+        conv, am = conversation_with_pair
+        am.citations = [{"source": "p1_c0", "paper_id": 1, "title": "原引用"}]
+        db.commit()
+
+        async def fake_stream(messages, enable_web_search=False):
+            yield "不应提交的半条回答"
+            yield "\n[调用 LLM 出错: private-stack-canary]"
+
+        from .conftest import TestingSessionLocal
+
+        monkeypatch.setattr("app.routers.chat.llm_service.chat_stream", fake_stream)
+        monkeypatch.setattr(
+            "app.routers.chat.get_vector_store",
+            lambda: SimpleNamespace(available=lambda: False),
+        )
+        monkeypatch.setattr("app.database.SessionLocal", TestingSessionLocal)
+
+        resp = client.post(f"/api/chat/conversations/{conv.id}/messages/{am.id}/regenerate")
+        frames = [
+            json.loads(line[len("data: "):])
+            for line in resp.text.splitlines() if line.startswith("data: ")
+        ]
+
+        assert frames[-1] == {
+            "error": "AI 服务暂时不可用，请稍后重试",
+            "error_code": "llm_generation_failed",
+            "conversation_id": conv.id,
+        }
+        assert not any(frame.get("finished") is True for frame in frames)
+        assert "private-stack-canary" not in resp.text
+        db.expire_all()
+        saved = db.query(Message).filter(Message.id == am.id).one()
+        assert saved.content == "old"
+        assert saved.citations == [{"source": "p1_c0", "paper_id": 1, "title": "原引用"}]
+
 
 class TestDeleteMessagesFrom:
     """delete_messages_from 截断删除后回溯 message_count（Batch7b-F11）。
@@ -290,6 +329,105 @@ class TestGuardrailsIntegration:
         assert resp.json()["content"] == "同步答案[^1^]越界"
         assert [item["source"] for item in resp.json()["citations"]] == ["p1_c0"]
         assert resp.json()["verification"]["removed"] == 1
+
+
+class TestGenerationFailureTransactions:
+    """Batch 23C：LLM 失败不是正文，assistant 与计数必须 fail-close。"""
+
+    @staticmethod
+    def _patch_orchestration(monkeypatch):
+        monkeypatch.setattr(
+            "app.routers.chat.run_pre_orchestration",
+            lambda **kwargs: {
+                "messages": [{"role": "user", "content": kwargs["user_message"]}],
+                "context_chunks": [],
+                "web_search_enabled": False,
+                "history_total": 1,
+            },
+        )
+
+    @staticmethod
+    def _frames(response):
+        return [
+            json.loads(line[len("data: "):])
+            for line in response.text.splitlines() if line.startswith("data: ")
+        ]
+
+    def test_stream_error_sentinel_is_sanitized_and_not_persisted(
+        self, client, db, monkeypatch
+    ):
+        self._patch_orchestration(monkeypatch)
+
+        async def fake_stream(messages, enable_web_search=False):
+            yield "不应提交的半条回答"
+            yield "\n[调用 LLM 出错: private-stack-canary]"
+
+        from .conftest import TestingSessionLocal
+
+        monkeypatch.setattr("app.routers.chat.llm_service.chat_stream", fake_stream)
+        monkeypatch.setattr("app.database.SessionLocal", TestingSessionLocal)
+
+        response = client.post("/api/chat", json={"message": "失败问题"})
+        frames = self._frames(response)
+
+        assert frames[-1] == {
+            "error": "AI 服务暂时不可用，请稍后重试",
+            "error_code": "llm_generation_failed",
+            "conversation_id": 1,
+        }
+        assert not any(frame.get("finished") is True for frame in frames)
+        assert "private-stack-canary" not in response.text
+        db.expire_all()
+        assert db.query(Message).filter(Message.role == "assistant").count() == 0
+        conv = db.query(Conversation).one()
+        assert conv.message_count == db.query(Message).filter(
+            Message.conversation_id == conv.id
+        ).count() == 1
+
+    def test_empty_stream_is_failure_and_not_success(self, client, db, monkeypatch):
+        self._patch_orchestration(monkeypatch)
+
+        async def fake_stream(messages, enable_web_search=False):
+            if False:
+                yield ""
+
+        from .conftest import TestingSessionLocal
+
+        monkeypatch.setattr("app.routers.chat.llm_service.chat_stream", fake_stream)
+        monkeypatch.setattr("app.database.SessionLocal", TestingSessionLocal)
+
+        response = client.post("/api/chat", json={"message": "空结果"})
+        frames = self._frames(response)
+
+        assert frames[-1]["error_code"] == "empty_generation"
+        assert not any(frame.get("finished") is True for frame in frames)
+        assert db.query(Message).filter(Message.role == "assistant").count() == 0
+
+    def test_non_stream_error_sentinel_returns_sanitized_503(
+        self, client, db, monkeypatch
+    ):
+        self._patch_orchestration(monkeypatch)
+
+        async def fake_completion(messages):
+            return "[调用 LLM 出错: private-stack-canary]"
+
+        monkeypatch.setattr(
+            "app.routers.chat.llm_service.chat_completion", fake_completion
+        )
+
+        response = client.post(
+            "/api/chat", json={"message": "失败问题", "stream": False}
+        )
+
+        assert response.status_code == 503
+        assert response.json()["detail"] == "AI 服务暂时不可用，请稍后重试"
+        assert "private-stack-canary" not in response.text
+        db.expire_all()
+        assert db.query(Message).filter(Message.role == "assistant").count() == 0
+        conv = db.query(Conversation).one()
+        assert conv.message_count == db.query(Message).filter(
+            Message.conversation_id == conv.id
+        ).count() == 1
 
 
 class TestDeepReview:
