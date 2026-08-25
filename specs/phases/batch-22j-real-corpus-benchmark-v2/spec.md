@@ -16,7 +16,10 @@ factoid/实体检索改进提供未触碰的评价面。
 ## 3. 硬 Gate
 
 - 覆盖清单对每个 PDF 给出稳定身份、重复组和是否已被 v1 覆盖，无原文泄漏。
-- 新集合按论文 split，同一论文不能跨分区；问题类型数量在冻结前审计。
+- readiness 至少需要 12 篇已导入、未被 v1 覆盖的唯一论文；物理副本不得重复计数。
+- 新集合在编写 QA 前按论文冻结 split，同一论文不能跨分区；冻结文件以排他创建和
+  `0600` 权限写入私有目录，train/dev/holdout 数据文件相互独立。
 - 每条正例 evidence quote 在指定原页 100% 唯一解析；歧义、空证据或跨 split 立即失败。
 - 首次运行候选前，冻结 dataset/qrels/corpus/database/page/vector 指纹和一次性 ledger。
-- holdout 永久不由通用 CLI 直接打开，只允许经预注册 Gate 消费。
+- holdout 永久不由通用 CLI 直接打开，只允许经预注册 Gate 消费；消费凭据固定为
+  `{freeze_sha256}-holdout.claim.json`，必须先于读取 holdout 排他创建，运行崩溃也视为已消费。
