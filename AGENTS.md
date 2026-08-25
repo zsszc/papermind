@@ -54,11 +54,12 @@
         │  HTTP (/api, /static)   SSE 流式对话
         ▼
 FastAPI 后端 (:8000, 单 worker)
-  ├─ routers/   papers / search / chat / thesis / memory / export / settings / static
+  ├─ routers/   papers / search / chat / thesis / memory / export / readiness / settings / static
   ├─ services/  pdf_parser, docx_parser, embedding, retrieval, llm,
   │             skills, memory_manager, web_search, image_analyzer,
   │             auto_tag, backup, cache, processor,
-  │             agent_graph（LangGraph 对话编排）, mcp_server（MCP 工具）
+  │             agent_graph（LangGraph 对话编排）, mcp_server（MCP 工具）,
+  │             corpus_readiness（真实语料 v2 只读聚合核心）
   ├─ eval/      RAG 评测（dataset / metrics / run，详见「测试与评测」）
   ├─ /mcp       MCP Server（SSE 传输，FastMCP 子应用挂载）
   └─ SQLite (data/papers.db, WAL) + ChromaDB (vector_db/) + 本地文件
@@ -76,6 +77,7 @@ Kimi API (kimi-k2.6) —— 对话 / 概括 / 联网搜索 / 图片分析
 - **对话**（`routers/chat.py`）：`POST /api/chat` 为 SSE 流式。LLM 调用前的编排（记忆加载 → 向量检索 → 消息组装）由 `services/agent_graph.py` 的 LangGraph StateGraph 完成；流式生成与 SSE 事件格式（`{delta}` / `{finished, citations}` / `{error}`）由路由层保持。另有会话 CRUD、消息删除/重新生成、`/analyze-image`（多模态）、`/skills` 列表。
 - **MCP Server**（`services/mcp_server.py`）：挂载于 `/mcp`（SSE 握手 `/mcp/sse`），暴露 4 个只读工具 `search_papers` / `list_papers` / `get_paper` / `get_library_stats`，供任意 MCP 客户端连接使用。
 - **备份**（`services/backup.py`）：每日凌晨 3 点自动备份到 `backups/`，保留最近 10 份；也可经 `POST /api/export/backup` 手动触发。
+- **语料就绪度**（`services/corpus_readiness.py` + `routers/readiness.py`）：`GET /api/readiness/benchmark-v2` 实时只读审计当前 DB/PDF，并以严格白名单返回 PASS/WAIT/UNAVAILABLE 聚合状态；响应 `no-store`，异常时未知计数为 null。核心位于可打包的 `app`，`eval.benchmark_v2` 复用同一覆盖函数；Electron 包继续排除私有 `backend/eval`。
 
 ---
 
@@ -86,14 +88,14 @@ Kimi API (kimi-k2.6) —— 对话 / 概括 / 联网搜索 / 图片分析
 ├── backend/
 │   ├── app/
 │   │   ├── core/           # config.py（YAML 配置单例）、settings.py（环境变量覆盖/启动校验）、logger.py
-│   │   ├── routers/        # papers/search/chat/thesis/memory/export/settings/static
-│   │   ├── services/       # 见上文运行时架构（含 agent_graph、mcp_server）
+│   │   ├── routers/        # papers/search/chat/thesis/memory/export/readiness/settings/static
+│   │   ├── services/       # 见上文运行时架构（含 agent_graph、mcp_server、corpus_readiness）
 │   │   ├── database.py     # SQLAlchemy 引擎 + ensure_schema() 轻量迁移
 │   │   ├── models.py       # ORM 模型 + FTS5 虚拟表 DDL
 │   │   ├── schemas.py      # Pydantic 请求/响应模型
 │   │   └── main.py         # FastAPI 入口（lifespan、CORS、/mcp 挂载、/static 白名单）
 │   ├── eval/               # RAG 评测：公开 fixture、稳定/私人 QA、metrics.py、run.py
-│   ├── tests/              # pytest 套件（862 用例，内存 SQLite + TestClient）
+│   ├── tests/              # pytest 套件（871 用例，内存 SQLite + TestClient）
 │   ├── venv/               # Python 3.12 虚拟环境（会被 electron-builder 打包）
 │   ├── pyproject.toml      # 依赖声明 + pytest/ruff 配置
 │   └── requirements.txt    # 锁定依赖（与 pyproject 保持一致）
@@ -192,7 +194,7 @@ cd ../electron && npm run build    # 产物在 frontend/out/（dmg/zip/exe）
 
 ## 8. 测试与评测
 
-### 单元/集成测试（pytest，862 个用例）
+### 单元/集成测试（pytest，871 个用例）
 
 ```bash
 cd backend
@@ -209,7 +211,7 @@ cd ../electron && npm test       # node:test（health / wait / restart / kill �
 ```
 
 前端测试依赖包含 MSW，新增网络交互测试不得连接真实后端；Electron 生命周期与安全策略纯模块不得
-`require('electron')`，确保 CI 无 GUI 也能运行。当前后端 862 个测试、前端 39 个测试、Electron 26 个测试。
+`require('electron')`，确保 CI 无 GUI 也能运行。当前后端 871 个测试、前端 45 个测试、Electron 26 个测试。
 
 ### RAG 评测（backend/eval/）
 
@@ -238,6 +240,7 @@ env -u PYTHONPATH venv/bin/python -m eval.deterministic_vector_snapshot \
 - **Batch 22H 确定性 HNSW 候选未晋级**：隔离候选 train 独立双跑 24/24 top-5 完全一致，Recall/factoid/MRR/NDCG=`0.667/0.500/0.424/0.485`、P95=344/365ms；同一次问题遍历的 dev 基线/候选质量完全相同（`0.625/0.333/0.39375/0.45172`），候选 P95=244.6ms。因没有任何严格质量提升，按 Gate 未激活，生产 `vector_db/` 仍保持默认 HNSW。Chroma 0.4.24 打开默认 HNSW 会重写 `length.bin`，首次查询还可能重写 `data_level0.bin` 运行时区域；比较必须在 client 打开前冻结原始文件指纹，打开后以 ID/维度/embedding SHA/双层元数据/query smoke 判定语义完整性
 - **Batch 22I factoid 锚点候选未晋级**：新增查询数字/缩写/ASCII 单位锚点和等权第三路 BM25，每题只计算一次共享 semantic/BM25 并派生生产/候选排序。真实 train 基线与候选 Recall/factoid 均为 `0.667/0.500`，候选 MRR/NDCG 由 `0.424/0.485` 回退到 `0.399/0.465`，method_detail Recall 回退 1/6；P95=435.9ms。Gate 失败后未运行 dev/holdout，未调权重，生产默认未变。
 - **Batch 22J 盲化基准 readiness 未通过**：`papers/` 的 36 个物理 PDF 仅有 19 份唯一内容，17 个是重复副本；v1 已覆盖 18 份，只有 1 篇可进入 v2，低于预注册的 12 篇下限。已增加 PDF/UID 双重覆盖、论文 split 预冻结、证据唯一解析、固定路径一次性 claim 与通用 `eval.run` holdout 禁止；未生成 v2 QA、未运行盲化基线、未消费 holdout。
+- **Batch 22K 就绪度可观测性完成**：共享覆盖核心同时服务 CLI 与应用 API；统计页显示 PASS/WAIT/不可用三态并独立重试。真实核心/API 均为 WAIT，36 个物理 PDF、19 份唯一内容、17 个副本、v1 覆盖 18、合格 1、缺 11。API 严格排除路径/标题/DOI/UID/SHA，manifest 自哈希、幽灵论文、根/PDF 软链接和快照变化均 fail closed；本批未打开 QA/holdout，未调用 Kimi。
 - **Batch 21 邻域候选未晋级**：`hybrid-local-neighbor`（semantic top20、同论文 ±2、固定 rank-distance 衰减）dev 为 0.625/0.36389/0.43005，factoid 仍 0.333、P95=270.1ms；MRR/NDCG/factoid Gate 失败，生产默认保持 shared hybrid。候选仅供显式复现
 - **Batch 22 双语 v2 未进入 dev**：`bm25-bilingual-v2` 仅新增四条病理术语映射，train 质量与 v1 完全相同（0.66667/0.42361/0.48529，factoid=0.50），未达到至少新增 1 题的 Gate，因此按预案跳过 dev；生产继续使用 `bm25-bilingual`
 - **Batch 22B 消费者已收敛**：聊天、重新生成、深度综述、论文引用推荐和 eval 的 chunk RAG 都经共享 `RetrievalPipeline`；论文引用零证据时跳过 LLM，显式单篇论文范围禁止 graph 越界，论文发现页语义异常保留 FTS 结果
@@ -293,4 +296,4 @@ env -u PYTHONPATH venv/bin/python -m eval.deterministic_vector_snapshot \
 
 ---
 
-> 最后更新：2026-08-25，Batch 22J 真实语料 v2 readiness Gate 完成后同步。
+> 最后更新：2026-08-25，Batch 22K 真实语料就绪度可观测性完成后同步。
