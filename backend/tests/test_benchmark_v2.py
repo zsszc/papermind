@@ -37,8 +37,15 @@ def _item(qa_id: str, uid: str, *, split: str = "train") -> dict:
 
 
 def _manifest(documents: list[dict]) -> dict:
+    import hashlib
+    payload = json.dumps(
+        sorted(documents, key=lambda item: item.get("paper_uid") or ""),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
     return {
-        "manifest_sha256": "a" * 64,
+        "manifest_sha256": hashlib.sha256(payload).hexdigest(),
         "documents": documents,
     }
 

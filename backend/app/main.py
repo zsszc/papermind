@@ -12,7 +12,7 @@ from app.models import ensure_papers_fts
 from app.services.llm import llm_service
 from app.services.backup import auto_backup, cleanup_old_backups
 from app.services.data_integrity import audit_database
-from app.routers import papers, search, chat, thesis, memory, export, settings, static
+from app.routers import papers, search, chat, thesis, memory, export, readiness, settings, static
 from app.core.settings import apply_env_overrides, validate_startup_config
 from app.core.capability import CapabilityMiddleware
 
@@ -118,6 +118,7 @@ app.include_router(chat.router, prefix="/api/chat", tags=["chat"])
 app.include_router(thesis.router, prefix="/api/thesis", tags=["thesis"])
 app.include_router(memory.router, prefix="/api/memory", tags=["memory"])
 app.include_router(export.router, prefix="/api/export", tags=["export"])
+app.include_router(readiness.router, prefix="/api/readiness", tags=["readiness"])
 app.include_router(settings.router, prefix="/api/settings", tags=["settings"])
 
 # MCP Server：将文献库只读能力暴露为 MCP 工具（SSE 传输）。

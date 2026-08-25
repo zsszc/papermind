@@ -11,56 +11,19 @@ import re
 import time
 from typing import Any, Callable
 
+from app.services.corpus_readiness import (
+    _evidence_uids,
+    _sha_json,
+    _valid_sha,
+    audit_v2_coverage,
+    evaluate_v2_readiness,
+    public_coverage_summary,
+)
 from eval.private_benchmark import validate_private_dataset
 
 
 _SHA_RE = re.compile(r"[0-9a-f]{64}")
 _SPLITS = {"train", "dev", "holdout"}
-
-
-def _sha_json(value: Any) -> str:
-    payload = json.dumps(
-        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
-
-
-def _valid_sha(value: Any, name: str) -> str:
-    if not isinstance(value, str) or _SHA_RE.fullmatch(value) is None:
-        raise ValueError(f"缺少有效 SHA-256: {name}")
-    return value
-
-
-def _evidence_uids(items: list[dict[str, Any]]) -> set[str]:
-    return {
-        evidence["paper_uid"]
-        for item in items
-        for evidence in item.get("relevant_evidence", [])
-    }
-
-
-def _stable_sha256_file(path: Path) -> str:
-    """不跟随软链接且校验读取期间未变的流式 SHA-256。"""
-    path = Path(path)
-    if path.is_symlink():
-        raise ValueError("papers 目录不得包含 PDF 软链接")
-    before = path.stat()
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        opened = os.fstat(stream.fileno())
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-        after = os.fstat(stream.fileno())
-    current = path.stat()
-    before_identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-    opened_identity = (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
-    after_identity = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-    current_identity = (
-        current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns
-    )
-    if before_identity != opened_identity or after_identity != current_identity:
-        raise ValueError("PDF 在计算 SHA-256 期间发生变化")
-    return digest.hexdigest()
 
 
 def _exclusive_json(path: Path, value: dict[str, Any]) -> None:
@@ -71,133 +34,6 @@ def _exclusive_json(path: Path, value: dict[str, Any]) -> None:
     with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
         json.dump(value, handle, ensure_ascii=False, indent=2, sort_keys=True)
         handle.write("\n")
-
-
-def audit_v2_coverage(
-    papers_dir: Path,
-    corpus_manifest: dict[str, Any],
-    v1_items: list[dict[str, Any]],
-) -> dict[str, Any]:
-    """以 paper UID + PDF SHA 并集排除 v1，不输出文件名或原文。"""
-    papers_dir = Path(papers_dir).resolve()
-    if not papers_dir.is_dir():
-        raise ValueError("papers 目录不存在")
-    _valid_sha(corpus_manifest.get("manifest_sha256"), "corpus manifest")
-
-    documents = corpus_manifest.get("documents")
-    if not isinstance(documents, list):
-        raise ValueError("语料 manifest 缺少 documents")
-    uid_to_sha: dict[str, str] = {}
-    sha_to_uid: dict[str, str] = {}
-    normalized_documents: list[dict[str, str]] = []
-    for document in documents:
-        uid = document.get("paper_uid")
-        pdf_sha = _valid_sha(document.get("pdf_sha256"), "document.pdf_sha256")
-        if not isinstance(uid, str) or not uid:
-            raise ValueError("语料 manifest 缺少 paper_uid")
-        previous_sha = uid_to_sha.setdefault(uid, pdf_sha)
-        if previous_sha != pdf_sha:
-            raise ValueError("同一 paper_uid 对应多个 PDF SHA")
-        previous_uid = sha_to_uid.setdefault(pdf_sha, uid)
-        if previous_uid != uid:
-            raise ValueError("同一 PDF 内容 SHA 对应多个 paper_uid")
-        normalized_documents.append({"paper_uid": uid, "pdf_sha256": pdf_sha})
-
-    v1_uids = sorted(_evidence_uids(v1_items))
-    missing_v1 = sorted(set(v1_uids) - set(uid_to_sha))
-    if missing_v1:
-        raise ValueError(f"v1 paper_uid 在语料 manifest 未命中: {len(missing_v1)}")
-    v1_pdf_hashes = sorted({uid_to_sha[uid] for uid in v1_uids})
-    covered_hashes = set(v1_pdf_hashes)
-
-    pdf_entries = [
-        path for path in papers_dir.iterdir() if path.suffix.lower() == ".pdf"
-    ]
-    if any(path.is_symlink() for path in pdf_entries):
-        raise ValueError("papers 目录不得包含 PDF 软链接")
-    physical_paths = sorted(
-        (path for path in pdf_entries if path.is_file()), key=lambda path: path.name
-    )
-    physical: list[tuple[Path, str]] = [
-        (path, _stable_sha256_file(path)) for path in physical_paths
-    ]
-    physical_counts = Counter(digest for _path, digest in physical)
-    manifest_hashes = set(sha_to_uid)
-    files: list[dict[str, Any]] = []
-    for path, digest in physical:
-        copy_token = hashlib.sha256(
-            f"{digest}\0{path.name}".encode("utf-8")
-        ).hexdigest()
-        files.append({
-            "copy_token_sha256": copy_token,
-            "pdf_sha256": digest,
-            "duplicate_group_sha256": digest,
-            "physical_copy_count": physical_counts[digest],
-            "database_match_count": int(digest in manifest_hashes),
-            "covered_by_v1": digest in covered_hashes,
-        })
-
-    v1_uid_set = set(v1_uids)
-    eligible_documents = sorted(
-        (
-            document for document in normalized_documents
-            if document["paper_uid"] not in v1_uid_set
-            and document["pdf_sha256"] not in covered_hashes
-        ),
-        key=lambda row: row["paper_uid"],
-    )
-    audit: dict[str, Any] = {
-        "coverage_schema": "private-benchmark-v2-coverage-v1",
-        "corpus_manifest_sha256": corpus_manifest["manifest_sha256"],
-        "physical_pdf_files": len(physical),
-        "unique_pdf_contents": len(physical_counts),
-        "duplicate_pdf_files": len(physical) - len(physical_counts),
-        "covered_unique_contents": len(set(physical_counts) & covered_hashes),
-        "eligible_imported_papers": len(eligible_documents),
-        "unimported_unique_contents": len(set(physical_counts) - manifest_hashes),
-        "v1_paper_uids": v1_uids,
-        "v1_pdf_sha256s": v1_pdf_hashes,
-        "v1_paper_uids_sha256": _sha_json(v1_uids),
-        "v1_pdf_sha256s_sha256": _sha_json(v1_pdf_hashes),
-        "eligible_documents": eligible_documents,
-        "eligible_paper_uids_sha256": _sha_json(eligible_documents),
-        "files": files,
-    }
-    audit["coverage_manifest_sha256"] = _sha_json(audit)
-    return audit
-
-
-def public_coverage_summary(audit: dict[str, Any]) -> dict[str, Any]:
-    """返回可提交的去标识化覆盖摘要。"""
-    fields = (
-        "coverage_manifest_sha256", "corpus_manifest_sha256",
-        "physical_pdf_files", "unique_pdf_contents", "duplicate_pdf_files",
-        "covered_unique_contents", "eligible_imported_papers",
-        "unimported_unique_contents",
-    )
-    return {field: audit[field] for field in fields}
-
-
-def evaluate_v2_readiness(
-    audit: dict[str, Any], *, min_new_papers: int = 12
-) -> dict[str, Any]:
-    """只在有足够未覆盖且已导入的真实论文时允许进入 QA 阶段。"""
-    if audit.get("coverage_schema") != "private-benchmark-v2-coverage-v1":
-        raise ValueError("不是 Benchmark v2 覆盖制品")
-    _valid_sha(audit.get("coverage_manifest_sha256"), "coverage manifest")
-    actual = audit.get("eligible_imported_papers")
-    if not isinstance(actual, int) or isinstance(actual, bool):
-        raise ValueError("覆盖制品缺少候选论文数")
-    check = {
-        "actual": actual, "threshold": min_new_papers,
-        "operator": ">=", "passed": actual >= min_new_papers,
-    }
-    return {
-        "gate_version": "private-benchmark-v2-readiness-v1",
-        "passed": check["passed"],
-        "checks": {"new_unique_imported_papers": check},
-        "coverage_manifest_sha256": audit["coverage_manifest_sha256"],
-    }
 
 
 def validate_v2_dataset(

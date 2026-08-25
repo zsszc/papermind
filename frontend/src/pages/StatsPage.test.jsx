@@ -113,4 +113,15 @@ describe('StatsPage Benchmark v2 就绪度', () => {
     expect(screen.queryByText('/private/secret.pdf')).not.toBeInTheDocument()
     expect(screen.queryByText('秘密论文标题')).not.toBeInTheDocument()
   })
+
+  it('矛盾的 PASS 响应失败关闭，不由 UI 自行放行', async () => {
+    apiMocks.getBenchmarkV2Readiness.mockResolvedValue({
+      data: { ...waiting, status: 'PASS', ready: true },
+    })
+
+    render(<StatsPage />)
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('不可用，已按未就绪处理')
+    expect(screen.queryByText('可进入 QA 冻结流程')).not.toBeInTheDocument()
+  })
 })

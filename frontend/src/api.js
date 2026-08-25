@@ -36,6 +36,8 @@ export const importPapers = (files) => {
 
 export const listPapers = (params) => api.get('/papers', { params })
 export const getPaperStats = () => api.get('/papers/stats/overview')
+export const getBenchmarkV2Readiness = () =>
+  api.get('/readiness/benchmark-v2', { skipGlobalError: true })
 export const getPaper = (id) => api.get(`/papers/${id}`)
 export const updatePaper = (id, data) => api.put(`/papers/${id}`, data)
 export const deletePaper = (id) => api.delete(`/papers/${id}`)

@@ -1,6 +1,6 @@
 from datetime import datetime
-from typing import List, Optional, Dict, Any
-from pydantic import BaseModel, Field, field_validator
+from typing import List, Optional, Dict, Any, Literal
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, field_validator
 
 
 # ---------- Tag ----------
@@ -314,3 +314,21 @@ class CitationGraphResponse(BaseModel):
 
     nodes: List[CitationGraphNode] = []
     edges: List[CitationGraphEdge] = []
+
+
+class BenchmarkV2ReadinessResponse(BaseModel):
+    """只公开聚合计数的 Benchmark v2 就绪度响应。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["PASS", "WAIT", "UNAVAILABLE"]
+    ready: StrictBool
+    minimum_new_papers: Literal[12]
+    missing_new_papers: Optional[StrictInt] = Field(default=None, ge=0)
+    physical_pdf_files: Optional[StrictInt] = Field(default=None, ge=0)
+    unique_pdf_contents: Optional[StrictInt] = Field(default=None, ge=0)
+    duplicate_pdf_files: Optional[StrictInt] = Field(default=None, ge=0)
+    covered_unique_contents: Optional[StrictInt] = Field(default=None, ge=0)
+    eligible_imported_papers: Optional[StrictInt] = Field(default=None, ge=0)
+    unimported_unique_contents: Optional[StrictInt] = Field(default=None, ge=0)
+    error_code: Optional[Literal["benchmark_data_unavailable"]] = None
