@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from app.services.generation_guardrails import (
+    build_rag_prompt,
     verify_citations,
     verify_citations_detailed,
 )
@@ -200,8 +201,15 @@ def test_public_generation_report_is_content_free_and_gate_passes(tmp_path):
     assert report["overall"]["citation_precision"] == 1.0
     assert report["overall"]["negative_refusal_rate"] == 1.0
     assert report["offline_proof"]["forbidden_modules_loaded"] == []
+    assert len(report["message_contract_sha256"]) == 64
     forbidden_keys = {"answer", "retrieved_chunks", "messages", "prompt", "content", "path"}
     assert not any(forbidden_keys & set(case) for case in report["cases"])
     rendered = report_path.read_text(encoding="utf-8")
     assert "合成材料甲" not in rendered
     assert "文献库中没有相关内容" not in rendered
+
+
+def test_production_agent_reexports_the_shared_pure_message_builder():
+    from app.services import agent_graph
+
+    assert agent_graph.build_rag_prompt is build_rag_prompt

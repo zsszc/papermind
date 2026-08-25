@@ -36,7 +36,7 @@ from app.core.config import config
 from app.core.logger import logger
 from app.models import Chunk, Message, Paper
 from app.services.memory_manager import MemoryManager
-from app.services.generation_guardrails import verify_citations
+from app.services.generation_guardrails import build_rag_prompt, verify_citations
 from app.services.retrieval import get_vector_store
 from app.services.retrieval_pipeline import RetrievalPipeline
 from app.services.skills import build_skill_prompt
@@ -75,36 +75,6 @@ RETRIEVE_TOP_K = 5
 # retrieval.graph_expand_hops（默认 1 跳）
 GRAPH_EXPAND_MAX_CHUNKS_PER_PAPER = 2
 GRAPH_EXPAND_RRF_K = 60
-
-def build_rag_prompt(query: str, retrieved: List[dict]) -> str:
-    """把检索片段拼装为带引用编号的 RAG system prompt（与原 chat.py 实现一致）。"""
-    context_parts = []
-    for i, item in enumerate(retrieved, start=1):
-        title = item.get("title") or "未知文献"
-        authors = item.get("authors") or ""
-        year = item.get("year") or ""
-        page = item.get("page_number")
-        content = item.get("content", "")
-        header = f"[{i}] {title}"
-        if authors:
-            header += f" - {authors}"
-        if year:
-            header += f" ({year})"
-        if page:
-            header += f" 第{page}页"
-        context_parts.append(f"{header}\n{content}\n")
-
-    context = "\n---\n".join(context_parts)
-    return f"""以下是可能相关的文献片段（每个片段开头 [i] 为引用编号，请在回答中需要引用时标注 [^i^]）：
-
-{context}
-
----
-
-用户问题：{query}
-
-请基于以上片段回答，并在需要时标注引用来源 [^i^]。回答末尾请列出引用文献的标题与页码。"""
-
 
 class AgentState(TypedDict, total=False):
     """Agent 编排图状态。

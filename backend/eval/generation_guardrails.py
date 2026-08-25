@@ -10,7 +10,11 @@ from pathlib import Path
 from statistics import mean
 from typing import Any, Dict, Iterable, List
 
-from app.services.generation_guardrails import context_chunk_id, verify_citations_detailed
+from app.services.generation_guardrails import (
+    build_rag_prompt,
+    context_chunk_id,
+    verify_citations_detailed,
+)
 from eval.metrics import contains_refusal
 
 
@@ -172,6 +176,8 @@ def _validate_public_fixture(fixture: Dict[str, Any]) -> List[Dict[str, Any]]:
     cases = fixture.get("cases")
     if not isinstance(cases, list) or not cases:
         raise ValueError("公开生成 fixture cases 不得为空")
+    if any(not isinstance(case.get("question"), str) for case in cases):
+        raise ValueError("公开生成 fixture 每条 case 必须有 question")
     return cases
 
 
@@ -194,6 +200,10 @@ def run_public_generation_gate(
     cases = _validate_public_fixture(fixture)
     evaluation = evaluate_generation_cases(cases)
     gate = build_generation_guardrail_gate(evaluation)
+    message_contract = [
+        build_rag_prompt(case["question"], case.get("retrieved_chunks") or [])
+        for case in cases
+    ]
     forbidden_loaded = sorted(forbidden_modules_loaded or [])
     counters = audit_counters or {}
     report = {
@@ -204,6 +214,9 @@ def run_public_generation_gate(
         "fixture_sha256": _sha256(fixture_bytes),
         "guardrail_contract_sha256": _sha256(
             json.dumps(_GUARDRAIL_CONTRACT, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ),
+        "message_contract_sha256": _sha256(
+            json.dumps(message_contract, ensure_ascii=False).encode("utf-8")
         ),
         "overall": evaluation["overall"],
         "cases": evaluation["cases"],

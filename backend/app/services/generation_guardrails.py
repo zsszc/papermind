@@ -131,3 +131,33 @@ def select_cited_chunks(
         if (chunk_id := context_chunk_id(chunk)) is not None
     }
     return [by_id[chunk_id] for chunk_id in cited_ids if chunk_id in by_id]
+
+
+def build_rag_prompt(query: str, retrieved: List[Dict[str, Any]]) -> str:
+    """构建生产 RAG system prompt；保持纯函数，供 Agent 与离线契约共用。"""
+    context_parts = []
+    for index, item in enumerate(retrieved or [], start=1):
+        title = item.get("title") or "未知文献"
+        authors = item.get("authors") or ""
+        year = item.get("year") or ""
+        page = item.get("page_number")
+        content = item.get("content", "")
+        header = f"[{index}] {title}"
+        if authors:
+            header += f" - {authors}"
+        if year:
+            header += f" ({year})"
+        if page:
+            header += f" 第{page}页"
+        context_parts.append(f"{header}\n{content}\n")
+
+    context = "\n---\n".join(context_parts)
+    return f"""以下是可能相关的文献片段（每个片段开头 [i] 为引用编号，请在回答中需要引用时标注 [^i^]）：
+
+{context}
+
+---
+
+用户问题：{query}
+
+请基于以上片段回答，并在需要时标注引用来源 [^i^]。回答末尾请列出引用文献的标题与页码。"""

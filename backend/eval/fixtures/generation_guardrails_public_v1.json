@@ -7,6 +7,7 @@
   "cases": [
     {
       "case_id": "positive-single",
+      "question": "合成材料甲的指标是多少？",
       "has_answer": true,
       "retrieved_chunks": [
         {"chunk_id": "p101_c0", "source": "p101_c0", "paper_id": 101, "content": "合成材料甲的指标为四。"}
@@ -16,6 +17,7 @@
     },
     {
       "case_id": "positive-second-ordinal",
+      "question": "合成流程有几个阶段？",
       "has_answer": true,
       "retrieved_chunks": [
         {"chunk_id": "p102_c0", "source": "p102_c0", "paper_id": 102, "content": "合成干扰片段。"},
@@ -26,6 +28,7 @@
     },
     {
       "case_id": "positive-multi-evidence",
+      "question": "合成方法和限制分别是什么？",
       "has_answer": true,
       "retrieved_chunks": [
         {"chunk_id": "p104_c0", "source": "p104_c0", "paper_id": 104, "content": "合成材料丙给出方法。"},
@@ -36,6 +39,7 @@
     },
     {
       "case_id": "positive-reordered",
+      "question": "合成材料己的结论是什么？",
       "has_answer": true,
       "retrieved_chunks": [
         {"chunk_id": "p106_c0", "source": "p106_c0", "paper_id": 106, "content": "合成材料戊为非相关项。"},
@@ -46,6 +50,7 @@
     },
     {
       "case_id": "negative-empty",
+      "question": "合成库中不存在的事实是什么？",
       "has_answer": false,
       "retrieved_chunks": [],
       "relevant_chunk_ids": [],
@@ -53,6 +58,7 @@
     },
     {
       "case_id": "negative-unanswerable",
+      "question": "请回答没有任何合成证据支持的结论。",
       "has_answer": false,
       "retrieved_chunks": [],
       "relevant_chunk_ids": [],
