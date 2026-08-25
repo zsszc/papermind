@@ -2,7 +2,7 @@ import asyncio
 import importlib
 import json
 from dataclasses import asdict, is_dataclass
-from typing import AsyncIterator, List, Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
@@ -13,7 +13,7 @@ from app.models import Conversation, MemorySummary, Message, Paper
 from app.schemas import ChatRequest, ConversationResponse, DeepReviewRequest, ImageAnalysisRequest
 from app.core.config import config
 from app.core.logger import logger
-from app.services.llm import llm_service
+from app.services.llm import LLMGenerationError, is_llm_error_response, llm_service
 from app.services.retrieval import get_vector_store
 from app.services.retrieval_pipeline import RetrievalPipeline
 from app.services.memory_manager import MemoryManager
@@ -32,12 +32,7 @@ from app.services.agent_graph import (
 )
 
 router = APIRouter()
-
-
-async def _stream_response(messages: List[dict]) -> AsyncIterator[str]:
-    async for delta in llm_service.chat_stream(messages):
-        yield f"data: {json.dumps({'delta': delta, 'finished': False}, ensure_ascii=False)}\n\n"
-    yield f"data: {json.dumps({'delta': '', 'finished': True}, ensure_ascii=False)}\n\n"
+_GENERATION_ERROR_MESSAGE = "AI 服务暂时不可用，请稍后重试"
 
 
 # ---------- Phase F F2：深度综述长任务（SSE 帧与 Guardrails 复用 /api/chat 模式） ----------
@@ -47,6 +42,15 @@ _REVIEW_DELTA_CHUNK_SIZE = 512  # 综述全文回放分块大小（字符）：�
 def _sse_frame(payload: dict) -> str:
     """SSE 帧：data: <json>\\n\\n（与 /api/chat 相同帧格式，ensure_ascii=False）。"""
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _generation_error_frame(conversation_id: int, error_code: str) -> str:
+    """生成失败的唯一公开终态；禁止携带上游异常正文。"""
+    return _sse_frame({
+        "error": _GENERATION_ERROR_MESSAGE,
+        "error_code": error_code,
+        "conversation_id": conversation_id,
+    })
 
 
 def _field(obj, key, default=None):
@@ -238,7 +242,7 @@ async def regenerate_message(
             ),
         )
     except Exception as e:
-        logger.error(f"[regenerate] 检索失败: {e}")
+        logger.error("[regenerate] 检索失败: %s", type(e).__name__)
 
     memory_mgr = MemoryManager(db)
     memory_context = memory_mgr.build_memory_context()
@@ -260,6 +264,11 @@ async def regenerate_message(
         try:
             # regenerate 无请求体、不含联网开关，固定关闭（确定性重生成，见 specs/backend/routers/chat.md 3.6）
             async for delta in llm_service.chat_stream(messages, enable_web_search=False):
+                if is_llm_error_response(delta):
+                    yield _generation_error_frame(
+                        conversation_id, "llm_generation_failed"
+                    )
+                    return
                 full_content += delta
                 yield f"data: {json.dumps({'delta': delta, 'finished': False, 'conversation_id': conversation_id}, ensure_ascii=False)}\n\n"
                 # 让出控制权，使客户端断开后能触发 CancelledError
@@ -267,27 +276,59 @@ async def regenerate_message(
         except asyncio.CancelledError:
             logger.info(f"[regenerate] conversation {conversation_id} message {message_id} cancelled")
             return
-
-        cleaned_content, detailed_report, cited_ids = verify_citations_detailed(
-            full_content, retrieved
-        )
-        verification = _compat_verification(detailed_report)
-        cited_chunks = select_cited_chunks(retrieved, cited_ids)
-
-        # 保存替换后的内容
-        from app.database import SessionLocal
-        with SessionLocal() as new_db:
-            msg = (
-                new_db.query(Message)
-                .filter(Message.id == message_id, Message.conversation_id == conversation_id)
-                .first()
+        except Exception as e:
+            logger.error(
+                "[regenerate] 生成失败 conversation=%s message=%s type=%s",
+                conversation_id,
+                message_id,
+                type(e).__name__,
             )
-            if msg:
+            yield _generation_error_frame(conversation_id, "llm_generation_failed")
+            return
+
+        try:
+            if not full_content.strip():
+                yield _generation_error_frame(conversation_id, "empty_generation")
+                return
+            cleaned_content, detailed_report, cited_ids = verify_citations_detailed(
+                full_content, retrieved
+            )
+            if not cleaned_content.strip():
+                yield _generation_error_frame(conversation_id, "empty_generation")
+                return
+            verification = _compat_verification(detailed_report)
+            cited_chunks = select_cited_chunks(retrieved, cited_ids)
+            finish_frame = _sse_frame({
+                "delta": "",
+                "finished": True,
+                "conversation_id": conversation_id,
+                "content": cleaned_content,
+                "citations": cited_chunks,
+                "verification": verification,
+            })
+
+            # 正文与引用同一事务替换；目标并发消失时不得假成功。
+            from app.database import SessionLocal
+            with SessionLocal() as new_db:
+                msg = (
+                    new_db.query(Message)
+                    .filter(Message.id == message_id, Message.conversation_id == conversation_id)
+                    .first()
+                )
+                if not msg:
+                    raise RuntimeError("regenerate_target_missing")
                 msg.content = cleaned_content
                 msg.citations = _stored_citations(cited_chunks, verification)
                 new_db.commit()
-
-        yield f"data: {json.dumps({'delta': '', 'finished': True, 'conversation_id': conversation_id, 'content': cleaned_content, 'citations': cited_chunks, 'verification': verification}, ensure_ascii=False)}\n\n"
+            yield finish_frame
+        except Exception as e:
+            logger.error(
+                "[regenerate] 终态提交失败 conversation=%s message=%s type=%s",
+                conversation_id,
+                message_id,
+                type(e).__name__,
+            )
+            yield _generation_error_frame(conversation_id, "finalization_failed")
 
     return StreamingResponse(
         event_stream(),
@@ -337,7 +378,11 @@ async def analyze_image(
 
 @router.post("")
 async def chat(request: ChatRequest, db: Session = Depends(get_db)):
-    logger.info(f"[chat] 收到请求: conversation_id={request.conversation_id}, message={request.message[:50]}")
+    logger.info(
+        "[chat] 收到请求: conversation_id=%s message_chars=%d",
+        request.conversation_id,
+        len(request.message),
+    )
     # 处理会话
     if request.conversation_id:
         conv = db.query(Conversation).filter(Conversation.id == request.conversation_id).first()
@@ -363,7 +408,7 @@ async def chat(request: ChatRequest, db: Session = Depends(get_db)):
     try:
         await memory_mgr.update_short_term_memory(conv.id)
     except Exception as e:
-        logger.error(f"[chat] 记忆更新失败: {e}")
+        logger.error("[chat] 记忆更新失败: %s", type(e).__name__)
 
     # LangGraph 前置编排：load_memory → retrieve → build_messages
     # 产出 messages / 检索片段（引用）/ 联网开关，流式生成与 SSE 发送逻辑维持不变
@@ -379,30 +424,48 @@ async def chat(request: ChatRequest, db: Session = Depends(get_db)):
     retrieved = state["context_chunks"]
     enable_web_search = state["web_search_enabled"]
 
-    conv.message_count = state["history_total"] + 1
+    # 这里只提交已经存在的 user；assistant 成功落库时再在同一事务更新计数。
+    conv.message_count = state["history_total"]
     db.commit()
 
     if request.stream is False:
-        raw_content = await llm_service.chat_completion(messages)
-        content, detailed_report, cited_ids = verify_citations_detailed(
-            raw_content, retrieved
-        )
-        verification = _compat_verification(detailed_report)
-        cited_chunks = select_cited_chunks(retrieved, cited_ids)
-        assistant_msg = Message(
-            conversation_id=conv.id,
-            role="assistant",
-            content=content,
-            citations=_stored_citations(cited_chunks, verification),
-        )
-        db.add(assistant_msg)
-        db.commit()
-        return {
-            "conversation_id": conv.id,
-            "content": content,
-            "citations": cited_chunks,
-            "verification": verification,
-        }
+        try:
+            raw_content = await llm_service.chat_completion(messages)
+            if is_llm_error_response(raw_content) or not raw_content.strip():
+                raise LLMGenerationError("empty_or_failed_completion")
+            content, detailed_report, cited_ids = verify_citations_detailed(
+                raw_content, retrieved
+            )
+            if not content.strip():
+                raise LLMGenerationError("empty_final_content")
+            verification = _compat_verification(detailed_report)
+            cited_chunks = select_cited_chunks(retrieved, cited_ids)
+            assistant_msg = Message(
+                conversation_id=conv.id,
+                role="assistant",
+                content=content,
+                citations=_stored_citations(cited_chunks, verification),
+            )
+            db.add(assistant_msg)
+            db.flush()
+            conv.message_count = db.query(Message).filter(
+                Message.conversation_id == conv.id
+            ).count()
+            db.commit()
+            return {
+                "conversation_id": conv.id,
+                "content": content,
+                "citations": cited_chunks,
+                "verification": verification,
+            }
+        except Exception as e:
+            db.rollback()
+            logger.error(
+                "[chat] 非流式生成失败 conversation=%s type=%s",
+                conv.id,
+                type(e).__name__,
+            )
+            raise HTTPException(status_code=503, detail=_GENERATION_ERROR_MESSAGE)
 
     conv_id = conv.id
     async def event_stream():
@@ -412,6 +475,9 @@ async def chat(request: ChatRequest, db: Session = Depends(get_db)):
         cited_chunks = []
         try:
             async for delta in llm_service.chat_stream(messages, enable_web_search=enable_web_search):
+                if is_llm_error_response(delta):
+                    yield _generation_error_frame(conv_id, "llm_generation_failed")
+                    return
                 full_content += delta
                 yield f"data: {json.dumps({'delta': delta, 'finished': False, 'conversation_id': conv_id}, ensure_ascii=False)}\n\n"
                 # 让出控制权，使客户端断开后能触发 CancelledError
@@ -419,18 +485,46 @@ async def chat(request: ChatRequest, db: Session = Depends(get_db)):
         except asyncio.CancelledError:
             logger.info(f"[chat] conversation {conv_id} streaming cancelled")
             return
+        except Exception as e:
+            logger.error(
+                "[chat] 流式生成失败 conversation=%s type=%s",
+                conv_id,
+                type(e).__name__,
+            )
+            yield _generation_error_frame(conv_id, "llm_generation_failed")
+            return
+
+        if not full_content.strip():
+            yield _generation_error_frame(conv_id, "empty_generation")
+            return
 
         # 保存助手回复（使用新的 Session，避免原 Session 已关闭）
-        if full_content.strip():
+        try:
             # Phase C C1：落库前校验引用忠实度——剔除越界 [^n^] 标记，
             # citations 附 verified / removed（不阻塞返回，先观测）
             cleaned_content, detailed_report, cited_ids = verify_citations_detailed(
                 full_content, retrieved
             )
+            if not cleaned_content.strip():
+                yield _generation_error_frame(conv_id, "empty_generation")
+                return
             verification = _compat_verification(detailed_report)
             cited_chunks = select_cited_chunks(retrieved, cited_ids)
+            finish_frame = _sse_frame({
+                "delta": "",
+                "finished": True,
+                "conversation_id": conv_id,
+                "content": cleaned_content,
+                "citations": cited_chunks,
+                "verification": verification,
+            })
             from app.database import SessionLocal
             with SessionLocal() as new_db:
+                conv_row = new_db.query(Conversation).filter(
+                    Conversation.id == conv_id
+                ).first()
+                if not conv_row:
+                    raise RuntimeError("conversation_missing")
                 assistant_msg = Message(
                     conversation_id=conv_id,
                     role="assistant",
@@ -438,9 +532,19 @@ async def chat(request: ChatRequest, db: Session = Depends(get_db)):
                     citations=_stored_citations(cited_chunks, verification),
                 )
                 new_db.add(assistant_msg)
+                new_db.flush()
+                conv_row.message_count = new_db.query(Message).filter(
+                    Message.conversation_id == conv_id
+                ).count()
                 new_db.commit()
-
-        yield f"data: {json.dumps({'delta': '', 'finished': True, 'conversation_id': conv_id, 'content': cleaned_content, 'citations': cited_chunks, 'verification': verification}, ensure_ascii=False)}\n\n"
+            yield finish_frame
+        except Exception as e:
+            logger.error(
+                "[chat] 终态提交失败 conversation=%s type=%s",
+                conv_id,
+                type(e).__name__,
+            )
+            yield _generation_error_frame(conv_id, "finalization_failed")
 
     return StreamingResponse(
         event_stream(),
@@ -462,7 +566,11 @@ async def deep_review(request: DeepReviewRequest, db: Session = Depends(get_db))
     服务层 services/deep_review.py（F1）按契约调用：plan(topic) /
     execute(sub_question, db=...) / synthesize(topic, sub_answers)。
     """
-    logger.info(f"[deep-review] 收到请求: conversation_id={request.conversation_id}, topic={request.topic[:50]}")
+    logger.info(
+        "[deep-review] 收到请求: conversation_id=%s topic_chars=%d",
+        request.conversation_id,
+        len(request.topic),
+    )
     if request.conversation_id:
         conv = db.query(Conversation).filter(Conversation.id == request.conversation_id).first()
         if not conv:
@@ -485,7 +593,7 @@ async def deep_review(request: DeepReviewRequest, db: Session = Depends(get_db))
             try:
                 questions = await svc.plan(request.topic)
             except Exception as e:
-                logger.error(f"[deep-review] 规划失败: {e}")
+                logger.error("[deep-review] 规划失败: %s", type(e).__name__)
                 yield _sse_frame({"error": "深度综述规划失败，请稍后重试"})
                 return
             yield _sse_frame({
@@ -502,7 +610,10 @@ async def deep_review(request: DeepReviewRequest, db: Session = Depends(get_db))
                 try:
                     sub_answers.append(await svc.execute(q, db=db))
                 except Exception as e:
-                    logger.error(f"[deep-review] 子问题执行失败，降级处理: {e}")
+                    logger.error(
+                        "[deep-review] 子问题执行失败，降级处理: %s",
+                        type(e).__name__,
+                    )
                     sub_answers.append({
                         "question": _jsonable(q),
                         "answer": "该子问题检索不足",
@@ -513,7 +624,7 @@ async def deep_review(request: DeepReviewRequest, db: Session = Depends(get_db))
             try:
                 review = await svc.synthesize(request.topic, sub_answers)
             except Exception as e:
-                logger.error(f"[deep-review] 汇总失败: {e}")
+                logger.error("[deep-review] 汇总失败: %s", type(e).__name__)
                 yield _sse_frame({"error": "深度综述汇总失败，请稍后重试"})
                 return
 
@@ -587,7 +698,7 @@ async def deep_review(request: DeepReviewRequest, db: Session = Depends(get_db))
             return
         except Exception as e:
             # 兜底：任何未预期异常以带内错误帧收尾（脱敏，详情仅入日志，宪法第 13 条）
-            logger.error(f"[deep-review] 未预期异常: {e}")
+            logger.error("[deep-review] 未预期异常: %s", type(e).__name__)
             yield _sse_frame({"error": "深度综述任务失败，请稍后重试"})
             return
 

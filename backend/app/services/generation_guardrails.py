@@ -48,7 +48,6 @@ def verify_citations_detailed(
     }
     seen: set[str] = set()
     cited_ids: List[str] = []
-    removed_tokens: List[str] = []
     counters = {
         "total": 0,
         "valid": 0,
@@ -62,22 +61,18 @@ def verify_citations_detailed(
         counters["total"] += 1
         if match.group(2) is not None:
             counters["malformed"] += 1
-            removed_tokens.append(match.group(2))
             return ""
         raw_index = match.group(1)
         if not _INTEGER_PATTERN.fullmatch(raw_index):
             counters["malformed"] += 1
-            removed_tokens.append(raw_index)
             return ""
         ordinal = int(raw_index)
         if ordinal < 1 or ordinal > len(chunk_ids):
             counters["out_of_range"] += 1
-            removed_tokens.append(raw_index)
             return ""
         chunk_id = chunk_ids[ordinal - 1]
         if chunk_id is None or chunk_id in ambiguous_ids:
             counters["malformed"] += 1
-            removed_tokens.append(raw_index)
             return ""
         counters["valid"] += 1
         if chunk_id in seen:
@@ -102,8 +97,7 @@ def verify_citations_detailed(
     }
     if removed:
         logger.warning(
-            "[guardrails] 已剔除非法引用 tokens=%s：out_of_range=%d malformed=%d retrieved=%d",
-            removed_tokens,
+            "[guardrails] 已剔除非法引用：out_of_range=%d malformed=%d retrieved=%d",
             report["out_of_range"],
             report["malformed"],
             len(chunk_ids),

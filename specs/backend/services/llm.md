@@ -90,11 +90,10 @@
 ### 3.5 `LLMService.chat_stream(self, messages: List[Dict[str, str]], enable_web_search: bool = False) -> AsyncIterator[str]`
 
 - **输入**：消息列表（进入后先经 `_truncate_messages`）；`enable_web_search=True` 时注入 Kimi 内置联网工具
-- **输出**：异步迭代器，逐个 yield 模型输出的**文本增量**（空增量被过滤）；正常结束自然耗尽；失败时 yield 一个带内错误串（见下）
+- **输出**：异步迭代器，逐个 yield 模型输出的**文本增量**（空增量被过滤）；正常结束自然耗尽；失败抛 `LLMGenerationError`
 - **请求参数**：`model`、`max_tokens`、`temperature=_get_temperature()`、`stream=True`、`timeout=180`；`enable_web_search=True` 时附加 `tools=[{"type": "builtin_function", "function": {"name": "web_search"}}]` 与 `tool_choice="auto"`
 - **重试**：最多 3 次尝试，可重试异常集合与 3.4 相同，退避 `min(1.0 * 2 ** attempt, 10.0)`（1s → 2s → 放弃）；**非预期异常不重试**，立即 yield `\n[调用 LLM 出错: {格式化文案}]` 并结束迭代
-- **失败契约（重要）**：本方法**不向调用方抛异常**表达失败；重试耗尽或非预期异常时，把 `f"\n[调用 LLM 出错: {self._format_error(e)}]"` 作为**普通文本增量** yield 出去。上游若把增量原样拼接入库，该错误串会成为助手回复内容的一部分
-- **已知边界**：若异常发生在**已开始产出增量之后**（流中途断开），已 yield 的内容不会回收，重试将从头重新生成，调用方会看到重复前缀
+- **失败契约**：首个正文 token 前的可重试异常最多尝试 3 次；一旦已输出 token，任何异常立即抛 `LLMGenerationError`，禁止从头重试拼接；非预期异常同样类型化抛出，永不 yield 错误正文
 - **副作用**：网络调用、`asyncio.sleep` 退避、`[LLM]` 日志
 
 ### 3.6 SSE 对线协议（与 `routers/chat.py` 拼接后的完整契约）
@@ -105,9 +104,9 @@
 |------|------------------------------------------|--------|
 | 增量 | `{"delta": "<文本>", "finished": false, "conversation_id": N}` | chat.py 逐增量包装 |
 | 完成 | `{"delta": "", "finished": true, "conversation_id": N, "citations": [...]}` | chat.py 流结束后发一帧 |
-| 错误 | `{"error": "<文案>"}` | **前端 ChatPanel 解析层兼容此帧，但当前后端路由从不产生它** |
+| 错误 | `{"error":"AI 服务暂时不可用，请稍后重试","error_code":"...","conversation_id":N}` | chat 路由 |
 
-- 当前后端的 LLM 错误**不走 `{error}` 帧**，而是以 3.5 的带内错误串作为普通 `delta` 送达，随后照常发 `{finished: true}` 帧；前端因此把它当作正常回复文本渲染（并落库）
+- chat 路由仍兼容识别测试替身或旧实现返回的带内错误串，但会在发送前转为脱敏 error 终态且不落库
 - 响应头固定 `Cache-Control: no-cache`、`Connection: keep-alive`、`X-Accel-Buffering: no`
 - 客户端中断：路由层每增量后 `await asyncio.sleep(0)` 让出控制权，依赖 `asyncio.CancelledError` 终止生成；`llm.py` 自身不感知取消
 
@@ -132,7 +131,7 @@
 
 ### 3.10 `LLMService._format_error(self, e: Exception) -> str`
 
-按以下顺序对 `str(e)` 做子串匹配，首个命中即返回对应**固定中文文案**；全部未命中返回异常原文：
+按以下顺序对 `str(e)` 做子串匹配，首个命中即返回对应**固定中文文案**；全部未命中返回通用脱敏文案：
 
 | 匹配条件（按序） | 返回文案 |
 |------------------|----------|
@@ -140,9 +139,9 @@
 | 含 `"429"`，或 lower 后含 `"overloaded"` | `Kimi API 当前负载过高或请求频繁，请稍后再试。` |
 | 含 `"401"` 或含 `"Authentication"`（区分大小写） | `API Key 无效或已过期，请检查 config.yaml 中的 llm.api_key。` |
 | lower 后含 `"timeout"` 或 `"timed out"` | `Kimi API 响应超时，请稍后重试。` |
-| 其他 | `str(e)` 原文 |
+| 其他 | `Kimi API 调用失败，请稍后重试。` |
 
-- **未覆盖面**：余额不足 / 额度耗尽类错误（如含 `insufficient`、`balance`、`quota` 等关键词）**没有专属文案**，会走兜底分支把英文异常原文透出给用户
+- **隐私约束**：未知异常原文只用于进程内分类，不写入公开响应；错误日志只记录异常类型
 - **注意**：子串匹配可能误伤（如正常文本中恰好含 "timeout" 的其他错误），属可接受的启发式
 
 ### 3.11 `LLMService.is_configured(self) -> bool`
@@ -168,10 +167,10 @@
 | content 为 `None` 的消息 | 按空串计量（`or ""`），不崩溃 |
 | 消息总量略超预算 | 仅超长（>300 字符）的非 system 消息被均摊截尾，短消息原样保留 |
 | 均摊截断后仍超预算 | 非 system 消息砍到只剩最近 2 条；system 消息永不截断，总量仍可能超预算 |
-| API 返回 429 / engine_overloaded | 可重试异常：流式与非流式均退避重试至多 3 次；最终失败返回「负载过高」文案错误串 |
+| API 返回 429 / engine_overloaded | 首 token 前可退避重试至多 3 次；流式最终失败抛类型化异常，非流式兼容入口返回固定错误串 |
 | API Key 无效（401） | SDK 抛 `AuthenticationError`（`APIError` 子类），会被当作可重试异常**重试 3 次后才失败**——已知行为，重试无意义但不影响正确性 |
-| 余额/额度不足 | 无专属文案，异常英文原文经错误串透出（见 3.10） |
-| 流中途断连（已产出部分增量） | 重试从头生成，调用方看到重复前缀（见 3.5） |
+| 余额/额度不足 | 返回专属固定中文文案，不透出异常原文 |
+| 流中途断连（已产出部分增量） | 立即抛 `LLMGenerationError`，路由丢弃 provisional 且不落库 |
 | 客户端主动断开 SSE | 由路由层 `asyncio.sleep(0)` + `CancelledError` 处理；llm.py 不感知 |
 | `json_mode=True` 但模型返回非法 JSON | 本模块不管解析；调用方（如 `eval/generate_qa.py`）自行捕获并视 `[调用 LLM 出错:` 前缀为失败重试 |
 | 配置运行期被修改 | 已构造的 client 不更新（3.0），需重启进程；`is_configured()` 例外，实时读配置 |
@@ -193,8 +192,8 @@
 - [ ] AC2：消息总量未超 `max_total_chars` 时 `_truncate_messages` 原样返回（含顺序）；超预算时 system 消息全部保留且不被截断，超长非 system 消息保留尾部且每条不少于 300 字符
 - [ ] AC3：均摊截断仍超预算时，非 system 消息仅保留最近 2 条，返回列表以全部 system 消息开头
 - [ ] AC4：对可重试异常（`APIError` / 超时类），`chat_completion` 恰好尝试 3 次且按 1s/2s 退避后返回 `[调用 LLM 出错: ...]` 串；对非预期异常只尝试 1 次即返回错误串，均**不抛异常**
-- [ ] AC5：`chat_stream` 正常路径 yield 全部非空增量；重试耗尽后最后一次 yield 的内容以 `\n[调用 LLM 出错:` 开头
-- [ ] AC6：429/overloaded、401/Authentication、timeout 三类异常分别映射到 3.10 的三条固定中文文案；其他异常返回原文
+- [x] AC5：`chat_stream` 正常路径 yield 全部非空增量；失败抛类型化异常且永不 yield 错误正文；首 token 后禁止重试
+- [x] AC6：429/overloaded、401/Authentication、timeout 三类异常映射固定文案；未知异常返回通用脱敏文案
 - [ ] AC7：`is_configured` 对空 Key、`sk-xxxx` / `your-` 前缀、长度 < 20 的 Key 返回 `False`，其余返回 `True`
 - [ ] AC8：`health_check` 在未配置时短路返回 `{"ok": False, ...}` 且不发网络请求；成功路径返回 `{"ok": True, "model": ...}`
 - [ ] AC9：`enable_web_search=True` 时请求携带 `builtin_function web_search` 工具与 `tool_choice="auto"`

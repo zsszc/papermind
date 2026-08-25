@@ -403,6 +403,30 @@ class TestGenerationFailureTransactions:
         assert not any(frame.get("finished") is True for frame in frames)
         assert db.query(Message).filter(Message.role == "assistant").count() == 0
 
+    def test_stream_exception_after_delta_has_one_error_terminal(
+        self, client, db, monkeypatch
+    ):
+        """真实严格流会抛异常：半条 delta 后只许 error，异常正文不得泄漏。"""
+        self._patch_orchestration(monkeypatch)
+
+        async def fake_stream(messages, enable_web_search=False):
+            yield "不应落库的 provisional"
+            raise RuntimeError("raised-private-canary")
+
+        from .conftest import TestingSessionLocal
+
+        monkeypatch.setattr("app.routers.chat.llm_service.chat_stream", fake_stream)
+        monkeypatch.setattr("app.database.SessionLocal", TestingSessionLocal)
+
+        response = client.post("/api/chat", json={"message": "中途失败"})
+        frames = self._frames(response)
+
+        assert sum("error" in frame for frame in frames) == 1
+        assert frames[-1]["error_code"] == "llm_generation_failed"
+        assert not any(frame.get("finished") is True for frame in frames)
+        assert "raised-private-canary" not in response.text
+        assert db.query(Message).filter(Message.role == "assistant").count() == 0
+
     def test_non_stream_error_sentinel_returns_sanitized_503(
         self, client, db, monkeypatch
     ):

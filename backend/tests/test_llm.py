@@ -1,12 +1,15 @@
 """LLMService 错误格式化契约测试（Batch 7 / F2）。
 
 背景：429 配额/冻结类错误（exceeded_current_quota_error）此前被笼统归入
-"负载过高"文案，排障时被严重误导。本测试钉死四类错误的文案分支。
+"负载过高"文案，排障时被严重误导。本测试钉死错误分类与流式失败边界。
 """
+
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
-from app.services.llm import LLMService
+from app.services.llm import LLMGenerationError, LLMService
 
 
 @pytest.fixture()
@@ -43,8 +46,47 @@ class TestFormatError:
     def test_timeout_message(self, svc):
         assert "超时" in svc._format_error(Exception("Request timed out"))
 
-    def test_unknown_error_passthrough(self, svc):
-        assert svc._format_error(Exception("some other error")) == "some other error"
+    def test_unknown_error_is_sanitized(self, svc):
+        """未知异常不得把 SDK、路径或请求正文原样暴露给客户端。"""
+        canary = "some-other-error-private-canary"
+        formatted = svc._format_error(Exception(canary))
+        assert formatted == "Kimi API 调用失败，请稍后重试。"
+        assert canary not in formatted
+
+
+class TestStrictStreamFailure:
+    @pytest.mark.asyncio
+    async def test_partial_stream_failure_raises_without_retry_or_error_delta(self):
+        """首 token 后失败不可从头重试，也不可把错误包装成普通正文。"""
+        service = LLMService.__new__(LLMService)
+        service._langfuse_enabled = False
+        service.model = "test-model"
+        service.max_tokens = 32
+        service.temperature = 0.3
+        service.max_total_chars = 1000
+
+        class FailingStream:
+            def __aiter__(self):
+                async def generate():
+                    yield SimpleNamespace(
+                        choices=[SimpleNamespace(delta=SimpleNamespace(content="partial"))]
+                    )
+                    raise RuntimeError("private-stream-canary")
+
+                return generate()
+
+        create = AsyncMock(return_value=FailingStream())
+        service.client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        )
+
+        deltas = []
+        with pytest.raises(LLMGenerationError):
+            async for delta in service.chat_stream([{"role": "user", "content": "q"}]):
+                deltas.append(delta)
+
+        assert deltas == ["partial"]
+        assert create.await_count == 1
 
 
 class TestObservabilityZeroIntrusion:

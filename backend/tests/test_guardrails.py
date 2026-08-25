@@ -88,13 +88,14 @@ class TestVerifyCitations:
         assert report == {"total": 2, "valid": 2, "removed": 0, "verified": True}
 
     def test_removal_logs_warning_without_answer_text(self, caplog):
-        """有剔除时记 [guardrails] warning；脱敏：记编号列表，不记答案全文。"""
+        """有剔除时只记聚合计数，不记答案全文或原始引用 token。"""
         secret = "患者隐私段落XYZ"
         with caplog.at_level(logging.WARNING, logger="papermind"):
             verify_citations(f"{secret}[^7^]", [_chunk(1)])
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert any("[guardrails]" in r.message for r in warnings)
-        assert any("7" in r.message for r in warnings)
+        assert any("out_of_range=1" in r.message for r in warnings)
+        assert all("[^7^]" not in r.message and "tokens=" not in r.message for r in warnings)
         assert all(secret not in r.message for r in warnings)
 
     def test_no_removal_no_warning(self, caplog):

@@ -44,7 +44,7 @@ import {
   analyzeImage,
 } from '../api'
 import { apiFetch } from '../utils/apiUrl'
-import { readSSEStream } from '../utils/sse'
+import { readSSEStream, SSEProtocolError } from '../utils/sse'
 import {
   beginChatOperation,
   finishChatOperation,
@@ -60,6 +60,37 @@ function generateTempId() {
   return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
 }
 
+function CitationTags({ citations, onSelectPaper }) {
+  if (!Array.isArray(citations) || citations.length === 0) return null
+  return (
+    <div style={{ padding: '4px 2px 0' }}>
+      <Text type="secondary" style={{ fontSize: 12 }}>引用来源：</Text>
+      <Space size="small" wrap>
+        {citations.map((citation, index) => {
+          const label = citation.title
+            ? `${citation.title}${citation.year ? `（${citation.year}）` : ''}`
+            : `文献 #${citation.paper_id}`
+          return (
+            <Tag
+              key={citation.source || citation.chunk_id || `${citation.paper_id}-${index}`}
+              size="small"
+              color="blue"
+              style={{
+                borderRadius: 10,
+                border: 'none',
+                cursor: citation.paper_id && onSelectPaper ? 'pointer' : 'default',
+              }}
+              onClick={() => citation.paper_id && onSelectPaper?.(citation.paper_id)}
+            >
+              {label}
+            </Tag>
+          )
+        })}
+      </Space>
+    </div>
+  )
+}
+
 const MessageBubble = memo(function MessageBubble({
   role,
   content,
@@ -68,10 +99,13 @@ const MessageBubble = memo(function MessageBubble({
   onEdit,
   onRegenerate,
   loading,
+  citations,
+  onSelectPaper,
 }) {
   const isUser = role === 'user'
   return (
     <div
+      data-message-role={role}
       style={{
         alignSelf: isUser ? 'flex-end' : 'flex-start',
         maxWidth: '80%',
@@ -114,6 +148,7 @@ const MessageBubble = memo(function MessageBubble({
           <div style={{ marginTop: 4, fontSize: 12, opacity: 0.7 }}>（已停止）</div>
         )}
       </div>
+      {!isUser && <CitationTags citations={citations} onSelectPaper={onSelectPaper} />}
       <div style={{ alignSelf: isUser ? 'flex-end' : 'flex-start' }}>
         {isUser ? (
           <Tooltip title="编辑">
@@ -164,7 +199,6 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
-  const [citations, setCitations] = useState([])
   const [regeneratingMsgId, setRegeneratingMsgId] = useState(null)
   const [enableWebSearch, setEnableWebSearch] = useState(false)
   const [activeSkill, setActiveSkill] = useState(null)
@@ -205,7 +239,6 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
       const res = await getHistory(id)
       setCurrentId(id)
       setMessages(res.data.messages || [])
-      setCitations([])
     } catch (err) {
       message.error('加载对话历史失败')
     }
@@ -219,7 +252,6 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
       setConversations((prev) => [newConv, ...prev])
       setCurrentId(newConv.id)
       setMessages([])
-      setCitations([])
       setDrawerOpen(false)
       return newConv.id
     } catch (err) {
@@ -239,7 +271,6 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
         if (currentId === id) {
           setCurrentId(null)
           setMessages([])
-          setCitations([])
         }
       } catch (err) {
         message.error('删除会话失败')
@@ -276,7 +307,7 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
       setMessages((prev) => [
         ...prev,
         { role: 'user', content: userContent, tempId: userTempId, image: currentImagePreview },
-        { role: 'assistant', content: '', tempId: assistantTempId },
+        { role: 'assistant', content: '', citations: [], tempId: assistantTempId },
       ])
       setLoading(true)
 
@@ -303,23 +334,26 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
             // 后端通过 SSE 下发的 error 事件：提示并结束 loading（finally 中统一收尾）
             (errorMsg) => {
               message.error('图片分析失败：' + errorMsg)
-              setMessages((prev) => {
-                const target = prev.find((item) => item.tempId === assistantTempId)
-                return updateMessageByIdentity(
-                  prev,
-                  { tempId: assistantTempId },
-                  { content: target?.content || '[图片分析失败，请稍后重试]' }
-                )
-              })
+              setMessages((prev) => updateMessageByIdentity(
+                prev,
+                { tempId: assistantTempId },
+                { content: '[图片分析失败，请稍后重试]', citations: [] }
+              ))
             }
           )
         } catch (err) {
-          if (err.name !== 'AbortError') {
+          if (err.name === 'AbortError') {
+            setMessages((prev) => updateMessageByIdentity(
+              prev,
+              { tempId: assistantTempId },
+              { content: '[已停止，回答未保存]', citations: [], isInterrupted: true }
+            ))
+          } else {
             message.error('图片分析失败：' + (err.message || '未知错误'))
             setMessages((prev) => updateMessageByIdentity(
               prev,
               { tempId: assistantTempId },
-              { content: '[图片分析失败，请稍后重试]' }
+              { content: '[图片分析失败，请稍后重试]', citations: [] }
             ))
           }
         }
@@ -358,15 +392,15 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
             ))
           },
           (finalCitations, terminal) => {
-            const finalContent = typeof terminal?.content === 'string'
-              ? terminal.content
-              : assistantContent
+            if (typeof terminal?.content !== 'string') {
+              throw new SSEProtocolError('SSE finished 缺少最终正文')
+            }
+            const finalContent = terminal.content
             setMessages((prev) => updateMessageByIdentity(
               prev,
               { tempId: assistantTempId },
               { content: finalContent, citations: finalCitations || [] }
             ))
-            setCitations(finalCitations || [])
             completed = true
           },
           // 后端通过 SSE 下发的 error 事件：提示并结束 loading（finally 中统一收尾）
@@ -392,9 +426,9 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
           message.error('对话请求失败：' + (err.message || '未知错误'))
           setMessages((prev) => updateMessageByIdentity(
             prev,
-            { tempId: assistantTempId },
-            { content: '[请求失败，请稍后重试]' }
-          ))
+              { tempId: assistantTempId },
+              { content: '[请求失败，请稍后重试]', citations: [] }
+            ))
         }
       }
     } finally {
@@ -442,7 +476,7 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
       setRegeneratingMsgId(msg.id)
       setLoading(true)
       const originalContent = msg.content
-      const originalCitations = citations
+      const originalCitations = Array.isArray(msg.citations) ? msg.citations : []
 
       try {
         const response = await regenerateMessage(currentId, msg.id, { signal: controller.signal })
@@ -459,19 +493,19 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
             setMessages((prev) => updateMessageByIdentity(
               prev,
               { id: msg.id },
-              { content: newContent, isInterrupted: false }
+              { content: newContent, citations: [], isInterrupted: false }
             ))
           },
           (finalCitations, terminal) => {
-            const finalContent = typeof terminal?.content === 'string'
-              ? terminal.content
-              : newContent
+            if (typeof terminal?.content !== 'string') {
+              throw new SSEProtocolError('SSE finished 缺少最终正文')
+            }
+            const finalContent = terminal.content
             setMessages((prev) => updateMessageByIdentity(
               prev,
               { id: msg.id },
               { content: finalContent, citations: finalCitations || [], isInterrupted: false }
             ))
-            setCitations(finalCitations || [])
             completed = true
           },
           // 后端通过 SSE 下发的 error 事件：提示即可，loading 由 finally 收尾
@@ -480,9 +514,8 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
             setMessages((prev) => updateMessageByIdentity(
               prev,
               { id: msg.id },
-              { content: originalContent, isInterrupted: false }
+              { content: originalContent, citations: originalCitations, isInterrupted: false }
             ))
-            setCitations(originalCitations)
           }
         )
         if (completed) fetchConversations()
@@ -490,9 +523,8 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
         setMessages((prev) => updateMessageByIdentity(
           prev,
           { id: msg.id },
-          { content: originalContent, isInterrupted: false }
+          { content: originalContent, citations: originalCitations, isInterrupted: false }
         ))
-        setCitations(originalCitations)
         if (err.name !== 'AbortError') {
           message.error('重新生成失败：' + (err.message || '未知错误'))
         }
@@ -503,7 +535,7 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
         }
       }
     },
-    [currentId, messages, citations, fetchConversations]
+    [currentId, messages, fetchConversations]
   )
 
   const panelStyle = fullHeight
@@ -655,8 +687,10 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
               role={m.role}
               content={m.content}
               image={m.image}
+              citations={m.citations}
               isInterrupted={m.isInterrupted}
               loading={regeneratingMsgId === m.id}
+              onSelectPaper={onSelectPaper}
               onEdit={m.role === 'user' ? () => handleEditMessage(idx) : undefined}
               onRegenerate={m.role === 'assistant' ? () => handleRegenerate(idx) : undefined}
             />
@@ -678,39 +712,6 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
             background: colors.cardBg,
           }}
         >
-          {citations.length > 0 && (
-            <div
-              style={{
-                padding: '8px 12px',
-                borderBottom: `1px solid ${colors.border}`,
-                background: colors.pageBg,
-              }}
-            >
-              <Text type="secondary" style={{ fontSize: 12 }}>
-                引用来源：
-              </Text>
-              <Space size="small" wrap>
-                {citations.map((c, idx) => {
-                  const label = c.title ? `${c.title}${c.year ? `（${c.year}）` : ''}` : `文献 #${c.paper_id}`
-                  return (
-                    <Tag
-                      key={idx}
-                      size="small"
-                      color="blue"
-                      style={{
-                        borderRadius: 10,
-                        border: 'none',
-                        cursor: c.paper_id && onSelectPaper ? 'pointer' : 'default',
-                      }}
-                      onClick={() => c.paper_id && onSelectPaper?.(c.paper_id)}
-                    >
-                      {label}
-                    </Tag>
-                  )
-                })}
-              </Space>
-            </div>
-          )}
           <div style={{ padding: '12px 16px' }}>
             <div style={{ marginBottom: 8, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
               <Button

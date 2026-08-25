@@ -10,6 +10,15 @@ from app.core.config import config
 from app.core.logger import logger
 
 
+class LLMGenerationError(RuntimeError):
+    """上游生成失败；异常正文不得直接返回客户端。"""
+
+
+def is_llm_error_response(value: Any) -> bool:
+    """识别历史兼容的带内错误串，允许流式版本带前导换行。"""
+    return isinstance(value, str) and value.lstrip().startswith("[调用 LLM 出错:")
+
+
 class LLMService:
     def __init__(self):
         api_key = config.get("llm.api_key")
@@ -42,7 +51,10 @@ class LLMService:
                 self._langfuse_enabled = True
             except Exception as e:
                 # 降级契约：初始化失败记 warning，回退未启用态，绝不影响主链路
-                logger.warning(f"[langfuse] 初始化失败，降级为未启用态: {e}")
+                logger.warning(
+                    "[langfuse] 初始化失败，降级为未启用态: %s",
+                    type(e).__name__,
+                )
                 self.client = None
                 self.sync_client = None
                 self._langfuse_enabled = False
@@ -90,7 +102,10 @@ class LLMService:
                 metadata.update(trace_metadata)
             return {"name": method_name, "metadata": metadata}
         except Exception as e:
-            logger.warning(f"[langfuse] 观测参数组装失败，已跳过本次观测: {e}")
+            logger.warning(
+                "[langfuse] 观测参数组装失败，已跳过本次观测: %s",
+                type(e).__name__,
+            )
             return {}
 
     def _get_temperature(self) -> float:
@@ -140,12 +155,20 @@ class LLMService:
                 last_exception = e
                 if attempt < max_retries - 1:
                     delay = min(base_delay * (2 ** attempt), max_delay)
-                    logger.warning(f"[LLM] 调用失败，第 {attempt + 1} 次重试，等待 {delay}s: {e}")
+                    logger.warning(
+                        "[LLM] 调用失败，第 %d 次重试，等待 %ss: %s",
+                        attempt + 1,
+                        delay,
+                        type(e).__name__,
+                    )
                     await asyncio.sleep(delay)
                 else:
-                    logger.error(f"[LLM] 调用失败，已达最大重试次数: {e}")
+                    logger.error(
+                        "[LLM] 调用失败，已达最大重试次数: %s",
+                        type(e).__name__,
+                    )
             except Exception as e:
-                logger.error(f"[LLM] 非预期错误: {e}")
+                logger.error("[LLM] 非预期错误: %s", type(e).__name__)
                 raise
         raise last_exception
 
@@ -157,6 +180,7 @@ class LLMService:
     ) -> AsyncIterator[str]:
         messages = self._truncate_messages(messages)
         last_exception = None
+        emitted_content = False
 
         for attempt in range(3):
             try:
@@ -186,25 +210,40 @@ class LLMService:
                     delta = chunk.choices[0].delta
                     content = getattr(delta, "content", None) or ""
                     if content:
+                        emitted_content = True
                         yield content
                 return
             except (APIError, APITimeoutError, TimeoutError, asyncio.TimeoutError) as e:
                 last_exception = e
+                # 已向调用方发布 token 后禁止从头重试，避免两次回答被拼接。
+                if emitted_content:
+                    logger.error(
+                        "[LLM] 流式响应中途失败，停止重试: %s", type(e).__name__
+                    )
+                    raise LLMGenerationError("stream_interrupted") from None
                 if attempt < 2:
                     delay = min(1.0 * (2 ** attempt), 10.0)
-                    logger.warning(f"[LLM] 流式调用失败，第 {attempt + 1} 次重试，等待 {delay}s: {e}")
+                    logger.warning(
+                        "[LLM] 流式调用失败，第 %d 次重试，等待 %ss: %s",
+                        attempt + 1,
+                        delay,
+                        type(e).__name__,
+                    )
                     await asyncio.sleep(delay)
                 else:
-                    logger.error(f"[LLM] 流式调用失败，已达最大重试次数: {e}")
+                    logger.error(
+                        "[LLM] 流式调用失败，已达最大重试次数: %s",
+                        type(e).__name__,
+                    )
             except Exception as e:
-                logger.error(f"[LLM] 流式调用非预期错误: {e}")
-                yield f"\n[调用 LLM 出错: {self._format_error(e)}]"
-                return
+                logger.error("[LLM] 流式调用非预期错误: %s", type(e).__name__)
+                raise LLMGenerationError("upstream_failure") from None
 
         if last_exception:
-            error_msg = self._format_error(last_exception)
-            logger.error(f"[LLM] 流式调用最终失败: {error_msg}")
-            yield f"\n[调用 LLM 出错: {error_msg}]"
+            logger.error(
+                "[LLM] 流式调用最终失败: %s", type(last_exception).__name__
+            )
+            raise LLMGenerationError("upstream_failure") from None
 
     async def chat_completion(
         self,
@@ -256,12 +295,20 @@ class LLMService:
                 last_exception = e
                 if attempt < max_retries - 1:
                     delay = min(base_delay * (2 ** attempt), max_delay)
-                    logger.warning(f"[LLM] 同步调用失败，第 {attempt + 1} 次重试，等待 {delay}s: {e}")
+                    logger.warning(
+                        "[LLM] 同步调用失败，第 %d 次重试，等待 %ss: %s",
+                        attempt + 1,
+                        delay,
+                        type(e).__name__,
+                    )
                     time.sleep(delay)
                 else:
-                    logger.error(f"[LLM] 同步调用失败，已达最大重试次数: {e}")
+                    logger.error(
+                        "[LLM] 同步调用失败，已达最大重试次数: %s",
+                        type(e).__name__,
+                    )
             except Exception as e:
-                logger.error(f"[LLM] 同步调用非预期错误: {e}")
+                logger.error("[LLM] 同步调用非预期错误: %s", type(e).__name__)
                 raise
         assert last_exception is not None
         raise last_exception
@@ -323,7 +370,7 @@ class LLMService:
             return "API Key 无效或已过期，请检查 config.yaml 中的 llm.api_key。"
         if "timeout" in msg.lower() or "timed out" in msg.lower():
             return "Kimi API 响应超时，请稍后重试。"
-        return msg
+        return "Kimi API 调用失败，请稍后重试。"
 
     def is_configured(self) -> bool:
         """检查 API Key 是否已配置且不像占位符。"""
