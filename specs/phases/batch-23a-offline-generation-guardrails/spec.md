@@ -11,14 +11,19 @@
 - 复用生产聊天的消息组装、引用解析和 Guardrail 逻辑；评测代码不得另写宽松解析器。
 - 评测 citation precision/recall/F1、越界引用数、负例拒答率和流式终止契约。
 - 本批只运行确定性离线响应或 mock LLM，不调用 Kimi、联网搜索、Embedding 或私有语料。
+- 生产 stream / non-stream / regenerate 共用同一纯 Guardrail；流式 delta 只是
+  provisional，以 finished 的清洗后 `content` 为唯一成功终态。
 
 ## 3. 硬 Gate
 
-- 指标数学以手算 fixture 锁定，重复/未知/越界 citation 必须计入相应惩罚。
+- 指标数学以手算 fixture 锁定：每个 citation claim 都进 precision 分母，
+  只有首次、合法且相关的 chunk 进正确分子；Recall 按唯一相关证据覆盖，
+  F1 逐正例计算后宏平均。
 - 引用不得超出检索允许的 paper/chunk 集；越界引用数必须为 0 才允许后续私有 smoke。
 - 负例必须明确拒答且不得伪造引用，公开 fixture 的拒答率下限为 0.90。
-- SSE 中错误、取消、提前 EOF、重复 finished 不得留下半条 assistant 消息或错误引用。
-- 公开 CI 全离线、无密钥、无私人数据；评测报告绑定 fixture 与代码指纹。
+- SSE 中 error / cancel / EOF 不得留下半条 assistant；重复 finished 采“首终态获胜”幂等契约。
+- CI 的“生成 Harness 执行阶段”强制离线、无密钥、无私人数据；checkout /
+  依赖安装 / artifact 上传属外层 CI 基础设施，不属该执行边界。
 
 ## 4. 非目标
 

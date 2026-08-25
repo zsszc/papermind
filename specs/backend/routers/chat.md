@@ -2,7 +2,7 @@
 
 > 本文件描述 `backend/app/routers/chat.py` 的**行为契约**（做什么），不描述实现细节。
 > 本模块是对话子系统的 HTTP 包装层：LLM 调用契约归 `specs/backend/services/llm.md`（含 SSE 对线协议 3.6 节）、LLM 调用前编排归 `specs/backend/services/agent_graph.md`、记忆读写归 `specs/backend/services/memory_manager.md`、图片分析归 `specs/backend/services/image_analyzer.md`、Skill 注册表归 `specs/backend/services/skills.md`。本规格聚焦端点签名、参数校验、状态码、SSE 事件序列与落库时序，服务层细节一律引用衔接、不重复。
-> 依据源码实际内容反向工程整理（2026-08-04，chat.py 全文 362 行）。
+> 依据源码实际内容反向工程整理；2026-08-25 同步 Batch 23A 生成 Guardrail 与原子 SSE 终态。
 
 ## 1. 背景与目标
 
@@ -100,7 +100,9 @@
   3. 消息组装：`[system(含记忆)] + 目标之前的全部历史消息 + [RAG system（retrieved 非空时，build_rag_prompt）]`；
   4. 与 `POST /api/chat` 的差异：**无 `HISTORY_LIMIT=10` 截断（全量历史注入）、无 skill 注入、无 paper_id 过滤、无联网搜索提示注入、不触发 `update_short_term_memory`、不动 `message_count`**。
 - **~~已知缺陷~~已修复（2026-08-04）**：`event_stream` 闭包内原引用未赋值的 `enable_web_search`（自初始提交 `cfbc1b2` 起存在，首帧即 `NameError`，端点完全不可用）。修复：显式传 `enable_web_search=False`（regenerate 无请求体、无联网开关，取确定性重生成语义），`tests/test_chat.py::TestRegenerate` 3 用例固化（流式替换 + 404 两分支）。
-- **成功路径后置条件（缺陷修复后的预期契约）**：用**新 `SessionLocal`** 把 `full_content` 写回目标消息 `content`，`citations` 覆写为 `[{"source": r["source"], "paper_id": r["paper_id"]} for r in retrieved]`（**比 3.8 落库更裁剪**，仅 2 键）；随后发 finished 尾帧（`citations` 为原始 `retrieved`）。
+- **成功路径后置条件**：用共享 `generation_guardrails` 清洗完整回答，用
+  **新 `SessionLocal`** 原地写回清洗后 `content`；落库与 finished 都只包含答案实际合法
+  引用的 chunk。finished 同时携带清洗后 `content` 与四字段 `verification`。
 - **取消语义**：`asyncio.CancelledError`（客户端断开）→ 记 info 日志并 return，**原消息内容保留不变**。
 
 ### 3.7 `analyze_image(file, question)`（`POST /api/chat/analyze-image`）
@@ -136,8 +138,8 @@
   7. 分支生成（见下）。
 - **非流式分支**（`request.stream is False`）：
   - `content = await llm_service.chat_completion(messages)`——**不传 `enable_web_search`**（`chat_completion` 无此参数），**联网开关在非流式路径不生效**（已知不对称，流式路径生效）；
-  - assistant 消息落库并 commit，`citations` 为裁剪版 7 键 dict（`source / paper_id / title / authors / year / page_number / content`）；
-  - 返回 JSON `{"conversation_id": int, "content": str, "citations": retrieved}`（**`citations` 为原始 chunk dict**，与落库裁剪版不同）；
+  - 与流式路径调用同一 Guardrail，返回/落库都使用清洗后 `content` 与实际引用子集；
+  - 返回 JSON 额外携带 `verification={total,valid,removed,verified}`；
   - LLM 失败时 `content` 为 `[调用 LLM 出错: ...]` 错误串且**照样落库**（llm.md 3.7 的既定契约），HTTP 仍 200。
 - **流式分支**（默认）：`StreamingResponse(event_stream(), media_type="text/event-stream")`，响应头固定 `Cache-Control: no-cache`、`Connection: keep-alive`、`X-Accel-Buffering: no`；SSE 事件序列与取消语义见 3.10。
 - **副作用汇总**：`conversations` 可能插入；`messages` 插入 1–2 行；`conversations.message_count`/`updated_at` 更新；`memory_summaries` 可能写入（第 4 步）；LLM 网络调用；流式路径 assistant 落库使用**新 `SessionLocal`**（原请求会话已随响应生命周期关闭）。
@@ -155,10 +157,13 @@
 | 阶段 | 帧格式（`data: ` + JSON + `\n\n`，`ensure_ascii=False`） |
 |------|----------------------------------------------------------|
 | 增量 | `{"delta": "<文本>", "finished": false, "conversation_id": N}` |
-| 完成 | `{"delta": "", "finished": true, "conversation_id": N, "citations": <原始 retrieved chunk dict 列表>}` |
+| 完成 | `{"delta":"", "finished":true, "conversation_id":N, "content":"<清洗后全文>", "citations":<实际引用 chunk 子集>, "verification":{...}}` |
 | 错误 | `{"error": "..."}`——**前端 ChatPanel 兼容解析，但当前后端所有端点从不产生**；LLM 失败走带内错误串（作为普通 delta，随后照常发 finished 帧，错误串会随 `full_content` 落库） |
 
-- **落库时序**：尾帧**之前**完成 assistant 落库——`full_content.strip()` 非空才写库（全空回复不落库）；落库用新 `SessionLocal`；落库 `citations` 为裁剪版 7 键 dict，与尾帧的原始 dict 不同。**Phase C C1（已实现）**：落库前调用 `agent_graph.verify_citations(full_content, retrieved)` 校验引用忠实度——越界 `[^n^]` 标记从落库文本剔除（保留语句本身），落库 citations 每条追加 `verified`（有剔除为 false）与 `removed` 计数两键（7 键 → 9 键）；不阻塞返回、SSE 帧格式不变；有剔除时记 `[guardrails]` warning 日志（脱敏，只记编号列表）。非流式分支与 regenerate 路径本轮不接入（phase-c-guardrails spec 2.2）。
+- **落库/终态时序**：尾帧**之前**完成 assistant 落库。delta 仅供实时预览；
+  前端收到 finished 后必须用其 `content` 原子替换 provisional 文本。error、取消或
+  提前 EOF 必须丢弃 provisional；重复 finished 仅首帧生效。有效引用保留，越界、
+  畸形、旧式 `[pN_cN]` 和歧义 chunk 身份 fail closed 并脱敏记录计数。
 - **取消语义**：每发一帧后 `await asyncio.sleep(0)` 让出控制权，使客户端断开能触发 `asyncio.CancelledError` → 记 `[chat]` info 日志并 return；**已提交的用户消息与 `message_count` 保留（计数因此比实际消息数多 1）**，assistant 消息不落库。
 - `analyze-image` 的帧为子集：`{"delta", "finished"}`，无 `conversation_id` / `citations`。
 
@@ -217,12 +222,12 @@
 
 - [ ] AC1：`POST /api/chat` 无 `conversation_id` 时自动建会话（`title=message[:30]`）、用户消息落库、响应帧序列符合 3.10（首帧起 delta、末帧 finished=true + conversation_id + citations）
 - [ ] AC2：`conversation_id` 不存在 → 404；缺 `message` → 422
-- [ ] AC3：非流式分支返回 `{conversation_id, content, citations}`，assistant 消息落库且 citations 为 7 键裁剪版
+- [x] AC3：非流式分支与 stream/regenerate 使用同一引用清洗与实际引用子集契约
 - [ ] AC4：消息总数为 5 的倍数时 `update_short_term_memory` 被触发（mock 断言调用）；其抛异常时响应不受影响
 - [ ] AC5：`message_count` 在提交后等于 `history_total + 1`；流式取消后计数不回退（固化现状）
 - [ ] AC6：会话 CRUD——列表按 `updated_at` 降序；创建固定 `"新对话"`；history 消息升序且字段裁剪为 4 键；删除会话级联删除消息 → 204；不存在均 404
 - [ ] AC7：`delete_messages_from` 删除目标及其后全部消息；`message_count` 回溯为实际剩余消息数（已修复 Batch7b-F11，`TestDeleteMessagesFrom` 固化）
-- [ ] AC8：regenerate 前置校验 404/400 四分支；**通过校验后当前抛 NameError（缺陷固化用例，标注 xfail/已知缺陷）；修复后**：目标消息内容被替换、citations 为 2 键裁剪、取消时原内容保留
+- [x] AC8：regenerate 前置校验 404/400 分支；成功时原子替换清洗后内容与实际引用，取消/失败保留原内容
 - [ ] AC9：analyze-image 空文件 → 400；正常文件 SSE 帧序列 `delta* + finished`；服务层异常时带内错误串
 - [ ] AC10：`GET /api/chat/skills` 返回 6 个默认 Skill 的 3 键 dict 列表
 - [ ] AC11：LLM 失败时错误串作为普通 delta 送达并落库，无 `{error}` 帧（与 llm.md AC5 联动的端到端用例）
@@ -230,10 +235,10 @@
 ## 7. 现有测试覆盖与盲区
 
 - **已实现（Phase C）**：C1 路由集成——mock LLM 输出含越界引用，SSE 完成后落库 citations 带 `verified=false`、`removed=1`，落库文本越界标记已剔除；全部有效时 `verified=true` 且文本不篡改——`backend/tests/test_chat.py::TestGuardrailsIntegration`（2 用例）。纯函数与 C2 拒答硬约束用例见 `backend/tests/test_guardrails.py`（agent_graph.md 第 7 节）
-- **已覆盖**：**无。`backend/tests/` 中不存在 `test_chat.py`**，grep 全测试目录无任何 `/api/chat` 或 `routers.chat` 引用；相关测试仅有 `test_agent_graph.py`（编排层，mock 掉路由）与 `test_skills.py`（服务层注册表，未经路由）、`test_memory.py`（MemoryManager，mock LLM）。
-- **盲区**（按严重程度）：
-  - **高**：`POST /api/chat` 全链路零覆盖——SSE 帧序列、自动建会话、用户消息落库时序、`message_count = history_total + 1`、非流式分支、404/422（AC1–AC5）
-  - **高**：regenerate 的 **NameError 缺陷无任何测试暴露**——该端点自初始提交起实际不可用，前置校验四分支与成功/取消路径均无覆盖（AC8）
+- **已覆盖**：`test_chat.py` 覆盖 stream/non-stream/regenerate/deep-review 与落库；`test_generation_guardrails_offline.py` 锁定引用数学、边界、拒答与报告脱敏；前端 SSE / ChatPanel 测试覆盖原子 finished、失败丢弃半条回答和幂等终态。
+- **剩余盲区**（按严重程度）：
+  - **高**：LLM 全部重试失败时的带内错误串仍可能被当作正常内容落库（AC11）。
+  - **中**：同一会话并发请求的 `message_count` 仍无锁，需要独立 SDD/TDD 循环。
   - **高**：会话 CRUD 的列表/创建/历史/删除仍无测试（AC6）；`delete_messages_from` 的 from 截断语义与 message_count 回溯**已修复并固化（Batch7b-F11，`TestDeleteMessagesFrom` 3 用例：截断回溯/全删归 0/会话 404）**
   - **中**：`update_short_term_memory` 的触发时机（5 的倍数）与双重兜底在路由层无测试（AC4，memory_manager 服务层另有覆盖）
   - **中**：analyze-image 的 400 与 SSE 帧、服务层带内错误串透传无测试（AC9）
@@ -247,6 +252,6 @@
 - **用户消息「先 flush 编排、后随计数 commit」**：编排的 `load_memory` 必须在同一事务内看到本轮 user 消息（否则历史缺失），而最终提交与 `message_count` 更新合并为一次 commit——保证「用户消息 + 计数」原子落盘；取消/LLM 失败时不会出现「有用户消息但计数缺失」的反向不一致（只会计数多 1，见 4 节）。
 - **记忆更新内联 await 而非真后台**：注释声称「不阻塞回复」，实现却是阻塞式（5 的倍数时调 LLM 摘要）。保留现状的隐性收益是**当轮 prompt 即可读到新摘要**；代价是该轮首帧延迟可达分钟级。改真后台（`asyncio.create_task`）属行为变更，需先改规格。
 - **assistant 落库用新 `SessionLocal`**：StreamingResponse 迭代发生在请求会话（Depends 生命周期）关闭之后，必须用全新会话写库；非流式分支无此问题，直接复用请求会话。
-- **citations 双形态**：尾帧给前端的 `citations` 是原始 chunk dict（信息全，供展示）；落库的是裁剪 7 键 dict（regenerate 进一步裁为 2 键）——历史遗留的不一致，前端两种都消费，固化现状。
-- **regenerate 独立编排而非复用 agent_graph**：历史代码路径（初始提交即存在），与主链路相比缺历史截断/skill/联网提示，且携带 3.6 的 NameError 缺陷——**重构方向是复用 `run_pre_orchestration` 消除分叉**，但属行为变更，须规格先行。
+- **citations 实际引用子集**：finished 和落库都不再发布未被答案引用的 retrieved chunk；前端仅在成功终态替换引用列表。
+- **regenerate 独立编排而非复用 agent_graph**：它已共用检索管线与生成 Guardrail，但仍与主链路存在历史截断/skill/联网提示差异；进一步统一须规格先行。
 - **后端从不发 `{error}` 帧**：错误一律带内化（llm.md 第 8 节决策），前端把错误串当正常回复渲染并落库——体验上「对话不中断」，代价是错误内容进入对话历史与后续 prompt 上下文。
