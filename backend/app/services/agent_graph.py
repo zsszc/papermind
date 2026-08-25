@@ -25,9 +25,8 @@
 
 import asyncio
 import concurrent.futures
-import re
 import threading
-from typing import Any, Dict, List, Optional, Tuple, TypedDict
+from typing import Any, Dict, List, Optional, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 from sqlalchemy import bindparam, case, text
@@ -37,6 +36,7 @@ from app.core.config import config
 from app.core.logger import logger
 from app.models import Chunk, Message, Paper
 from app.services.memory_manager import MemoryManager
+from app.services.generation_guardrails import verify_citations
 from app.services.retrieval import get_vector_store
 from app.services.retrieval_pipeline import RetrievalPipeline
 from app.services.skills import build_skill_prompt
@@ -75,52 +75,6 @@ RETRIEVE_TOP_K = 5
 # retrieval.graph_expand_hops（默认 1 跳）
 GRAPH_EXPAND_MAX_CHUNKS_PER_PAPER = 2
 GRAPH_EXPAND_RRF_K = 60
-
-# 引用标记正则：[^n^]，n 为整数（允许负数形式以便识别后剔除，编号为 1-based）
-_CITATION_MARKER_PATTERN = re.compile(r"\[\^(-?\d+)\^\]")
-
-
-def verify_citations(
-    answer_text: str, retrieved_chunks: List[Dict[str, Any]]
-) -> Tuple[str, Dict[str, Any]]:
-    """校验答案中的 [^n^] 引用标记是否落在本次检索片段编号范围内（Phase C C1）。
-
-    - 1 <= n <= len(retrieved_chunks) 的标记保留并计入有效引用；
-    - 越界（含 0、负数）或零检索时的标记从文本剔除（保留语句本身）；
-    - 返回 (清洗后文本, {"total", "valid", "removed", "verified"})，
-      全部有效或无引用时 verified=True，有剔除时 verified=False；
-    - 有剔除时记 [guardrails] warning（脱敏：只记编号列表，不记答案全文）。
-
-    幂等纯函数：无 DB / 网络 / LLM 调用，可直接单测。
-    """
-    total = 0
-    valid = 0
-    removed_indices: List[int] = []
-
-    def _replace(match: "re.Match[str]") -> str:
-        nonlocal total, valid
-        total += 1
-        n = int(match.group(1))
-        if 1 <= n <= len(retrieved_chunks):
-            valid += 1
-            return match.group(0)
-        removed_indices.append(n)
-        return ""
-
-    cleaned = _CITATION_MARKER_PATTERN.sub(_replace, answer_text)
-    removed = total - valid
-    if removed:
-        logger.warning(
-            f"[guardrails] 剔除越界引用标记 {removed_indices}"
-            f"（本次检索片段数={len(retrieved_chunks)}）"
-        )
-    return cleaned, {
-        "total": total,
-        "valid": valid,
-        "removed": removed,
-        "verified": removed == 0,
-    }
-
 
 def build_rag_prompt(query: str, retrieved: List[dict]) -> str:
     """把检索片段拼装为带引用编号的 RAG system prompt（与原 chat.py 实现一致）。"""

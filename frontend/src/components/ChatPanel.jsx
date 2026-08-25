@@ -279,7 +279,6 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
         { role: 'assistant', content: '', tempId: assistantTempId },
       ])
       setLoading(true)
-      setCitations([])
 
       // 如果有图片，走图片分析接口
       if (currentImage) {
@@ -347,6 +346,7 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
         }
 
         let assistantContent = ''
+        let completed = false
         await readSSEStream(
           response,
           (delta) => {
@@ -357,31 +357,35 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
               { content: assistantContent }
             ))
           },
-          (finalCitations) => {
-            if (finalCitations?.length) {
-              setCitations(finalCitations)
-            }
+          (finalCitations, terminal) => {
+            const finalContent = typeof terminal?.content === 'string'
+              ? terminal.content
+              : assistantContent
+            setMessages((prev) => updateMessageByIdentity(
+              prev,
+              { tempId: assistantTempId },
+              { content: finalContent, citations: finalCitations || [] }
+            ))
+            setCitations(finalCitations || [])
+            completed = true
           },
           // 后端通过 SSE 下发的 error 事件：提示并结束 loading（finally 中统一收尾）
           (errorMsg) => {
             message.error('对话失败：' + errorMsg)
-            setMessages((prev) => {
-              const target = prev.find((item) => item.tempId === assistantTempId)
-              return updateMessageByIdentity(
-                prev,
-                { tempId: assistantTempId },
-                { content: target?.content || '[请求失败，请稍后重试]' }
-              )
-            })
+            setMessages((prev) => updateMessageByIdentity(
+              prev,
+              { tempId: assistantTempId },
+              { content: '[请求失败，请稍后重试]', citations: [] }
+            ))
           }
         )
-        fetchConversations()
+        if (completed) fetchConversations()
       } catch (err) {
         if (err.name === 'AbortError') {
           setMessages((prev) => updateMessageByIdentity(
             prev,
             { tempId: assistantTempId },
-            { isInterrupted: true }
+            { content: '[已停止，回答未保存]', citations: [], isInterrupted: true }
           ))
         } else {
           // POST /api/chat 已在 SSE 前落用户消息，任何自动重放都可能重复落库/计费。
@@ -437,7 +441,8 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
 
       setRegeneratingMsgId(msg.id)
       setLoading(true)
-      setCitations([])
+      const originalContent = msg.content
+      const originalCitations = citations
 
       try {
         const response = await regenerateMessage(currentId, msg.id, { signal: controller.signal })
@@ -446,6 +451,7 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
         }
 
         let newContent = ''
+        let completed = false
         await readSSEStream(
           response,
           (delta) => {
@@ -456,18 +462,37 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
               { content: newContent, isInterrupted: false }
             ))
           },
-          (finalCitations) => {
-            if (finalCitations?.length) {
-              setCitations(finalCitations)
-            }
+          (finalCitations, terminal) => {
+            const finalContent = typeof terminal?.content === 'string'
+              ? terminal.content
+              : newContent
+            setMessages((prev) => updateMessageByIdentity(
+              prev,
+              { id: msg.id },
+              { content: finalContent, citations: finalCitations || [], isInterrupted: false }
+            ))
+            setCitations(finalCitations || [])
+            completed = true
           },
           // 后端通过 SSE 下发的 error 事件：提示即可，loading 由 finally 收尾
           (errorMsg) => {
             message.error('重新生成失败：' + errorMsg)
+            setMessages((prev) => updateMessageByIdentity(
+              prev,
+              { id: msg.id },
+              { content: originalContent, isInterrupted: false }
+            ))
+            setCitations(originalCitations)
           }
         )
-        fetchConversations()
+        if (completed) fetchConversations()
       } catch (err) {
+        setMessages((prev) => updateMessageByIdentity(
+          prev,
+          { id: msg.id },
+          { content: originalContent, isInterrupted: false }
+        ))
+        setCitations(originalCitations)
         if (err.name !== 'AbortError') {
           message.error('重新生成失败：' + (err.message || '未知错误'))
         }
@@ -478,7 +503,7 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
         }
       }
     },
-    [currentId, messages, fetchConversations, readSSEStream]
+    [currentId, messages, citations, fetchConversations]
   )
 
   const panelStyle = fullHeight

@@ -19,7 +19,12 @@ from app.services.retrieval_pipeline import RetrievalPipeline
 from app.services.memory_manager import MemoryManager
 from app.services.image_analyzer import image_analyzer_service
 from app.services.skills import list_skills
+from app.services.generation_guardrails import (
+    select_cited_chunks,
+    verify_citations_detailed,
+)
 from app.services.agent_graph import (
+    NO_RETRIEVAL_GUARD,
     SYSTEM_PROMPT,
     build_rag_prompt as _build_rag_prompt,
     run_pre_orchestration,
@@ -75,6 +80,26 @@ def _local_chunks(citations) -> list:
         c for c in (citations or [])
         if _field(c, "source") and _field(c, "paper_id") is not None
     ]
+
+
+def _compat_verification(report: dict) -> dict:
+    """SSE 继续暴露 Phase C 四字段契约，详细指标留给离线 Gate。"""
+    return {key: report[key] for key in ("total", "valid", "removed", "verified")}
+
+
+def _stored_citations(citations: list, verification: dict) -> list:
+    """构建可持久化的实际引用快照。"""
+    return [{
+        "source": _field(item, "source") or _field(item, "chunk_id"),
+        "paper_id": _field(item, "paper_id"),
+        "title": _field(item, "title"),
+        "authors": _field(item, "authors"),
+        "year": _field(item, "year"),
+        "page_number": _field(item, "page_number"),
+        "content": _field(item, "content"),
+        "verified": verification["verified"],
+        "removed": verification["removed"],
+    } for item in citations]
 
 
 @router.get("/conversations", response_model=List[ConversationResponse])
@@ -227,6 +252,8 @@ async def regenerate_message(
     if retrieved:
         rag_context = _build_rag_prompt(query, retrieved)
         messages.append({"role": "system", "content": rag_context})
+    else:
+        messages[0]["content"] += f"\n\n{NO_RETRIEVAL_GUARD}"
 
     async def event_stream():
         full_content = ""
@@ -241,6 +268,12 @@ async def regenerate_message(
             logger.info(f"[regenerate] conversation {conversation_id} message {message_id} cancelled")
             return
 
+        cleaned_content, detailed_report, cited_ids = verify_citations_detailed(
+            full_content, retrieved
+        )
+        verification = _compat_verification(detailed_report)
+        cited_chunks = select_cited_chunks(retrieved, cited_ids)
+
         # 保存替换后的内容
         from app.database import SessionLocal
         with SessionLocal() as new_db:
@@ -250,11 +283,11 @@ async def regenerate_message(
                 .first()
             )
             if msg:
-                msg.content = full_content
-                msg.citations = [{"source": r["source"], "paper_id": r["paper_id"]} for r in retrieved]
+                msg.content = cleaned_content
+                msg.citations = _stored_citations(cited_chunks, verification)
                 new_db.commit()
 
-        yield f"data: {json.dumps({'delta': '', 'finished': True, 'conversation_id': conversation_id, 'citations': retrieved}, ensure_ascii=False)}\n\n"
+        yield f"data: {json.dumps({'delta': '', 'finished': True, 'conversation_id': conversation_id, 'content': cleaned_content, 'citations': cited_chunks, 'verification': verification}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(
         event_stream(),
@@ -350,32 +383,33 @@ async def chat(request: ChatRequest, db: Session = Depends(get_db)):
     db.commit()
 
     if request.stream is False:
-        content = await llm_service.chat_completion(messages)
+        raw_content = await llm_service.chat_completion(messages)
+        content, detailed_report, cited_ids = verify_citations_detailed(
+            raw_content, retrieved
+        )
+        verification = _compat_verification(detailed_report)
+        cited_chunks = select_cited_chunks(retrieved, cited_ids)
         assistant_msg = Message(
             conversation_id=conv.id,
             role="assistant",
             content=content,
-            citations=[{
-        "source": r["source"],
-        "paper_id": r["paper_id"],
-        "title": r.get("title"),
-        "authors": r.get("authors"),
-        "year": r.get("year"),
-        "page_number": r.get("page_number"),
-        "content": r.get("content"),
-    } for r in retrieved],
+            citations=_stored_citations(cited_chunks, verification),
         )
         db.add(assistant_msg)
         db.commit()
         return {
             "conversation_id": conv.id,
             "content": content,
-            "citations": retrieved,
+            "citations": cited_chunks,
+            "verification": verification,
         }
 
     conv_id = conv.id
     async def event_stream():
         full_content = ""
+        cleaned_content = ""
+        verification = {"total": 0, "valid": 0, "removed": 0, "verified": True}
+        cited_chunks = []
         try:
             async for delta in llm_service.chat_stream(messages, enable_web_search=enable_web_search):
                 full_content += delta
@@ -390,29 +424,23 @@ async def chat(request: ChatRequest, db: Session = Depends(get_db)):
         if full_content.strip():
             # Phase C C1：落库前校验引用忠实度——剔除越界 [^n^] 标记，
             # citations 附 verified / removed（不阻塞返回，先观测）
-            cleaned_content, verify_report = verify_citations(full_content, retrieved)
+            cleaned_content, detailed_report, cited_ids = verify_citations_detailed(
+                full_content, retrieved
+            )
+            verification = _compat_verification(detailed_report)
+            cited_chunks = select_cited_chunks(retrieved, cited_ids)
             from app.database import SessionLocal
             with SessionLocal() as new_db:
                 assistant_msg = Message(
                     conversation_id=conv_id,
                     role="assistant",
                     content=cleaned_content,
-                    citations=[{
-        "source": r["source"],
-        "paper_id": r["paper_id"],
-        "title": r.get("title"),
-        "authors": r.get("authors"),
-        "year": r.get("year"),
-        "page_number": r.get("page_number"),
-        "content": r.get("content"),
-        "verified": verify_report["verified"],
-        "removed": verify_report["removed"],
-    } for r in retrieved],
+                    citations=_stored_citations(cited_chunks, verification),
                 )
                 new_db.add(assistant_msg)
                 new_db.commit()
 
-        yield f"data: {json.dumps({'delta': '', 'finished': True, 'conversation_id': conv_id, 'citations': retrieved}, ensure_ascii=False)}\n\n"
+        yield f"data: {json.dumps({'delta': '', 'finished': True, 'conversation_id': conv_id, 'content': cleaned_content, 'citations': cited_chunks, 'verification': verification}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(
         event_stream(),
@@ -548,7 +576,11 @@ async def deep_review(request: DeepReviewRequest, db: Session = Depends(get_db))
                 "delta": "",
                 "finished": True,
                 "conversation_id": conv_id,
+                "content": cleaned_content if full_content.strip() else "",
                 "citations": [_jsonable(c) for c in citations],
+                "verification": _compat_verification(verify_report) if full_content.strip() else {
+                    "total": 0, "valid": 0, "removed": 0, "verified": True,
+                },
             })
         except asyncio.CancelledError:
             logger.info(f"[deep-review] conversation {conv_id} streaming cancelled")

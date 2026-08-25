@@ -58,6 +58,7 @@ export async function readSSEStream(
   let buffer = ''
   let terminal = null
   let lastCitations = []
+  let terminalPayload = null
   let receivedChunk = false
   const deadline = Date.now() + totalTimeoutMs
 
@@ -71,21 +72,39 @@ export async function readSSEStream(
     }
     if (!dataLines.length) return
     const payload = dataLines.join('\n')
+    let data
     try {
-      const data = JSON.parse(payload)
-      // error 是独立失败终态，与 finished 同帧时不得再触发成功回调。
-      if (data.error) {
-        terminal = 'error'
-        onError?.(data.error)
-        return
-      }
-      if (data.delta) onDelta(data.delta)
-      if (data.finished) {
-        terminal = 'finished'
-        lastCitations = data.citations || []
-      }
+      data = JSON.parse(payload)
     } catch (error) {
       warning('[SSE] JSON 解析失败，已跳过该事件：', error, payload)
+      return
+    }
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+      throw new SSEProtocolError('SSE 事件必须是 JSON 对象')
+    }
+    // error 是独立失败终态，与 finished 同帧时不得再触发成功回调。
+    if (Object.prototype.hasOwnProperty.call(data, 'error')) {
+      if (typeof data.error !== 'string' || !data.error) {
+        throw new SSEProtocolError('SSE error 必须是非空字符串')
+      }
+      terminal = 'error'
+      onError?.(data.error)
+      return
+    }
+    if (Object.prototype.hasOwnProperty.call(data, 'delta') && typeof data.delta !== 'string') {
+      throw new SSEProtocolError('SSE delta 必须是字符串')
+    }
+    if (Object.prototype.hasOwnProperty.call(data, 'finished') && typeof data.finished !== 'boolean') {
+      throw new SSEProtocolError('SSE finished 必须是布尔值')
+    }
+    if (Object.prototype.hasOwnProperty.call(data, 'citations') && !Array.isArray(data.citations)) {
+      throw new SSEProtocolError('SSE citations 必须是数组')
+    }
+    if (data.delta) onDelta(data.delta)
+    if (data.finished === true) {
+      terminal = 'finished'
+      lastCitations = data.citations || []
+      terminalPayload = data
     }
   }
 
@@ -114,7 +133,7 @@ export async function readSSEStream(
     }
     if (!terminal && buffer.trim()) handleEvent(buffer)
     if (!terminal) throw new IncompleteSSEError()
-    if (terminal === 'finished') onFinish(lastCitations)
+    if (terminal === 'finished') onFinish(lastCitations, terminalPayload)
   } finally {
     // 已读到应用终态时主动停止底层流；Abort/网络异常也走同一释放路径。
     try {

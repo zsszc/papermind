@@ -7,23 +7,40 @@
 
 name: Eval
 
+permissions:
+  contents: read
+
 on:
   workflow_dispatch:
   pull_request:
     paths:
       - "backend/eval/**"
+      - "backend/app/services/generation_guardrails.py"
+      - "backend/app/routers/chat.py"
       - "backend/tests/test_eval_*.py"
+      - "backend/tests/test_generation_guardrails_offline.py"
+      - "frontend/src/utils/sse.js"
+      - "frontend/src/utils/sse.test.js"
+      - "frontend/src/components/ChatPanel.jsx"
+      - "frontend/src/components/ChatPanel.test.jsx"
       - ".github/workflows/eval.yml"
   push:
     branches: [main]
     paths:
       - "backend/eval/**"
+      - "backend/app/services/generation_guardrails.py"
+      - "backend/app/routers/chat.py"
       - "backend/tests/test_eval_*.py"
+      - "backend/tests/test_generation_guardrails_offline.py"
+      - "frontend/src/utils/sse.js"
+      - "frontend/src/utils/sse.test.js"
+      - "frontend/src/components/ChatPanel.jsx"
+      - "frontend/src/components/ChatPanel.test.jsx"
       - ".github/workflows/eval.yml"
 
 jobs:
-  retrieval-eval:
-    name: 检索质量评测（无 LLM）
+  public-eval:
+    name: 公开检索与生成契约（无 LLM）
     runs-on: ubuntu-latest
     steps:
       - name: 检出代码
@@ -45,7 +62,27 @@ jobs:
         working-directory: backend
         env:
           PYTHONPATH: ""
-        run: python -m pytest tests/test_eval_*.py tests/test_dataset.py -q
+        run: >-
+          python -m pytest
+          tests/test_eval_*.py
+          tests/test_dataset.py
+          tests/test_generation_guardrails_offline.py
+          -q
+
+      - name: 安装 Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: 安装前端依赖
+        working-directory: frontend
+        run: npm ci
+
+      - name: 运行 SSE 原子终态契约
+        working-directory: frontend
+        run: npm test -- --run src/utils/sse.test.js src/components/ChatPanel.test.jsx
 
       - name: 运行 count 兼容基线
         working-directory: backend
@@ -73,11 +110,24 @@ jobs:
           --threshold 0.85
           --report-dir eval/reports/public-bm25
 
+      - name: 运行公开离线生成 Guardrail Gate
+        working-directory: backend
+        env:
+          PYTHONPATH: ""
+          OPENAI_API_KEY: ""
+          KIMI_API_KEY: ""
+          MOONSHOT_API_KEY: ""
+          PAPERMIND_DATA_DIR: ""
+        run: python -m eval.generation_guardrails --report-dir eval/reports/public-generation
+
       - name: 上传评测报告
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: eval-reports
-          path: backend/eval/reports/
+          path: |
+            backend/eval/reports/public-count/
+            backend/eval/reports/public-bm25/
+            backend/eval/reports/public-generation/
           if-no-files-found: warn
           retention-days: 30

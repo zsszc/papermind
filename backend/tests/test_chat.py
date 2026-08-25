@@ -48,6 +48,44 @@ class TestRegenerate:
         assert resp.status_code == 200
         assert "new-answer" in resp.text
 
+    def test_regenerate_uses_same_atomic_citation_finalization(
+        self, client, db, conversation_with_pair, monkeypatch
+    ):
+        conv, am = conversation_with_pair
+        chunk = {
+            "source": "p1_c0", "paper_id": 1, "title": "合成文献",
+            "authors": "", "year": 2026, "page_number": 1, "content": "合成证据",
+        }
+
+        class FakePipeline:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def search(self, *args, **kwargs):
+                return [chunk]
+
+        async def fake_stream(messages, enable_web_search=False):
+            yield "新答案[^1^]越界[^9^]"
+
+        from .conftest import TestingSessionLocal
+
+        monkeypatch.setattr("app.routers.chat.RetrievalPipeline", FakePipeline)
+        monkeypatch.setattr("app.routers.chat.llm_service.chat_stream", fake_stream)
+        monkeypatch.setattr("app.database.SessionLocal", TestingSessionLocal)
+
+        resp = client.post(f"/api/chat/conversations/{conv.id}/messages/{am.id}/regenerate")
+        frames = [
+            json.loads(line[len("data: "):])
+            for line in resp.text.splitlines() if line.startswith("data: ")
+        ]
+
+        assert frames[-1]["content"] == "新答案[^1^]越界"
+        assert [item["source"] for item in frames[-1]["citations"]] == ["p1_c0"]
+        db.expire_all()
+        saved = db.query(Message).filter(Message.id == am.id).one()
+        assert saved.content == frames[-1]["content"]
+        assert saved.citations[0]["removed"] == 1
+
     def test_404_when_conversation_missing(self, client):
         resp = client.post("/api/chat/conversations/999/messages/1/regenerate")
         assert resp.status_code == 404
@@ -229,6 +267,29 @@ class TestGuardrailsIntegration:
         assert msg.content == answer
         assert msg.citations[0]["verified"] is True
         assert msg.citations[0]["removed"] == 0
+
+    def test_non_stream_uses_same_citation_finalization(self, client, monkeypatch):
+        chunk = self._chunk()
+        from app.services import agent_graph
+
+        async def fake_completion(messages):
+            return "同步答案[^1^]越界[^7^]"
+
+        store = SimpleNamespace(
+            available=lambda: True,
+            search=lambda query, top_k, filters: [chunk],
+        )
+        monkeypatch.setattr(agent_graph, "get_vector_store", lambda: store)
+        monkeypatch.setattr(
+            "app.routers.chat.llm_service.chat_completion", fake_completion
+        )
+
+        resp = client.post("/api/chat", json={"message": "MIL", "stream": False})
+
+        assert resp.status_code == 200
+        assert resp.json()["content"] == "同步答案[^1^]越界"
+        assert [item["source"] for item in resp.json()["citations"]] == ["p1_c0"]
+        assert resp.json()["verification"]["removed"] == 1
 
 
 class TestDeepReview:

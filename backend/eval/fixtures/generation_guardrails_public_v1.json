@@ -1,0 +1,62 @@
+{
+  "fixture_schema": "papermind-generation-guardrail-fixture-v1",
+  "benchmark_id": "papermind-generation-public-v1",
+  "license": "CC0-1.0",
+  "synthetic": true,
+  "description": "PaperMind 原创合成的生成引用与拒答契约基准，不含真实论文或私有问答。",
+  "cases": [
+    {
+      "case_id": "positive-single",
+      "has_answer": true,
+      "retrieved_chunks": [
+        {"chunk_id": "p101_c0", "source": "p101_c0", "paper_id": 101, "content": "合成材料甲的指标为四。"}
+      ],
+      "relevant_chunk_ids": ["p101_c0"],
+      "answer": "指标为四[^1^]。"
+    },
+    {
+      "case_id": "positive-second-ordinal",
+      "has_answer": true,
+      "retrieved_chunks": [
+        {"chunk_id": "p102_c0", "source": "p102_c0", "paper_id": 102, "content": "合成干扰片段。"},
+        {"chunk_id": "p103_c0", "source": "p103_c0", "paper_id": 103, "content": "合成材料乙描述了两阶段流程。"}
+      ],
+      "relevant_chunk_ids": ["p103_c0"],
+      "answer": "该流程分为两个阶段[^2^]。"
+    },
+    {
+      "case_id": "positive-multi-evidence",
+      "has_answer": true,
+      "retrieved_chunks": [
+        {"chunk_id": "p104_c0", "source": "p104_c0", "paper_id": 104, "content": "合成材料丙给出方法。"},
+        {"chunk_id": "p105_c0", "source": "p105_c0", "paper_id": 105, "content": "合成材料丁给出限制。"}
+      ],
+      "relevant_chunk_ids": ["p104_c0", "p105_c0"],
+      "answer": "方法由材料丙给出[^1^]，限制由材料丁说明[^2^]。"
+    },
+    {
+      "case_id": "positive-reordered",
+      "has_answer": true,
+      "retrieved_chunks": [
+        {"chunk_id": "p106_c0", "source": "p106_c0", "paper_id": 106, "content": "合成材料戊为非相关项。"},
+        {"chunk_id": "p107_c0", "source": "p107_c0", "paper_id": 107, "content": "合成材料己的结论为稳定。"}
+      ],
+      "relevant_chunk_ids": ["p107_c0"],
+      "answer": "合成结论为稳定[^2^]。"
+    },
+    {
+      "case_id": "negative-empty",
+      "has_answer": false,
+      "retrieved_chunks": [],
+      "relevant_chunk_ids": [],
+      "answer": "文献库中没有相关内容。"
+    },
+    {
+      "case_id": "negative-unanswerable",
+      "has_answer": false,
+      "retrieved_chunks": [],
+      "relevant_chunk_ids": [],
+      "answer": "未找到可支持该结论的文献，文献库中没有相关内容。"
+    }
+  ]
+}

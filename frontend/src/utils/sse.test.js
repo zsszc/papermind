@@ -37,7 +37,10 @@ describe('readSSEStream', () => {
 
     expect(onDelta.mock.calls.flat()).toEqual(['你', '好'])
     expect(onFinish).toHaveBeenCalledTimes(1)
-    expect(onFinish).toHaveBeenCalledWith([{ paper_id: 1 }])
+    expect(onFinish).toHaveBeenCalledWith(
+      [{ paper_id: 1 }],
+      expect.objectContaining({ finished: true }),
+    )
     expect(response.cancel).toHaveBeenCalledOnce()
     expect(response.releaseLock).toHaveBeenCalledOnce()
   })
@@ -147,6 +150,19 @@ describe('readSSEStream', () => {
 
     expect(onError).toHaveBeenCalledOnce()
     expect(onFinish).not.toHaveBeenCalled()
+  })
+
+  it('同一批次重复 finished 时仅接受首个终态', async () => {
+    const response = responseFromChunks([
+      'data: {"finished":true,"content":"first","citations":[]}\n\n' +
+      'data: {"finished":true,"content":"second","citations":[{"paper_id":2}]}\n\n',
+    ])
+    const onFinish = vi.fn()
+
+    await readSSEStream(response, vi.fn(), onFinish)
+
+    expect(onFinish).toHaveBeenCalledOnce()
+    expect(onFinish.mock.calls[0][1].content).toBe('first')
   })
 
   it('首事件超过预算时抛出可区分的超时并释放 reader', async () => {
