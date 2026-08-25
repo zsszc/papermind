@@ -574,6 +574,8 @@ def _rrf_fuse_chunks(
 # Batch 20：保留上述函数名作为下游兼容 API，但实际实现统一来自生产服务。
 # 这样旧测试/脚本无需改 import，聊天与 eval 又不会继续维护两套算法。
 from app.services.retrieval_pipeline import (  # noqa: E402
+    _ANCHOR_UNIT_TOKENS,
+    _TECHNICAL_TOKEN_RE,
     bm25_chunk_search as _bm25_chunk_search,
     keyword_chunk_search as _keyword_chunk_search,
     query_technical_terms as _query_technical_terms,
@@ -660,6 +662,49 @@ def weighted_rrf_contract_metadata(
         "rrf_k": 60,
         "formula_sha256": formula_sha,
         "configuration_sha256": _sha256_bytes(configuration_payload),
+    }
+
+
+def factoid_anchor_contract_metadata() -> Dict[str, Any]:
+    """返回 Batch 22I 冻结锚点提取与三路融合公式指纹。"""
+    formula = {
+        "algorithm": "hybrid-anchor-v1",
+        "token_regex": _TECHNICAL_TOKEN_RE.pattern,
+        "anchor_rules": {
+            "has_digit": True,
+            "acronym_letter_length": [2, 12],
+            "acronym_min_uppercase": 2,
+            "adjacent_ascii_units": sorted(_ANCHOR_UNIT_TOKENS),
+            "dedup": "first-seen-normalized-lowercase",
+            "source": "query-only",
+        },
+        "anchor_bm25": {
+            "bilingual": False,
+            "k1": 1.2,
+            "b": 0.9,
+            "route_limit_multiplier": 2,
+        },
+        "fusion": {
+            "rrf_k": 60,
+            "routes": ["semantic", "bm25-bilingual", "anchor-bm25"],
+            "weights": [1.0, 1.0, 1.0],
+            "rank_base": 1,
+            "duplicate_contribution": "repeat-and-occupy-rank",
+            "tie": "first-seen-then-chunk-id",
+            "metadata": "first-seen",
+            "missing_chunk_id": "canonical-source-fallback",
+            "no_anchor": "delegate-production-rrf",
+        },
+    }
+    payload = json.dumps(
+        formula, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return {
+        "algorithm": "hybrid-anchor-v1",
+        "route_limit_multiplier": 2,
+        "rrf_k": 60,
+        "formula_sha256": _sha256_bytes(payload),
+        "formula": formula,
     }
 
 
@@ -1204,6 +1249,7 @@ def run_eval(args: argparse.Namespace) -> int:
         parent_contract: Dict[str, Any] = {}
         vector_audit: Dict[str, Any] = {}
         weighted_contract: Dict[str, Any] = {}
+        anchor_contract: Dict[str, Any] = {}
         if (
             args.vector_dir
             and args.database
@@ -1251,6 +1297,11 @@ def run_eval(args: argparse.Namespace) -> int:
             )
             benchmark["weighted_rrf_formula_sha256"] = (
                 weighted_contract["formula_sha256"]
+            )
+        if args.retrieval_profile == "hybrid-anchor-v1":
+            anchor_contract = factoid_anchor_contract_metadata()
+            benchmark["factoid_anchor_formula_sha256"] = (
+                anchor_contract["formula_sha256"]
             )
         print(f"[eval] 检索模式: {retriever.mode}"
               + (f"（{retriever.degrade_reason}）" if retriever.degraded else ""))
@@ -1421,6 +1472,7 @@ def run_eval(args: argparse.Namespace) -> int:
             benchmark.get("hnsw_config_sha256", "none"),
             benchmark.get("hnsw_binary_manifest_sha256", "none"),
             benchmark.get("weighted_rrf_formula_sha256", "none"),
+            benchmark.get("factoid_anchor_formula_sha256", "none"),
             str(args.top_k),
         ))
         runtime_valid = retriever.runtime_degraded_count == 0
@@ -1467,6 +1519,7 @@ def run_eval(args: argparse.Namespace) -> int:
                 "top_k": args.top_k,
                 **({"parent_child": parent_contract} if parent_contract else {}),
                 **({"weighted_rrf": weighted_contract} if weighted_contract else {}),
+                **({"factoid_anchor": anchor_contract} if anchor_contract else {}),
             },
             "diagnostics": {
                 "unresolved_qrels": [],
@@ -1768,8 +1821,11 @@ def _validate_cli_args(args: argparse.Namespace) -> Optional[str]:
             return "hybrid-anchor-v1 必须使用 --evidence-resolver page-span-v2"
         if args.top_k != 5:
             return "hybrid-anchor-v1 必须使用 top-k=5"
-        if args.split not in {"train", "dev"}:
-            return "hybrid-anchor-v1 只允许 train/dev，禁止 holdout"
+        if args.split != "train":
+            return (
+                "hybrid-anchor-v1 通用评测只允许 train；"
+                "dev 必须经专用配对 Gate"
+            )
         if args.lexical_profile != "bm25-bilingual":
             return "hybrid-anchor-v1 必须使用 --lexical-profile bm25-bilingual"
         if args.qa_id or args.with_llm:

@@ -7,12 +7,14 @@ import copy
 import pytest
 
 from eval.factoid_anchor_gate import evaluate_anchor_train
+from eval.deterministic_vector_snapshot import _config_sha256
 from eval.paired_anchor_eval import evaluate_anchor_paired_routes
 from eval.run import factoid_anchor_contract_metadata
 
 
 def _paired_report() -> dict:
     contract = factoid_anchor_contract_metadata()
+    hnsw_config = _config_sha256(464)
     types = ("factoid", "summary", "method_detail", "experiment_data")
     items = []
     for index in range(24):
@@ -37,7 +39,7 @@ def _paired_report() -> dict:
             "candidate_ndcg": float(candidate_hit),
             "degraded": False,
         })
-    return {
+    report = {
         "report_schema": "factoid-anchor-paired-v1",
         "run": {"git_sha": "a" * 40, "git_tracked_clean": True},
         "benchmark": {
@@ -47,7 +49,7 @@ def _paired_report() -> dict:
             "database_logical_manifest_sha256": "3" * 64,
             "page_text_manifest_sha256": "4" * 64,
             "vector_manifest_sha256": "5" * 64,
-            "hnsw_config_sha256": "6" * 64,
+            "hnsw_config_sha256": hnsw_config,
             "hnsw_binary_manifest_sha256": "7" * 64,
             "resolver_version": "page-span-v2",
             "factoid_anchor_formula_sha256": contract["formula_sha256"],
@@ -62,6 +64,7 @@ def _paired_report() -> dict:
             "evidence_resolver": "page-span-v2",
             "top_k": 5,
             "route_limit": 10,
+            "semantic_rerank": False,
             "factoid_anchor": contract,
         },
         "snapshot": {
@@ -71,8 +74,11 @@ def _paired_report() -> dict:
             "extra_vector_ids": 0,
             "embedding_dimension": 1024,
             "vector_manifest_sha256": "5" * 64,
-            "hnsw_config_sha256": "6" * 64,
+            "hnsw_config_sha256": hnsw_config,
             "hnsw_binary_manifest_sha256": "7" * 64,
+            "hnsw_space": "cosine",
+            "hnsw_num_threads": 1,
+            "hnsw_search_ef": 464,
         },
         "baseline": {
             "runtime_degraded_count": 0,
