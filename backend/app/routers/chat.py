@@ -1,6 +1,7 @@
 import asyncio
 import importlib
 import json
+import threading
 from dataclasses import asdict, is_dataclass
 from typing import List, Optional
 
@@ -10,7 +11,13 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models import Conversation, MemorySummary, Message, Paper
-from app.schemas import ChatRequest, ConversationResponse, DeepReviewRequest, ImageAnalysisRequest
+from app.schemas import (
+    ChatRequest,
+    ConversationResponse,
+    DeepReviewRequest,
+    ImageAnalysisRequest,
+    RegenerateRequest,
+)
 from app.core.config import config
 from app.core.logger import logger
 from app.services.llm import LLMGenerationError, is_llm_error_response, llm_service
@@ -33,6 +40,22 @@ from app.services.agent_graph import (
 
 router = APIRouter()
 _GENERATION_ERROR_MESSAGE = "AI 服务暂时不可用，请稍后重试"
+_ACTIVE_REGENERATIONS: set[tuple[int, int]] = set()
+_ACTIVE_REGENERATIONS_LOCK = threading.Lock()
+
+
+def _claim_regeneration(key: tuple[int, int]) -> bool:
+    """进程内同目标只允许一个在途 regenerate，避免重复模型费用。"""
+    with _ACTIVE_REGENERATIONS_LOCK:
+        if key in _ACTIVE_REGENERATIONS:
+            return False
+        _ACTIVE_REGENERATIONS.add(key)
+        return True
+
+
+def _release_regeneration(key: tuple[int, int]) -> None:
+    with _ACTIVE_REGENERATIONS_LOCK:
+        _ACTIVE_REGENERATIONS.discard(key)
 
 
 # ---------- Phase F F2：深度综述长任务（SSE 帧与 Guardrails 复用 /api/chat 模式） ----------
@@ -135,7 +158,13 @@ def get_history(conversation_id: int, db: Session = Depends(get_db)):
     return {
         "conversation": conv,
         "messages": [
-            {"id": m.id, "role": m.role, "content": m.content, "citations": m.citations}
+            {
+                "id": m.id,
+                "role": m.role,
+                "content": m.content,
+                "citations": m.citations,
+                "revision": m.revision,
+            }
             for m in messages
         ],
     }
@@ -191,6 +220,7 @@ def delete_messages_from(
 async def regenerate_message(
     conversation_id: int,
     message_id: int,
+    request: RegenerateRequest,
     db: Session = Depends(get_db),
 ):
     conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
@@ -204,60 +234,77 @@ async def regenerate_message(
     )
     if not target_msg or target_msg.role != "assistant":
         raise HTTPException(status_code=404, detail="Assistant message not found")
+    if target_msg.revision != request.expected_revision:
+        raise HTTPException(status_code=409, detail="Message revision conflict")
 
-    all_messages = (
-        db.query(Message)
-        .filter(Message.conversation_id == conversation_id)
-        .order_by(Message.created_at.asc())
-        .all()
-    )
+    regeneration_key = (conversation_id, message_id)
+    if not _claim_regeneration(regeneration_key):
+        raise HTTPException(status_code=409, detail="Message regeneration already active")
 
-    target_index = None
-    for i, m in enumerate(all_messages):
-        if m.id == message_id:
-            target_index = i
-            break
-    if target_index is None or target_index == 0:
-        raise HTTPException(status_code=400, detail="No user message before this assistant message")
-
-    prev_user_msg = all_messages[target_index - 1]
-    if prev_user_msg.role != "user":
-        raise HTTPException(status_code=400, detail="Previous message is not a user message")
-
-    history_messages = all_messages[:target_index]
-    query = prev_user_msg.content
-
-    # 重新生成与主聊天共用同一检索策略，避免两条生产路径排序漂移。
-    retrieved = []
     try:
-        retrieved = RetrievalPipeline(
-            db, vector_store=get_vector_store()
-        ).search(
-            query,
-            top_k=5,
-            filters={},
-            profile=config.get("retrieval.chat_profile", "hybrid"),
-            lexical_profile=config.get(
-                "retrieval.lexical_profile", "bm25-bilingual"
-            ),
+        all_messages = (
+            db.query(Message)
+            .filter(Message.conversation_id == conversation_id)
+            .order_by(Message.created_at.asc())
+            .all()
         )
-    except Exception as e:
-        logger.error("[regenerate] 检索失败: %s", type(e).__name__)
+        target_index = next(
+            (i for i, message in enumerate(all_messages) if message.id == message_id),
+            None,
+        )
+        if target_index is None or target_index == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="No user message before this assistant message",
+            )
 
-    memory_mgr = MemoryManager(db)
-    memory_context = memory_mgr.build_memory_context()
-    system_content = SYSTEM_PROMPT
-    if memory_context:
-        system_content += f"\n\n以下是关于用户的背景记忆，请在回答时参考：\n\n{memory_context}"
+        prev_user_msg = all_messages[target_index - 1]
+        if prev_user_msg.role != "user":
+            raise HTTPException(
+                status_code=400,
+                detail="Previous message is not a user message",
+            )
 
-    messages = [{"role": "system", "content": system_content}]
-    for m in history_messages:
-        messages.append({"role": m.role, "content": m.content})
-    if retrieved:
-        rag_context = _build_rag_prompt(query, retrieved)
-        messages.append({"role": "system", "content": rag_context})
-    else:
-        messages[0]["content"] += f"\n\n{NO_RETRIEVAL_GUARD}"
+        history_messages = all_messages[:target_index]
+        query = prev_user_msg.content
+
+        # 重新生成与主聊天共用同一检索策略，避免两条生产路径排序漂移。
+        retrieved = []
+        try:
+            retrieved = RetrievalPipeline(
+                db, vector_store=get_vector_store()
+            ).search(
+                query,
+                top_k=5,
+                filters={},
+                profile=config.get("retrieval.chat_profile", "hybrid"),
+                lexical_profile=config.get(
+                    "retrieval.lexical_profile", "bm25-bilingual"
+                ),
+            )
+        except Exception as e:
+            logger.error("[regenerate] 检索失败: %s", type(e).__name__)
+
+        memory_mgr = MemoryManager(db)
+        memory_context = memory_mgr.build_memory_context()
+        system_content = SYSTEM_PROMPT
+        if memory_context:
+            system_content += f"\n\n以下是关于用户的背景记忆，请在回答时参考：\n\n{memory_context}"
+
+        messages = [{"role": "system", "content": system_content}]
+        for history_message in history_messages:
+            messages.append({
+                "role": history_message.role,
+                "content": history_message.content,
+            })
+        if retrieved:
+            rag_context = _build_rag_prompt(query, retrieved)
+            messages.append({"role": "system", "content": rag_context})
+        else:
+            messages[0]["content"] += f"\n\n{NO_RETRIEVAL_GUARD}"
+    except Exception:
+        _release_regeneration(regeneration_key)
+        raise
 
     async def event_stream():
         full_content = ""
@@ -305,20 +352,45 @@ async def regenerate_message(
                 "content": cleaned_content,
                 "citations": cited_chunks,
                 "verification": verification,
+                "revision": request.expected_revision + 1,
             })
 
-            # 正文与引用同一事务替换；目标并发消失时不得假成功。
+            # 正文、引用与 revision 条件更新；跨进程竞争或删除不得假成功。
             from app.database import SessionLocal
             with SessionLocal() as new_db:
-                msg = (
+                updated = (
                     new_db.query(Message)
-                    .filter(Message.id == message_id, Message.conversation_id == conversation_id)
-                    .first()
+                    .filter(
+                        Message.id == message_id,
+                        Message.conversation_id == conversation_id,
+                        Message.role == "assistant",
+                        Message.revision == request.expected_revision,
+                    )
+                    .update(
+                        {
+                            Message.content: cleaned_content,
+                            Message.citations: _stored_citations(
+                                cited_chunks, verification
+                            ),
+                            Message.revision: Message.revision + 1,
+                        },
+                        synchronize_session=False,
+                    )
                 )
-                if not msg:
-                    raise RuntimeError("regenerate_target_missing")
-                msg.content = cleaned_content
-                msg.citations = _stored_citations(cited_chunks, verification)
+                if updated != 1:
+                    exists = new_db.query(Message.id).filter(
+                        Message.id == message_id,
+                        Message.conversation_id == conversation_id,
+                        Message.role == "assistant",
+                    ).first()
+                    new_db.rollback()
+                    error_code = (
+                        "regenerate_conflict"
+                        if exists
+                        else "regenerate_target_missing"
+                    )
+                    yield _generation_error_frame(conversation_id, error_code)
+                    return
                 new_db.commit()
             yield finish_frame
         except Exception as e:
@@ -330,8 +402,15 @@ async def regenerate_message(
             )
             yield _generation_error_frame(conversation_id, "finalization_failed")
 
+    async def guarded_event_stream():
+        try:
+            async for frame in event_stream():
+                yield frame
+        finally:
+            _release_regeneration(regeneration_key)
+
     return StreamingResponse(
-        event_stream(),
+        guarded_event_stream(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -595,16 +674,15 @@ async def deep_review(request: DeepReviewRequest, db: Session = Depends(get_db))
         request.conversation_id,
         len(request.topic),
     )
-    if request.conversation_id:
-        conv = db.query(Conversation).filter(Conversation.id == request.conversation_id).first()
+    topic = request.topic.strip()
+    if not topic:
+        raise HTTPException(status_code=422, detail="topic 不能为空")
+
+    existing_conv_id = request.conversation_id
+    if existing_conv_id is not None:
+        conv = db.query(Conversation).filter(Conversation.id == existing_conv_id).first()
         if not conv:
             raise HTTPException(status_code=404, detail="Conversation not found")
-    else:
-        conv = Conversation(title=request.topic[:30] or "新对话", message_count=0)
-        db.add(conv)
-        db.commit()
-        db.refresh(conv)
-    conv_id = conv.id
 
     async def event_stream():
         try:
@@ -615,15 +693,19 @@ async def deep_review(request: DeepReviewRequest, db: Session = Depends(get_db))
 
             # 1) 规划：LLM 拆子问题；plan 失败 → 错误事件（spec 3.1）
             try:
-                questions = await svc.plan(request.topic)
+                questions = await svc.plan(topic)
             except Exception as e:
                 logger.error("[deep-review] 规划失败: %s", type(e).__name__)
-                yield _sse_frame({"error": "深度综述规划失败，请稍后重试"})
+                yield _sse_frame({
+                    "error": "深度综述规划失败，请稍后重试",
+                    "error_code": "deep_review_plan_failed",
+                    "conversation_id": existing_conv_id,
+                })
                 return
             yield _sse_frame({
                 "type": "plan",
                 "questions": [_jsonable(q) for q in questions],
-                "conversation_id": conv_id,
+                "conversation_id": existing_conv_id,
             })
             # 让出控制权，使客户端断开后能触发 CancelledError
             await asyncio.sleep(0)
@@ -632,7 +714,9 @@ async def deep_review(request: DeepReviewRequest, db: Session = Depends(get_db))
             sub_answers = []
             for q in questions:
                 try:
-                    sub_answers.append(await svc.execute(q, db=db))
+                    from app.database import SessionLocal
+                    with SessionLocal() as work_db:
+                        sub_answers.append(await svc.execute(q, db=work_db))
                 except Exception as e:
                     logger.error(
                         "[deep-review] 子问题执行失败，降级处理: %s",
@@ -646,15 +730,22 @@ async def deep_review(request: DeepReviewRequest, db: Session = Depends(get_db))
 
             # 3) 汇总：生成结构化综述；失败 → 错误事件
             try:
-                review = await svc.synthesize(request.topic, sub_answers)
+                review = await svc.synthesize(topic, sub_answers)
             except Exception as e:
                 logger.error("[deep-review] 汇总失败: %s", type(e).__name__)
-                yield _sse_frame({"error": "深度综述汇总失败，请稍后重试"})
+                yield _sse_frame({
+                    "error": "深度综述汇总失败，请稍后重试",
+                    "error_code": "deep_review_synthesis_failed",
+                    "conversation_id": existing_conv_id,
+                })
                 return
 
             full_content = review if isinstance(review, str) else (
                 _field(review, "content") or _field(review, "text") or ""
             )
+            if not isinstance(full_content, str) or not full_content.strip():
+                yield _generation_error_frame(existing_conv_id, "empty_generation")
+                return
             # 引用优先取 Review 汇总产物；缺省回退为各子答案引用聚合（兼容 citations/chunks 两种命名）；
             # 仅保留本地 chunk
             citations = _local_chunks(
@@ -670,55 +761,73 @@ async def deep_review(request: DeepReviewRequest, db: Session = Depends(get_db))
                 yield _sse_frame({
                     "delta": full_content[i:i + _REVIEW_DELTA_CHUNK_SIZE],
                     "finished": False,
-                    "conversation_id": conv_id,
+                    "conversation_id": existing_conv_id,
                 })
                 await asyncio.sleep(0)
 
-            # 5) 落库前 Guardrails 校验（复用 Phase C C1 模式），随后持久化用户/助手消息
-            if full_content.strip():
-                cleaned_content, verify_report = verify_citations(full_content, citations)
-                from app.database import SessionLocal
-                with SessionLocal() as new_db:
-                    conv_row = new_db.query(Conversation).filter(Conversation.id == conv_id).first()
-                    if conv_row:
-                        new_db.add(Message(
-                            conversation_id=conv_id,
-                            role="user",
-                            content=request.topic,
-                            citations=[],
-                        ))
-                        new_db.add(Message(
-                            conversation_id=conv_id,
-                            role="assistant",
-                            content=cleaned_content,
-                            citations=[{
-                                "source": _field(r, "source"),
-                                "paper_id": _field(r, "paper_id"),
-                                "title": _field(r, "title"),
-                                "authors": _field(r, "authors"),
-                                "year": _field(r, "year"),
-                                "page_number": _field(r, "page_number"),
-                                "content": _field(r, "content"),
-                                "verified": verify_report["verified"],
-                                "removed": verify_report["removed"],
-                            } for r in citations],
-                        ))
-                        conv_row.message_count = (conv_row.message_count or 0) + 2
-                        new_db.commit()
+            # 5) Guardrails 后正文仍须非空；成功时才在单一事务内创建/更新会话。
+            cleaned_content, verify_report = verify_citations(full_content, citations)
+            if not cleaned_content.strip():
+                yield _generation_error_frame(existing_conv_id, "empty_generation")
+                return
 
-            # 6) finished 尾帧（citations 为本地 chunk 原始形态，沿用 /api/chat 双形态约定）
-            yield _sse_frame({
-                "delta": "",
-                "finished": True,
-                "conversation_id": conv_id,
-                "content": cleaned_content if full_content.strip() else "",
-                "citations": [_jsonable(c) for c in citations],
-                "verification": _compat_verification(verify_report) if full_content.strip() else {
-                    "total": 0, "valid": 0, "removed": 0, "verified": True,
-                },
-            })
+            from app.database import SessionLocal
+            with SessionLocal() as new_db:
+                if existing_conv_id is None:
+                    conv_row = Conversation(title=topic[:30] or "新对话", message_count=0)
+                    new_db.add(conv_row)
+                    new_db.flush()
+                else:
+                    conv_row = new_db.query(Conversation).filter(
+                        Conversation.id == existing_conv_id
+                    ).first()
+                    if not conv_row:
+                        raise RuntimeError("conversation_missing")
+
+                committed_conv_id = conv_row.id
+                new_db.add(Message(
+                    conversation_id=committed_conv_id,
+                    role="user",
+                    content=topic,
+                    citations=[],
+                ))
+                new_db.add(Message(
+                    conversation_id=committed_conv_id,
+                    role="assistant",
+                    content=cleaned_content,
+                    citations=[{
+                        "source": _field(r, "source"),
+                        "paper_id": _field(r, "paper_id"),
+                        "title": _field(r, "title"),
+                        "authors": _field(r, "authors"),
+                        "year": _field(r, "year"),
+                        "page_number": _field(r, "page_number"),
+                        "content": _field(r, "content"),
+                        "verified": verify_report["verified"],
+                        "removed": verify_report["removed"],
+                    } for r in citations],
+                ))
+                new_db.flush()
+                conv_row.message_count = new_db.query(Message).filter(
+                    Message.conversation_id == committed_conv_id
+                ).count()
+                finish_frame = _sse_frame({
+                    "delta": "",
+                    "finished": True,
+                    "conversation_id": committed_conv_id,
+                    "content": cleaned_content,
+                    "citations": [_jsonable(c) for c in citations],
+                    "verification": _compat_verification(verify_report),
+                })
+                new_db.commit()
+
+            # 6) 只有提交完成后才发布成功终态。
+            yield finish_frame
         except asyncio.CancelledError:
-            logger.info(f"[deep-review] conversation {conv_id} streaming cancelled")
+            logger.info(
+                "[deep-review] conversation %s streaming cancelled",
+                existing_conv_id,
+            )
             return
         except Exception as e:
             # 兜底：任何未预期异常以带内错误帧收尾（脱敏，详情仅入日志，宪法第 13 条）

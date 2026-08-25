@@ -174,6 +174,12 @@ class DeepReviewRequest(BaseModel):
     conversation_id: Optional[int] = None
 
 
+class RegenerateRequest(BaseModel):
+    """重新生成请求：客户端必须声明其当前看到的消息版本。"""
+
+    expected_revision: int = Field(ge=0)
+
+
 class ImageAnalysisRequest(BaseModel):
     question: Optional[str] = "请描述这张图片的内容，并解释其在学术论文中可能的含义。"
 

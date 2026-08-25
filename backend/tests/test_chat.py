@@ -209,6 +209,110 @@ class TestRegenerate:
         assert saved.content == "外部较新答案"
         assert saved.citations[0]["source"] == "p9_c9"
 
+    def test_active_target_returns_409_before_llm(
+        self, client, conversation_with_pair, monkeypatch
+    ):
+        """同进程同目标已有任务时，第二请求直接冲突且不产生模型费用。"""
+        conv, am = conversation_with_pair
+        from app.routers.chat import _claim_regeneration, _release_regeneration
+
+        calls = {"llm": 0}
+
+        async def fake_stream(messages, enable_web_search=False):
+            calls["llm"] += 1
+            yield "不应调用"
+
+        monkeypatch.setattr("app.routers.chat.llm_service.chat_stream", fake_stream)
+        key = (conv.id, am.id)
+        assert _claim_regeneration(key) is True
+        try:
+            resp = client.post(
+                f"/api/chat/conversations/{conv.id}/messages/{am.id}/regenerate",
+                json={"expected_revision": 0},
+            )
+        finally:
+            _release_regeneration(key)
+
+        assert resp.status_code == 409
+        assert calls["llm"] == 0
+
+    def test_target_deleted_during_generation_is_not_recreated(
+        self, client, db, conversation_with_pair, monkeypatch
+    ):
+        """生成中目标被删除时返回明确终态，不复活消息、不发送 finished。"""
+        conv, am = conversation_with_pair
+        message_id = am.id
+        from .conftest import TestingSessionLocal
+
+        async def fake_stream(messages, enable_web_search=False):
+            with TestingSessionLocal() as other_db:
+                other_db.query(Message).filter(Message.id == message_id).delete()
+                other_db.commit()
+            yield "不得复活"
+
+        monkeypatch.setattr("app.routers.chat.llm_service.chat_stream", fake_stream)
+        monkeypatch.setattr(
+            "app.routers.chat.get_vector_store",
+            lambda: SimpleNamespace(available=lambda: False),
+        )
+        monkeypatch.setattr("app.database.SessionLocal", TestingSessionLocal)
+
+        resp = client.post(
+            f"/api/chat/conversations/{conv.id}/messages/{message_id}/regenerate",
+            json={"expected_revision": 0},
+        )
+        frames = self._frames(resp.text)
+
+        assert frames[-1]["error_code"] == "regenerate_target_missing"
+        assert not any(frame.get("finished") is True for frame in frames)
+        db.expire_all()
+        assert db.query(Message).filter(Message.id == message_id).first() is None
+
+    def test_error_terminal_releases_active_target(
+        self, client, conversation_with_pair, monkeypatch
+    ):
+        """失败终态必须释放 active-set，随后相同 revision 可安全重试。"""
+        conv, am = conversation_with_pair
+        calls = {"count": 0}
+
+        async def fake_stream(messages, enable_web_search=False):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                yield "\n[调用 LLM 出错: synthetic]"
+            else:
+                yield "第二次成功"
+
+        from .conftest import TestingSessionLocal
+
+        monkeypatch.setattr("app.routers.chat.llm_service.chat_stream", fake_stream)
+        monkeypatch.setattr(
+            "app.routers.chat.get_vector_store",
+            lambda: SimpleNamespace(available=lambda: False),
+        )
+        monkeypatch.setattr("app.database.SessionLocal", TestingSessionLocal)
+
+        first = client.post(
+            f"/api/chat/conversations/{conv.id}/messages/{am.id}/regenerate",
+            json={"expected_revision": 0},
+        )
+        second = client.post(
+            f"/api/chat/conversations/{conv.id}/messages/{am.id}/regenerate",
+            json={"expected_revision": 0},
+        )
+
+        assert self._frames(first.text)[-1]["error_code"] == "llm_generation_failed"
+        assert self._frames(second.text)[-1]["finished"] is True
+        assert calls["count"] == 2
+
+    def test_history_exposes_message_revision(self, client, conversation_with_pair):
+        """客户端对账所需 revision 必须随历史逐消息返回。"""
+        conv, am = conversation_with_pair
+        resp = client.get(f"/api/chat/conversations/{conv.id}/history")
+        assistant = next(
+            message for message in resp.json()["messages"] if message["id"] == am.id
+        )
+        assert assistant["revision"] == 0
+
     @staticmethod
     def _frames(resp_text):
         return [

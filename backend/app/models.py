@@ -104,6 +104,7 @@ class Message(Base):
     citations = Column(JSON, default=list)
     skill_used = Column(String(100), nullable=True)
     token_usage = Column(Integer, nullable=True)
+    revision = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
     conversation = relationship("Conversation", back_populates="messages")

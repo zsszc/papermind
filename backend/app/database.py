@@ -31,6 +31,7 @@ SCHEMA_MIGRATIONS = {
         "citations": ("JSON", "'[]'"),
         "skill_used": ("VARCHAR(100)", None),
         "token_usage": ("INTEGER", None),
+        "revision": ("INTEGER NOT NULL", 0),
     },
 }
 
