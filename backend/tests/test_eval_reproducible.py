@@ -250,7 +250,9 @@ def test_corpus_fingerprint_does_not_depend_on_database_paper_id(db, tmp_path):
     db.add(paper)
     db.add(Chunk(paper_id=9, chunk_index=0, content="same content"))
     db.commit()
-    first = run._build_benchmark_metadata(db, dataset)["corpus_manifest_sha256"]
+    first_metadata = run._build_benchmark_metadata(db, dataset)
+    first = first_metadata["corpus_manifest_sha256"]
+    assert first_metadata["database_logical_manifest_sha256"] == first
 
     db.query(Chunk).delete()
     db.query(Paper).delete()

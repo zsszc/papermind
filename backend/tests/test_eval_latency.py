@@ -192,6 +192,9 @@ class TestRunReportLatency:
         assert report["report_schema"] == "2.0"
         assert len(report["benchmark"]["dataset_sha256"]) == 64
         assert len(report["benchmark"]["corpus_manifest_sha256"]) == 64
+        assert report["benchmark"]["database_logical_manifest_sha256"] == (
+            report["benchmark"]["corpus_manifest_sha256"]
+        )
         assert report["benchmark"]["n_chunks"] == 2
         assert report["pipeline"]["top_k"] == 5
         assert report["diagnostics"]["unresolved_qrels"] == []
