@@ -25,10 +25,17 @@ class VectorStore:
             path=str(self.vector_dir),
             settings=Settings(anonymized_telemetry=False),
         )
-        self.collection = self.client.get_or_create_collection(
-            name="papers",
-            metadata={"hnsw:space": "cosine"},
-        )
+        try:
+            # Chroma 0.4.24 的 get_or_create 在已有 collection 上仍会用传入
+            # metadata 覆盖原值；这会抹掉离线审计后冻结的 HNSW 参数。
+            self.collection = self.client.get_collection("papers")
+        except ValueError as exc:
+            if str(exc) != "Collection papers does not exist.":
+                raise
+            self.collection = self.client.create_collection(
+                name="papers",
+                metadata={"hnsw:space": "cosine"},
+            )
         self.embedding_service = EmbeddingService()
 
     def available(self) -> bool:
