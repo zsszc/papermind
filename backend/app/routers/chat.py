@@ -832,7 +832,9 @@ async def deep_review(request: DeepReviewRequest, db: Session = Depends(get_db))
         except Exception as e:
             # 兜底：任何未预期异常以带内错误帧收尾（脱敏，详情仅入日志，宪法第 13 条）
             logger.error("[deep-review] 未预期异常: %s", type(e).__name__)
-            yield _sse_frame({"error": "深度综述任务失败，请稍后重试"})
+            yield _generation_error_frame(
+                existing_conv_id, "finalization_failed"
+            )
             return
 
     return StreamingResponse(
