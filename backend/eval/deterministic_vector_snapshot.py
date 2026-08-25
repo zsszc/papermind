@@ -154,22 +154,87 @@ def audit_hnsw_sqlite_metadata(snapshot_dir: Path) -> dict[str, Any]:
     }
 
 
-def _hnsw_binary_manifest(snapshot_dir: Path, segment_id: str) -> str:
-    segment_dir = snapshot_dir / segment_id
-    if not segment_dir.is_dir():
-        raise ValueError(f"HNSW 二进制目录不存在: {segment_id}")
-    files = sorted(path for path in segment_dir.rglob("*") if path.is_file())
-    if not files:
-        raise ValueError("HNSW 二进制目录为空")
+def _hash_named_files(segment_dir: Path, names: list[str]) -> str:
     digest = hashlib.sha256()
-    for path in files:
-        relative = path.relative_to(segment_dir).as_posix().encode("utf-8")
+    for name in names:
+        path = segment_dir / name
+        if not path.is_file():
+            raise ValueError(f"HNSW 二进制文件不存在: {name}")
         content = path.read_bytes()
-        digest.update(relative)
+        digest.update(name.encode("utf-8"))
         digest.update(b"\0")
         digest.update(len(content).to_bytes(8, "little"))
         digest.update(content)
     return digest.hexdigest()
+
+
+def _hnsw_binary_manifests(
+    snapshot_dir: Path, segment_id: str
+) -> dict[str, Any]:
+    """区分稳定 HNSW 结构与 Chroma 运行时重写的 length.bin。"""
+    segment_dir = snapshot_dir / segment_id
+    if not segment_dir.is_dir():
+        raise ValueError(f"HNSW 二进制目录不存在: {segment_id}")
+    expected = {
+        "data_level0.bin", "header.bin", "length.bin", "link_lists.bin"
+    }
+    actual = {
+        path.relative_to(segment_dir).as_posix()
+        for path in segment_dir.rglob("*") if path.is_file()
+    }
+    if actual != expected:
+        raise ValueError("HNSW 二进制文件集合不符合冻结契约")
+    structural = sorted(expected - {"length.bin"})
+    return {
+        "hnsw_binary_manifest_sha256": _hash_named_files(
+            segment_dir, structural
+        ),
+        "hnsw_full_binary_manifest_sha256": _hash_named_files(
+            segment_dir, sorted(expected)
+        ),
+        "hnsw_structural_files": structural,
+        "hnsw_volatile_files": ["length.bin"],
+    }
+
+
+def read_raw_snapshot_manifest(snapshot_dir: Path) -> dict[str, Any]:
+    """不初始化 Chroma client，读取不会改写源目录的原始快照指纹。"""
+    snapshot_dir = Path(snapshot_dir).resolve()
+    audit = audit_hnsw_sqlite_metadata(snapshot_dir)
+    database = snapshot_dir / "chroma.sqlite3"
+    connection = sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True)
+    try:
+        ids = [str(row[0]) for row in connection.execute(
+            "SELECT embedding_id FROM embeddings WHERE segment_id = ? ORDER BY embedding_id",
+            (audit["metadata_segment_id"],),
+        ).fetchall()]
+        collection_columns = {
+            str(row[1]) for row in connection.execute(
+                "PRAGMA table_info(collections)"
+            ).fetchall()
+        }
+        dimension = None
+        if "dimension" in collection_columns:
+            row = connection.execute(
+                "SELECT dimension FROM collections WHERE id = ?",
+                (audit["collection_id"],),
+            ).fetchone()
+            dimension = row[0] if row else None
+    finally:
+        connection.close()
+    if len(ids) != len(set(ids)) or len(ids) != audit["vector_count"]:
+        raise ValueError("papers embedding ID 数量或唯一性审计失败")
+    id_payload = json.dumps(ids, ensure_ascii=False, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    return {
+        **audit,
+        "embedding_dimension": dimension,
+        "embedding_id_manifest_sha256": hashlib.sha256(id_payload).hexdigest(),
+        **_hnsw_binary_manifests(
+            snapshot_dir, audit["vector_segment_id"]
+        ),
+    }
 
 
 def read_vector_snapshot_manifest(snapshot_dir: Path) -> dict[str, Any]:
@@ -178,7 +243,7 @@ def read_vector_snapshot_manifest(snapshot_dir: Path) -> dict[str, Any]:
     from chromadb.config import Settings
 
     snapshot_dir = Path(snapshot_dir).resolve()
-    audit = audit_hnsw_sqlite_metadata(snapshot_dir)
+    raw_before = read_raw_snapshot_manifest(snapshot_dir)
     client = chromadb.PersistentClient(
         path=str(snapshot_dir),
         settings=Settings(anonymized_telemetry=False),
@@ -191,7 +256,10 @@ def read_vector_snapshot_manifest(snapshot_dir: Path) -> dict[str, Any]:
         embeddings = []
     if len(vector_ids) != len(set(vector_ids)):
         raise ValueError("Chroma 存在重复向量 ID")
-    if len(vector_ids) != audit["vector_count"] or len(embeddings) != len(vector_ids):
+    if (
+        len(vector_ids) != raw_before["vector_count"]
+        or len(embeddings) != len(vector_ids)
+    ):
         raise ValueError("Chroma API 与 SQLite 的向量数量不一致")
     dimensions = {len(embedding) for embedding in embeddings}
     if dimensions != {1024}:
@@ -211,12 +279,19 @@ def read_vector_snapshot_manifest(snapshot_dir: Path) -> dict[str, Any]:
     )
     if not (smoke.get("ids") or [[]])[0]:
         raise ValueError("Chroma query smoke 未返回结果")
+    raw_after = read_raw_snapshot_manifest(snapshot_dir)
+    if (
+        raw_before["hnsw_binary_manifest_sha256"]
+        != raw_after["hnsw_binary_manifest_sha256"]
+    ):
+        raise ValueError("Chroma 打开后 HNSW 结构文件发生变化")
     return {
-        **audit,
+        **raw_after,
         "embedding_dimension": next(iter(dimensions)),
         "vector_manifest_sha256": digest.hexdigest(),
-        "hnsw_binary_manifest_sha256": _hnsw_binary_manifest(
-            snapshot_dir, audit["vector_segment_id"]
+        "hnsw_runtime_file_rewritten": (
+            raw_before["hnsw_full_binary_manifest_sha256"]
+            != raw_after["hnsw_full_binary_manifest_sha256"]
         ),
         "query_smoke": "ok",
     }
@@ -252,6 +327,16 @@ def _same_vector_payload(left: dict[str, Any], right: dict[str, Any]) -> bool:
     return all(left.get(key) == right.get(key) for key in keys)
 
 
+def _same_raw_payload(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    keys = (
+        "vector_count",
+        "embedding_dimension",
+        "embedding_id_manifest_sha256",
+        "hnsw_binary_manifest_sha256",
+    )
+    return all(left.get(key) == right.get(key) for key in keys)
+
+
 def _require_deterministic_hnsw(manifest: dict[str, Any]) -> None:
     count = manifest.get("vector_count")
     if (
@@ -268,6 +353,7 @@ def build_deterministic_snapshot(
     target: Path,
     *,
     manifest_reader: ManifestReader | None = None,
+    expected_vector_manifest_sha256: str | None = None,
 ) -> dict[str, object]:
     """离线复制快照，只修改 stage 元数据并验证内容完全不变。"""
     source_input = Path(source)
@@ -285,8 +371,12 @@ def build_deterministic_snapshot(
     if target.is_relative_to(source):
         raise ValueError("目标不能位于源快照内部")
 
-    reader = manifest_reader or read_vector_snapshot_manifest
-    source_before = reader(source)
+    if manifest_reader is None and not expected_vector_manifest_sha256:
+        raise ValueError("真实快照构建必须提供预期 embedding 向量指纹")
+    source_before = (
+        manifest_reader(source)
+        if manifest_reader else read_raw_snapshot_manifest(source)
+    )
     target.parent.mkdir(parents=True, exist_ok=True)
     stage = target.parent / f".{target.name}.stage-{uuid.uuid4().hex}"
     try:
@@ -349,12 +439,28 @@ def build_deterministic_snapshot(
         finally:
             connection.close()
 
-        source_after = reader(source)
-        stage_manifest = reader(stage)
-        if not _same_vector_payload(source_before, source_after):
-            raise ValueError("复制期间源快照发生变化，拒绝生成候选")
-        if not _same_vector_payload(source_before, stage_manifest):
-            raise ValueError("候选向量内容指纹或 HNSW 二进制指纹发生变化")
+        if manifest_reader:
+            source_after = manifest_reader(source)
+            stage_manifest = manifest_reader(stage)
+            if not _same_vector_payload(source_before, source_after):
+                raise ValueError("复制期间源快照发生变化，拒绝生成候选")
+            if not _same_vector_payload(source_before, stage_manifest):
+                raise ValueError("候选向量内容指纹或 HNSW 二进制指纹发生变化")
+        else:
+            stage_raw_before = read_raw_snapshot_manifest(stage)
+            source_after = read_raw_snapshot_manifest(source)
+            if source_before != source_after:
+                raise ValueError("复制期间源快照发生变化，拒绝生成候选")
+            if not _same_raw_payload(source_before, stage_raw_before):
+                raise ValueError("候选 ID、维度或 HNSW 结构指纹发生变化")
+            stage_manifest = read_vector_snapshot_manifest(stage)
+            if not _same_raw_payload(source_before, stage_manifest):
+                raise ValueError("候选复检后 ID、维度或 HNSW 结构发生变化")
+            if (
+                stage_manifest["vector_manifest_sha256"]
+                != expected_vector_manifest_sha256
+            ):
+                raise ValueError("候选向量内容指纹与预期不一致")
         _require_deterministic_hnsw(stage_manifest)
         os.replace(stage, target)
     except Exception:
@@ -405,22 +511,37 @@ def activate_deterministic_snapshot(
     if failed_dir.exists() or backup_dir.exists():
         raise FileExistsError("激活备份或失败隔离目录已存在")
 
-    reader = manifest_reader or read_vector_snapshot_manifest
-    stage_manifest = reader(stage)
-    target_manifest = reader(target)
+    stage_manifest = (
+        manifest_reader(stage)
+        if manifest_reader else read_vector_snapshot_manifest(stage)
+    )
+    target_manifest = (
+        manifest_reader(target)
+        if manifest_reader else read_raw_snapshot_manifest(target)
+    )
     if stage_manifest.get("vector_manifest_sha256") != expected_vector_manifest_sha256:
         raise ValueError("stage 向量内容指纹与预期不一致")
-    if target_manifest.get("vector_manifest_sha256") != expected_vector_manifest_sha256:
-        raise ValueError("当前生产向量内容指纹与预期不一致")
-    if not _same_vector_payload(stage_manifest, target_manifest):
-        raise ValueError("stage 与当前生产向量内容或 HNSW 二进制不一致")
+    if manifest_reader:
+        if (
+            target_manifest.get("vector_manifest_sha256")
+            != expected_vector_manifest_sha256
+        ):
+            raise ValueError("当前生产向量内容指纹与预期不一致")
+        same_payload = _same_vector_payload(stage_manifest, target_manifest)
+    else:
+        same_payload = _same_raw_payload(stage_manifest, target_manifest)
+    if not same_payload:
+        raise ValueError("stage 与当前生产向量内容或 HNSW 结构不一致")
     _require_deterministic_hnsw(stage_manifest)
 
     backup = activate_staged_vector_store(stage, target, suffix=suffix)
     if backup != backup_dir:
         raise RuntimeError("激活函数返回了非预期备份目录")
     try:
-        activated_manifest = reader(target)
+        activated_manifest = (
+            manifest_reader(target)
+            if manifest_reader else read_vector_snapshot_manifest(target)
+        )
         if not _same_vector_payload(stage_manifest, activated_manifest):
             raise ValueError("激活后向量或 HNSW 二进制复检失败")
         _require_deterministic_hnsw(activated_manifest)
@@ -448,12 +569,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--source", required=True)
     parser.add_argument("--target", required=True)
+    parser.add_argument(
+        "--expected-vector-sha256",
+        required=True,
+        help="来自已审计生产报告的 embedding 向量内容 SHA256",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    result = build_deterministic_snapshot(Path(args.source), Path(args.target))
+    result = build_deterministic_snapshot(
+        Path(args.source),
+        Path(args.target),
+        expected_vector_manifest_sha256=args.expected_vector_sha256,
+    )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
