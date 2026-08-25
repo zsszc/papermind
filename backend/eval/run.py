@@ -136,6 +136,22 @@ def _git_sha() -> Optional[str]:
     return completed.stdout.strip() or None
 
 
+def _git_tracked_clean() -> Optional[bool]:
+    """报告当前提交是否没有未提交的 tracked 变更。"""
+    try:
+        completed = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            cwd=Path(__file__).resolve().parents[2],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return not bool(completed.stdout.strip())
+
+
 def _manifest_chunk_paper_uid(chunk: Any, uid_by_id: Dict[int, str]) -> str:
     """返回 manifest 中 chunk 的稳定论文身份。
 
@@ -195,6 +211,7 @@ def _build_benchmark_metadata(
     return {
         "dataset_sha256": _sha256_bytes(dataset_path.read_bytes()),
         "corpus_manifest_sha256": _sha256_bytes(manifest_bytes),
+        "database_logical_manifest_sha256": _sha256_bytes(manifest_bytes),
         "n_papers": len(papers),
         "n_chunks": len(chunks),
     }
@@ -694,7 +711,7 @@ def _audit_vector_snapshot(db, store) -> Dict[str, Any]:
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8"))
-    return {
+    result = {
         "database_chunk_count": len(database_ids),
         "vector_count": len(vector_ids),
         "missing_vector_ids": len(missing),
@@ -705,6 +722,34 @@ def _audit_vector_snapshot(db, store) -> Dict[str, Any]:
         "hnsw_search_ef": hnsw_search_ef,
         "hnsw_config_sha256": hnsw_sha,
     }
+    vector_dir = getattr(store, "vector_dir", None)
+    if vector_dir and (Path(vector_dir) / "chroma.sqlite3").is_file():
+        from eval.deterministic_vector_snapshot import (
+            read_raw_snapshot_manifest,
+        )
+
+        raw = read_raw_snapshot_manifest(Path(vector_dir))
+        if (
+            raw["vector_count"] != result["vector_count"]
+            or raw["embedding_dimension"] != result["embedding_dimension"]
+            or raw["hnsw_config_sha256"] != result["hnsw_config_sha256"]
+        ):
+            raise ValueError("Chroma API 与原始 SQLite/HNSW 审计不一致")
+        result.update({
+            "hnsw_space": raw["hnsw_space"],
+            "hnsw_binary_manifest_sha256": raw[
+                "hnsw_binary_manifest_sha256"
+            ],
+            "hnsw_full_binary_manifest_sha256": raw[
+                "hnsw_full_binary_manifest_sha256"
+            ],
+            "embedding_id_manifest_sha256": raw[
+                "embedding_id_manifest_sha256"
+            ],
+            "collection_metadata": raw["collection_metadata"],
+            "segment_metadata": raw["segment_metadata"],
+        })
+    return result
 
 
 def _audit_parent_child_snapshot(db, store, parent_db, parent_map) -> Dict[str, Any]:
@@ -1169,6 +1214,10 @@ def run_eval(args: argparse.Namespace) -> int:
             benchmark["hnsw_config_sha256"] = (
                 vector_audit["hnsw_config_sha256"]
             )
+            if vector_audit.get("hnsw_binary_manifest_sha256"):
+                benchmark["hnsw_binary_manifest_sha256"] = (
+                    vector_audit["hnsw_binary_manifest_sha256"]
+                )
         if args.retrieval_profile == "parent-child-v1":
             if retriever._store is None:
                 print("[eval] Parent-Child 向量快照不可用", file=sys.stderr)
@@ -1355,6 +1404,7 @@ def run_eval(args: argparse.Namespace) -> int:
             benchmark["dataset_sha256"],
             benchmark["qrels_sha256"],
             benchmark["corpus_manifest_sha256"],
+            benchmark["database_logical_manifest_sha256"],
             retriever.mode,
             args.lexical_profile,
             args.evidence_resolver,
@@ -1363,6 +1413,7 @@ def run_eval(args: argparse.Namespace) -> int:
             benchmark.get("parent_child_contract_sha256", "none"),
             benchmark.get("vector_manifest_sha256", "none"),
             benchmark.get("hnsw_config_sha256", "none"),
+            benchmark.get("hnsw_binary_manifest_sha256", "none"),
             benchmark.get("weighted_rrf_formula_sha256", "none"),
             str(args.top_k),
         ))
@@ -1393,6 +1444,7 @@ def run_eval(args: argparse.Namespace) -> int:
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "run": {
                 "git_sha": _git_sha(),
+                "git_tracked_clean": _git_tracked_clean(),
                 "python": platform.python_version(),
             },
             "benchmark": {
