@@ -9,18 +9,41 @@ import sys
 from pathlib import Path
 
 
-FIXTURE = Path("eval/fixtures/failure_transactions_public_v1.json")
+FIXTURE_V1 = Path("eval/fixtures/failure_transactions_public_v1.json")
+FIXTURE = Path("eval/fixtures/failure_transactions_public_v2.json")
 
 
 def test_public_fixture_is_synthetic_and_has_unique_scenarios():
     fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
-    assert fixture["fixture_schema"] == "papermind-failure-transactions-fixture-v1"
-    assert fixture["benchmark_id"] == "papermind-failure-transactions-public-v1"
+    assert fixture["fixture_schema"] == "papermind-failure-transactions-fixture-v2"
+    assert fixture["benchmark_id"] == "papermind-failure-transactions-public-v2"
     assert fixture["license"] == "CC0-1.0"
     assert fixture["synthetic"] is True
     ids = [item["scenario_id"] for item in fixture["scenarios"]]
-    assert len(ids) == 7
+    assert len(ids) == 11
     assert len(ids) == len(set(ids))
+    assert ids[-4:] == [
+        "regenerate-active-second-request",
+        "regenerate-external-revision-conflict",
+        "regenerate-external-delete",
+        "regenerate-cancel-release-retry",
+    ]
+    assert all("expected_error_code" in item for item in fixture["scenarios"])
+
+
+def test_v1_fixture_remains_frozen():
+    fixture = json.loads(FIXTURE_V1.read_text(encoding="utf-8"))
+    assert fixture["fixture_schema"] == "papermind-failure-transactions-fixture-v1"
+    assert fixture["benchmark_id"] == "papermind-failure-transactions-public-v1"
+    assert [item["scenario_id"] for item in fixture["scenarios"]] == [
+        "chat-success-control",
+        "chat-stream-failure",
+        "chat-cancelled",
+        "chat-assistant-commit-failure",
+        "deep-review-plan-failure",
+        "deep-review-commit-failure",
+        "regenerate-commit-failure",
+    ]
 
 
 def test_gate_fails_closed_when_any_counter_is_nonzero():
@@ -64,16 +87,21 @@ def test_cli_runs_in_clean_subprocess_and_publishes_content_free_report(tmp_path
 
     assert result.returncode == 0, result.stderr
     assert untrusted_runtime.exists() is False
-    report_path = report_dir / "failure_transactions_public_v1.json"
+    report_path = report_dir / "failure_transactions_public_v2.json"
     first_bytes = report_path.read_bytes()
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    assert report["report_schema"] == "papermind-failure-transactions-report-v1"
+    assert report["report_schema"] == "papermind-failure-transactions-report-v2"
     assert report["gate"]["passed"] is True
-    assert len(report["scenarios"]) == 7
+    assert len(report["scenarios"]) == 11
     assert report["offline_proof"] == {
-        "fake_llm_calls": 5,
-        "fake_retrieval_calls": 6,
+        "fake_llm_calls": 10,
+        "fake_retrieval_calls": 11,
         "fake_deep_review_calls": 4,
+        "request_count": 14,
+        "peer_request_count": 2,
+        "retry_request_count": 1,
+        "external_commit_count": 2,
+        "coordinated_scenario_count": 3,
         "network_attempts": 0,
         "subprocess_attempts": 0,
         "private_path_attempts": 0,
@@ -106,7 +134,7 @@ def test_report_schema_rejects_unknown_or_content_fields():
     from eval.failure_transactions import validate_public_report
 
     invalid = {
-        "report_schema": "papermind-failure-transactions-report-v1",
+        "report_schema": "papermind-failure-transactions-report-v2",
         "question": "synthetic-question",
     }
     try:
