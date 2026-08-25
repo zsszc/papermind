@@ -254,6 +254,63 @@ describe('ChatPanel operation lifecycle', () => {
     )
   })
 
+  it('旧会话迟到对账不得覆盖已切换的新会话', async () => {
+    apiMocks.listConversations.mockResolvedValue({
+      data: [
+        { id: 5, title: '旧会话', message_count: 2 },
+        { id: 6, title: '目标会话', message_count: 2 },
+      ],
+    })
+    let resolveOldReconcile
+    const oldReconcile = new Promise((resolve) => {
+      resolveOldReconcile = resolve
+    })
+    let oldCalls = 0
+    apiMocks.getHistory.mockImplementation((id) => {
+      if (id === 5 && oldCalls++ === 0) {
+        return Promise.resolve({
+          data: { messages: [
+            { id: 1, role: 'user', content: '旧问题', citations: [], revision: 0 },
+            { id: 2, role: 'assistant', content: '旧回答', citations: [], revision: 0 },
+          ] },
+        })
+      }
+      if (id === 5) return oldReconcile
+      return Promise.resolve({
+        data: { messages: [
+          { id: 3, role: 'user', content: '新问题', citations: [], revision: 0 },
+          { id: 4, role: 'assistant', content: '新会话回答', citations: [], revision: 0 },
+        ] },
+      })
+    })
+    apiMocks.regenerateMessage.mockResolvedValue(responseFromEvents([
+      { error: '版本冲突', error_code: 'regenerate_conflict' },
+    ]))
+    render(<ChatPanel fullHeight />)
+
+    fireEvent.click(screen.getByRole('button', { name: /历史/ }))
+    fireEvent.click(await screen.findByText('旧会话'))
+    await screen.findByText('旧回答')
+    fireEvent.click(screen.getByLabelText('reload').closest('button'))
+    await waitFor(() => expect(apiMocks.getHistory).toHaveBeenCalledTimes(2))
+
+    fireEvent.click(screen.getByRole('button', { name: /历史/ }))
+    fireEvent.click(await screen.findByText('目标会话'))
+    expect(await screen.findByText('新会话回答')).toBeInTheDocument()
+
+    resolveOldReconcile({
+      data: { messages: [
+        { id: 1, role: 'user', content: '旧问题', citations: [], revision: 0 },
+        { id: 2, role: 'assistant', content: '迟到旧回答', citations: [], revision: 1 },
+      ] },
+    })
+    await waitFor(() => {
+      expect(screen.getByLabelText('reload').closest('button')).not.toBeDisabled()
+    })
+    expect(screen.getByText('新会话回答')).toBeInTheDocument()
+    expect(document.body.textContent).not.toContain('迟到旧回答')
+  })
+
   it('finished 缺少 content 时丢弃 provisional 并按协议失败', async () => {
     apiMocks.apiFetch.mockResolvedValue(responseFromEvents([
       { delta: '不完整的半条回答', finished: false },

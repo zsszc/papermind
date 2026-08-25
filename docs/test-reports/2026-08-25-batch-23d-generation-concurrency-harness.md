@@ -41,7 +41,7 @@ messages 新增从 0 开始的 `revision`。regenerate 请求声明 `expected_re
 | Harness | 结果 |
 |---|---|
 | 后端 pytest | **907 passed** |
-| 前端 Vitest | **54 passed / 14 files** |
+| 前端 Vitest | **55 passed / 14 files** |
 | 前端 ESLint | 0 warnings |
 | 前端生产构建 | PASS（保留既有大 chunk 提示） |
 | Electron node:test | **26 passed** |
