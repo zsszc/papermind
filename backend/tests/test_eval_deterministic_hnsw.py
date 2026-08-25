@@ -8,6 +8,8 @@ from eval.deterministic_hnsw_gate import (
     evaluate_paired_dev,
     evaluate_train_repeatability,
 )
+from eval.deterministic_vector_snapshot import _config_sha256
+from eval.paired_hnsw_eval import evaluate_paired_retrieval
 
 
 def _items(prefix="p"):
@@ -31,7 +33,7 @@ def _train_report():
             "database_logical_manifest_sha256": "3" * 64,
             "page_text_manifest_sha256": "4" * 64,
             "vector_manifest_sha256": "5" * 64,
-            "hnsw_config_sha256": "6" * 64,
+            "hnsw_config_sha256": _config_sha256(464),
             "hnsw_binary_manifest_sha256": "7" * 64,
             "resolver_version": "page-span-v2",
         },
@@ -55,7 +57,7 @@ def _train_report():
                 "hnsw_binary_manifest_sha256": "7" * 64,
                 "hnsw_num_threads": 1,
                 "hnsw_search_ef": 464,
-                "hnsw_config_sha256": "6" * 64,
+                "hnsw_config_sha256": _config_sha256(464),
                 "hnsw_space": "cosine",
             },
         },
@@ -201,3 +203,41 @@ def test_paired_dev_rejects_holdout_or_snapshot_mismatch():
     report["candidate"]["vector_manifest_sha256"] = "0" * 64
     with pytest.raises(ValueError, match="向量"):
         evaluate_paired_dev(report)
+
+
+def test_paired_harness_queries_both_snapshots_in_one_item_traversal():
+    items = [
+        {
+            "qa_id": f"q{index:02d}",
+            "question": f"private question {index}",
+            "question_type": "factoid" if index < 6 else "summary",
+            "has_answer": True,
+        }
+        for index in range(24)
+    ]
+    resolved = {item["qa_id"]: [f"p{index}_c0"] for index, item in enumerate(items)}
+
+    class FakeRetriever:
+        def __init__(self, hit):
+            self.hit = hit
+            self.calls = []
+            self.runtime_degraded_count = 0
+            self.last_query_degraded = False
+
+        def search(self, question):
+            self.calls.append(question)
+            index = int(question.rsplit(" ", 1)[1])
+            chunk_id = f"p{index}_c0" if self.hit(index) else "miss_c0"
+            return [{"chunk_id": chunk_id}]
+
+    baseline = FakeRetriever(lambda index: index >= 6)
+    candidate = FakeRetriever(lambda index: True)
+    paired = evaluate_paired_retrieval(
+        items, resolved, baseline, candidate, top_k=5
+    )
+
+    assert baseline.calls == [item["question"] for item in items]
+    assert candidate.calls == baseline.calls
+    assert paired["baseline"]["overall"]["factoid_recall"] == 0.0
+    assert paired["candidate"]["overall"]["factoid_recall"] == 1.0
+    assert all("question" not in item for item in paired["items"])
