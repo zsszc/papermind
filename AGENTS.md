@@ -192,7 +192,7 @@ cd ../electron && npm run build    # 产物在 frontend/out/（dmg/zip/exe）
 
 ## 8. 测试与评测
 
-### 单元/集成测试（pytest，820 个用例）
+### 单元/集成测试（pytest，834 个用例）
 
 ```bash
 cd backend
@@ -209,7 +209,7 @@ cd ../electron && npm test       # node:test（health / wait / restart / kill �
 ```
 
 前端测试依赖包含 MSW，新增网络交互测试不得连接真实后端；Electron 生命周期与安全策略纯模块不得
-`require('electron')`，确保 CI 无 GUI 也能运行。当前后端 820 个测试、前端 39 个测试、Electron 26 个测试。
+`require('electron')`，确保 CI 无 GUI 也能运行。当前后端 834 个测试、前端 39 个测试、Electron 26 个测试。
 
 ### RAG 评测（backend/eval/）
 
@@ -223,7 +223,8 @@ env -u PYTHONPATH venv/bin/python -m eval.run \
   --keyword-only --lexical-profile bm25 --threshold 0.85      # 公开离线 Gate
 # 构建不改 embedding 内容的确定性 HNSW 评测副本（目标必须不存在）
 env -u PYTHONPATH venv/bin/python -m eval.deterministic_vector_snapshot \
-  --source eval/private/source-vector --target eval/private/deterministic-vector
+  --source eval/private/source-vector --target eval/private/deterministic-vector \
+  --expected-vector-sha256 <已审计的64位embedding内容SHA>
 ```
 
 - `eval/dataset/qa_seed.jsonl`：25 条种子 QA（含 3 条幻觉负例），schema 见 `eval/dataset/README.md`
@@ -234,7 +235,7 @@ env -u PYTHONPATH venv/bin/python -m eval.deterministic_vector_snapshot \
 - `eval/private/` 为已忽略的真实语料评测目录；v1 共 72 条已审 QA / 18 篇论文，train/dev/holdout 各 24 条，证据 72/72 唯一解析
 - **真实库留出基线**：BM25 Recall@5/MRR/NDCG@5 为 0.542/0.308/0.365；中英术语扩展为 0.583/0.353/0.410
 - **生产聊天当前 shared hybrid（private dev）**：显式 464-chunk 快照，Recall@5/MRR/NDCG@5 为 0.625/0.39375/0.4517186825，factoid Recall=0.333，P95=275.7ms、零降级；聊天与 eval 有逐项排序 parity Harness。该结果只用于开发诊断，不替代 holdout
-- **Batch 22G 确定性 HNSW train 诊断**：默认低 `search_ef` 的独立进程 production 双跑只有 21/24 top-5 一致；隔离副本固定 `hnsw:num_threads=1`、`hnsw:search_ef=464` 后双跑 24/24，Recall@5/MRR/NDCG@5=0.667/0.424/0.485、factoid=0.500、P95≈327ms。仅为 Batch 22H 生产候选证据，尚未激活到主 `vector_db/`
+- **Batch 22H 确定性 HNSW 候选未晋级**：隔离候选 train 独立双跑 24/24 top-5 完全一致，Recall/factoid/MRR/NDCG=`0.667/0.500/0.424/0.485`、P95=344/365ms；同一次问题遍历的 dev 基线/候选质量完全相同（`0.625/0.333/0.39375/0.45172`），候选 P95=244.6ms。因没有任何严格质量提升，按 Gate 未激活，生产 `vector_db/` 仍保持默认 HNSW。Chroma 0.4.24 打开默认 HNSW 会重写 `length.bin`，首次查询还可能重写 `data_level0.bin` 运行时区域；比较必须在 client 打开前冻结原始文件指纹，打开后以 ID/维度/embedding SHA/双层元数据/query smoke 判定语义完整性
 - **Batch 21 邻域候选未晋级**：`hybrid-local-neighbor`（semantic top20、同论文 ±2、固定 rank-distance 衰减）dev 为 0.625/0.36389/0.43005，factoid 仍 0.333、P95=270.1ms；MRR/NDCG/factoid Gate 失败，生产默认保持 shared hybrid。候选仅供显式复现
 - **Batch 22 双语 v2 未进入 dev**：`bm25-bilingual-v2` 仅新增四条病理术语映射，train 质量与 v1 完全相同（0.66667/0.42361/0.48529，factoid=0.50），未达到至少新增 1 题的 Gate，因此按预案跳过 dev；生产继续使用 `bm25-bilingual`
 - **Batch 22B 消费者已收敛**：聊天、重新生成、深度综述、论文引用推荐和 eval 的 chunk RAG 都经共享 `RetrievalPipeline`；论文引用零证据时跳过 LLM，显式单篇论文范围禁止 graph 越界，论文发现页语义异常保留 FTS 结果
@@ -290,4 +291,4 @@ env -u PYTHONPATH venv/bin/python -m eval.deterministic_vector_snapshot \
 
 ---
 
-> 最后更新：2026-08-25，Batch 22G 兼容加权网格与确定性 HNSW Harness 完成后同步。
+> 最后更新：2026-08-25，Batch 22H 确定性 HNSW 生产候选评测完成后同步。
