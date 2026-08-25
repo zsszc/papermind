@@ -31,6 +31,8 @@ CANARY = "synthetic-secret-canary"
 
 _VIOLATION_KEYS = (
     "scenario_count_mismatch",
+    "scenario_failure_count",
+    "active_regeneration_leak_count",
     "success_control_failure_count",
     "fake_call_contract_mismatch",
     "finished_on_failure_count",
@@ -56,7 +58,33 @@ _FAKE_SERVICE_MODULES = (
     "app.services.image_analyzer",
     "app.services.skills",
     "app.services.agent_graph",
+    "app.services.deep_review",
 )
+_FORBIDDEN_REAL_MODULE_PREFIXES = (
+    "app.main",
+    "app.services.embedding",
+    "app.services.web_search",
+    "openai",
+    "chromadb",
+    "sentence_transformers",
+    "torch",
+    "transformers",
+    "tokenizers",
+    "langfuse",
+)
+_FIXTURE_SCENARIO_KEYS = {
+    "scenario_id",
+    "operation",
+    "failure",
+    "expected_terminal",
+    "expected_http_status",
+    "expected_llm_calls",
+    "expected_retrieval_calls",
+    "expected_deep_review_calls",
+    "expected_conversations",
+    "expected_messages",
+    "expected_assistants",
+}
 _REPORT_KEYS = {
     "report_schema",
     "benchmark_id",
@@ -64,6 +92,7 @@ _REPORT_KEYS = {
     "synthetic",
     "fixture_sha256",
     "runner_sha256",
+    "implementation_sha256",
     "scenario_count",
     "scenarios",
     "overall",
@@ -79,6 +108,19 @@ _SCENARIO_REPORT_KEYS = {
     "finished_count",
     "db_invariants_passed",
     "fake_calls",
+    "fake_llm_calls",
+    "fake_retrieval_calls",
+    "fake_deep_review_calls",
+    "http_status",
+}
+_EXPECTED_SCENARIOS = {
+    "chat-success-control": ("chat", "none", "finished", 200, 1, 1, 0, 1, 2, 1),
+    "chat-stream-failure": ("chat", "stream", "error", 200, 1, 1, 0, 1, 1, 0),
+    "chat-cancelled": ("chat", "cancel", "none", 200, 1, 1, 0, 1, 1, 0),
+    "chat-assistant-commit-failure": ("chat", "commit", "error", 200, 1, 1, 0, 1, 1, 0),
+    "deep-review-plan-failure": ("deep-review", "plan", "error", 200, 0, 0, 1, 0, 0, 0),
+    "deep-review-commit-failure": ("deep-review", "commit", "error", 200, 0, 1, 3, 0, 0, 0),
+    "regenerate-commit-failure": ("regenerate", "commit", "error", 200, 1, 1, 0, 1, 2, 1),
 }
 
 
@@ -113,12 +155,18 @@ def validate_public_report(report: dict[str, Any]) -> None:
     if set(report.get("overall") or {}) != set(_VIOLATION_KEYS):
         raise ValueError("失败事务 overall schema 不兼容")
     if set(report.get("offline_proof") or {}) != {
+        "fake_llm_calls",
+        "fake_retrieval_calls",
+        "fake_deep_review_calls",
         "network_attempts",
         "subprocess_attempts",
         "private_path_attempts",
         "real_service_module_count",
     }:
         raise ValueError("失败事务离线证明 schema 不兼容")
+    expected_gate = build_failure_transaction_gate(report["overall"])
+    if report.get("gate") != expected_gate:
+        raise ValueError("失败事务 Gate 与 overall 不一致")
 
     rendered = json.dumps(report, ensure_ascii=False, sort_keys=True)
     forbidden_tokens = (
@@ -150,6 +198,37 @@ def _load_fixture() -> tuple[dict[str, Any], bytes]:
         raise ValueError("失败事务 fixture scenarios 不得为空")
     if any(not isinstance(item, str) or not item for item in ids) or len(ids) != len(set(ids)):
         raise ValueError("失败事务 scenario_id 必须唯一")
+    if ids != list(_EXPECTED_SCENARIOS):
+        raise ValueError("失败事务 fixture 场景集合或顺序已漂移")
+    for scenario in scenarios:
+        if set(scenario) != _FIXTURE_SCENARIO_KEYS:
+            raise ValueError("失败事务 fixture 场景 schema 不兼容")
+        contract = (
+            scenario["operation"],
+            scenario["failure"],
+            scenario["expected_terminal"],
+            scenario["expected_http_status"],
+            scenario["expected_llm_calls"],
+            scenario["expected_retrieval_calls"],
+            scenario["expected_deep_review_calls"],
+            scenario["expected_conversations"],
+            scenario["expected_messages"],
+            scenario["expected_assistants"],
+        )
+        if contract != _EXPECTED_SCENARIOS[scenario["scenario_id"]]:
+            raise ValueError("失败事务 fixture 场景契约已漂移")
+        for key in (
+            "expected_http_status",
+            "expected_llm_calls",
+            "expected_retrieval_calls",
+            "expected_deep_review_calls",
+            "expected_conversations",
+            "expected_messages",
+            "expected_assistants",
+        ):
+            value = scenario[key]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError("失败事务 fixture 计数必须是非负整数")
     return fixture, fixture_bytes
 
 
@@ -163,6 +242,12 @@ def _prepare_environment(runtime_root: Path) -> None:
         "MOONSHOT_API_KEY",
         "LANGFUSE_PUBLIC_KEY",
         "LANGFUSE_SECRET_KEY",
+        "PAPERMIND_LANGFUSE_PUBLIC_KEY",
+        "PAPERMIND_LANGFUSE_SECRET_KEY",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
     ):
         os.environ.pop(key, None)
 
@@ -242,7 +327,9 @@ def _install_audit(runtime_root: Path) -> dict[str, int]:
 
 class _HarnessState:
     scenario_id = ""
-    fake_calls = 0
+    llm_calls = 0
+    retrieval_calls = 0
+    deep_review_calls = 0
 
 
 def _fake_module(name: str, **attributes: object) -> types.ModuleType:
@@ -262,7 +349,7 @@ def _install_fake_services() -> None:
 
     class FakeLLM:
         async def chat_stream(self, messages, enable_web_search=False):
-            _HarnessState.fake_calls += 1
+            _HarnessState.llm_calls += 1
             yield "synthetic-answer"
             if _HarnessState.scenario_id == "chat-stream-failure":
                 raise RuntimeError(CANARY)
@@ -270,7 +357,7 @@ def _install_fake_services() -> None:
                 raise asyncio.CancelledError()
 
         async def chat_completion(self, messages):
-            _HarnessState.fake_calls += 1
+            _HarnessState.llm_calls += 1
             return "synthetic-answer"
 
     def is_llm_error_response(value: object) -> bool:
@@ -292,6 +379,7 @@ def _install_fake_services() -> None:
             pass
 
         def search(self, *args, **kwargs):
+            _HarnessState.retrieval_calls += 1
             return []
 
     _fake_module("app.services.retrieval_pipeline", RetrievalPipeline=FakePipeline)
@@ -316,6 +404,7 @@ def _install_fake_services() -> None:
     def run_pre_orchestration(db, conversation_id, user_message, **kwargs):
         from app.models import Message
 
+        _HarnessState.retrieval_calls += 1
         total = db.query(Message).filter(Message.conversation_id == conversation_id).count()
         return {
             "messages": [{"role": "user", "content": user_message}],
@@ -334,17 +423,18 @@ def _install_fake_services() -> None:
     )
 
     async def deep_plan(topic):
-        _HarnessState.fake_calls += 1
+        _HarnessState.deep_review_calls += 1
         if _HarnessState.scenario_id == "deep-review-plan-failure":
             raise RuntimeError(CANARY)
         return ["synthetic-subquestion"]
 
     async def deep_execute(question, db=None):
-        _HarnessState.fake_calls += 1
+        _HarnessState.deep_review_calls += 1
+        _HarnessState.retrieval_calls += 1
         return {"question": question, "answer": "synthetic-subanswer", "citations": []}
 
     async def deep_synthesize(topic, sub_answers):
-        _HarnessState.fake_calls += 1
+        _HarnessState.deep_review_calls += 1
         return {"content": "synthetic-answer", "citations": []}
 
     _fake_module(
@@ -368,7 +458,12 @@ def _scenario_database(db_path: Path, fail_final_commit: bool):
     from sqlalchemy.orm import Session, sessionmaker
     from sqlalchemy.pool import NullPool
 
-    connection_ids: set[int] = set()
+    connection_trace = {"count": 0}
+    fault_trace = {
+        "commit_attempts": 0,
+        "injections": 0,
+        "write_transactions": 0,
+    }
     engine = create_engine(
         f"sqlite:///{db_path}",
         connect_args={"check_same_thread": False},
@@ -377,7 +472,7 @@ def _scenario_database(db_path: Path, fail_final_commit: bool):
 
     @event.listens_for(engine, "connect")
     def configure(dbapi_connection, connection_record):
-        connection_ids.add(id(dbapi_connection))
+        connection_trace["count"] += 1
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA foreign_keys=ON")
         cursor.execute("PRAGMA busy_timeout=5000")
@@ -390,7 +485,10 @@ def _scenario_database(db_path: Path, fail_final_commit: bool):
 
     class FailingSession(Session):
         def commit(self):
+            fault_trace["commit_attempts"] += 1
             if fail_final_commit:
+                fault_trace["write_transactions"] += int(self.in_transaction())
+                fault_trace["injections"] += 1
                 raise RuntimeError(CANARY)
             return super().commit()
 
@@ -401,7 +499,7 @@ def _scenario_database(db_path: Path, fail_final_commit: bool):
         bind=engine,
         class_=FailingSession if fail_final_commit else Session,
     )
-    return engine, normal, finalizer, connection_ids
+    return engine, normal, finalizer, connection_trace, fault_trace
 
 
 def _run_scenario(
@@ -417,12 +515,18 @@ def _run_scenario(
 
     scenario_id = scenario["scenario_id"]
     _HarnessState.scenario_id = scenario_id
-    _HarnessState.fake_calls = 0
+    _HarnessState.llm_calls = 0
+    _HarnessState.retrieval_calls = 0
+    _HarnessState.deep_review_calls = 0
     fail_commit = scenario["failure"] == "commit"
     db_path = runtime_root / f"{scenario_id}.sqlite3"
-    engine, NormalSession, FinalizerSession, connection_ids = _scenario_database(
-        db_path, fail_commit
-    )
+    (
+        engine,
+        NormalSession,
+        FinalizerSession,
+        connection_trace,
+        fault_trace,
+    ) = _scenario_database(db_path, fail_commit)
     Base.metadata.create_all(bind=engine)
     database_module.SessionLocal = FinalizerSession
 
@@ -476,7 +580,12 @@ def _run_scenario(
             json={"expected_revision": 0},
         )
     frames = _parse_frames(response.text)
-    terminals = [frame for frame in frames if frame.get("finished") is True or "error" in frame]
+    terminal_indexes = [
+        index
+        for index, frame in enumerate(frames)
+        if frame.get("finished") is True or "error" in frame
+    ]
+    terminals = [frames[index] for index in terminal_indexes]
     finished_count = sum(frame.get("finished") is True for frame in frames)
 
     with NormalSession() as verify_db:
@@ -502,17 +611,78 @@ def _run_scenario(
         and len(assistants) == scenario["expected_assistants"]
         and count_mismatches == 0
     )
-    terminal_ok = (
-        finished_count == 1 and len(terminals) == 1
-        if is_success
-        else finished_count == 0 and len(terminals) <= 1
+    actual_terminal = (
+        "finished"
+        if finished_count == 1 and len(terminals) == 1
+        else "error"
+        if finished_count == 0 and len(terminals) == 1 and "error" in terminals[0]
+        else "none"
+        if len(terminals) == 0
+        else "invalid"
     )
-    fake_ok = _HarnessState.fake_calls == scenario["expected_llm_calls"]
+    terminal_ok = actual_terminal == scenario["expected_terminal"]
+    fake_ok = (
+        _HarnessState.llm_calls == scenario["expected_llm_calls"]
+        and _HarnessState.retrieval_calls == scenario["expected_retrieval_calls"]
+        and _HarnessState.deep_review_calls == scenario["expected_deep_review_calls"]
+    )
+    fault_ok = (
+        fault_trace == {
+            "commit_attempts": 1,
+            "injections": 1,
+            "write_transactions": 1,
+        }
+        if fail_commit
+        else fault_trace == {
+            "commit_attempts": 0,
+            "injections": 0,
+            "write_transactions": 0,
+        }
+    )
+    active_leak = int(
+        scenario["operation"] == "regenerate"
+        and bool(chat._ACTIVE_REGENERATIONS)
+    )
+    if active_leak:
+        chat._ACTIVE_REGENERATIONS.clear()
     response_clean = CANARY not in response.text and "Traceback" not in response.text
-    passed = db_ok and terminal_ok and fake_ok and response_clean and len(connection_ids) >= 2
+    terminal_last = not terminal_indexes or terminal_indexes[-1] == len(frames) - 1
+    allowed_errors = {
+        "AI 服务暂时不可用，请稍后重试",
+        "深度综述规划失败，请稍后重试",
+        "深度综述任务失败，请稍后重试",
+    }
+    error_payload_ok = all(
+        set(frame) <= {"error", "error_code", "conversation_id"}
+        and frame.get("error") in allowed_errors
+        for frame in terminals
+        if "error" in frame
+    )
+    success_payload_ok = True
+    if is_success:
+        success_payload_ok = bool(
+            terminals
+            and assistants
+            and terminals[0].get("content") == assistants[-1].content
+        )
+    passed = (
+        db_ok
+        and terminal_ok
+        and fake_ok
+        and fault_ok
+        and response.status_code == scenario["expected_http_status"]
+        and response_clean
+        and terminal_last
+        and error_payload_ok
+        and success_payload_ok
+        and connection_trace["count"] >= 2
+        and active_leak == 0
+    )
 
     violations = {
         "success_control_failure_count": int(is_success and not passed),
+        "scenario_failure_count": int(not passed),
+        "active_regeneration_leak_count": active_leak,
         "fake_call_contract_mismatch": int(not fake_ok),
         "finished_on_failure_count": 0 if is_success else finished_count,
         "multiple_terminal_count": max(0, len(terminals) - 1),
@@ -537,7 +707,15 @@ def _run_scenario(
         "terminal_count": len(terminals),
         "finished_count": finished_count,
         "db_invariants_passed": db_ok,
-        "fake_calls": _HarnessState.fake_calls,
+        "fake_calls": (
+            _HarnessState.llm_calls
+            + _HarnessState.retrieval_calls
+            + _HarnessState.deep_review_calls
+        ),
+        "fake_llm_calls": _HarnessState.llm_calls,
+        "fake_retrieval_calls": _HarnessState.retrieval_calls,
+        "fake_deep_review_calls": _HarnessState.deep_review_calls,
+        "http_status": response.status_code,
     }
     engine.dispose()
     return report, violations
@@ -576,21 +754,56 @@ def run_public_failure_transactions(report_dir: Path) -> tuple[dict[str, Any], P
             if name in sys.modules
             and not getattr(sys.modules[name], "_PAPERMIND_HARNESS_FAKE", False)
         ]
+        real_modules.extend(
+            name
+            for name in sys.modules
+            if any(
+                name == prefix or name.startswith(prefix + ".")
+                for prefix in _FORBIDDEN_REAL_MODULE_PREFIXES
+            )
+        )
+        real_modules = sorted(set(real_modules))
         aggregate["network_attempts"] = audit["network_attempts"]
         aggregate["subprocess_attempts"] = audit["subprocess_attempts"]
         aggregate["private_path_attempts"] = audit["private_path_attempts"]
         aggregate["real_service_module_count"] = len(real_modules)
 
         log_path = runtime_root / "logs" / "app.log"
+        log_text = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
         aggregate["log_canary_leak_count"] = int(
-            log_path.exists() and CANARY in log_path.read_text(encoding="utf-8")
+            any(
+                token in log_text
+                for token in (CANARY, "synthetic-question", "synthetic-answer", "Traceback")
+            )
         )
         offline_proof = {
+            "fake_llm_calls": sum(
+                item["fake_llm_calls"] for item in scenario_reports
+            ),
+            "fake_retrieval_calls": sum(
+                item["fake_retrieval_calls"] for item in scenario_reports
+            ),
+            "fake_deep_review_calls": sum(
+                item["fake_deep_review_calls"] for item in scenario_reports
+            ),
             "network_attempts": audit["network_attempts"],
             "subprocess_attempts": audit["subprocess_attempts"],
             "private_path_attempts": audit["private_path_attempts"],
             "real_service_module_count": len(real_modules),
         }
+        implementation_paths = (
+            PROJECT_ROOT / "backend" / "app" / "routers" / "chat.py",
+            PROJECT_ROOT / "backend" / "app" / "database.py",
+            PROJECT_ROOT / "backend" / "app" / "models.py",
+            PROJECT_ROOT / "backend" / "app" / "schemas.py",
+        )
+        implementation_bytes = b"".join(
+            path.relative_to(PROJECT_ROOT).as_posix().encode("utf-8")
+            + b"\0"
+            + path.read_bytes()
+            + b"\0"
+            for path in implementation_paths
+        )
         report = {
             "report_schema": REPORT_SCHEMA,
             "benchmark_id": BENCHMARK_ID,
@@ -598,6 +811,7 @@ def run_public_failure_transactions(report_dir: Path) -> tuple[dict[str, Any], P
             "synthetic": True,
             "fixture_sha256": _sha256(fixture_bytes),
             "runner_sha256": _sha256(MODULE_PATH.read_bytes()),
+            "implementation_sha256": _sha256(implementation_bytes),
             "scenario_count": len(scenario_reports),
             "scenarios": scenario_reports,
             "overall": aggregate,

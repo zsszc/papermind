@@ -123,16 +123,6 @@ jobs:
           --threshold 0.85
           --report-dir eval/reports/public-bm25
 
-      - name: 运行公开离线生成 Guardrail Gate
-        working-directory: backend
-        env:
-          PYTHONPATH: ""
-          OPENAI_API_KEY: ""
-          KIMI_API_KEY: ""
-          MOONSHOT_API_KEY: ""
-          PAPERMIND_DATA_DIR: ""
-        run: python -m eval.generation_guardrails --report-dir eval/reports/public-generation
-
       - name: 运行独立进程失败事务 Gate
         working-directory: backend
         env:
@@ -156,7 +146,40 @@ jobs:
           path: |
             backend/eval/reports/public-count/
             backend/eval/reports/public-bm25/
-            backend/eval/reports/public-generation/
             backend/eval/reports/public-failure-transactions/
           if-no-files-found: warn
+          retention-days: 30
+
+  public-generation-offline:
+    name: 公开生成 Guardrail（纯标准库）
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 运行纯标准库生成 Gate
+        working-directory: backend
+        env:
+          PYTHONPATH: ""
+          PYTHONNOUSERSITE: "1"
+          OPENAI_API_KEY: ""
+          KIMI_API_KEY: ""
+          MOONSHOT_API_KEY: ""
+          PAPERMIND_DATA_DIR: ""
+        run: >-
+          python -S -m eval.generation_guardrails
+          --report-dir eval/reports/public-generation
+
+      - name: 上传生成报告
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: generation-guardrail-report
+          path: backend/eval/reports/public-generation/
+          if-no-files-found: error
           retention-days: 30

@@ -4,12 +4,12 @@
   "license": "CC0-1.0",
   "synthetic": true,
   "scenarios": [
-    {"scenario_id": "chat-success-control", "operation": "chat", "failure": "none", "expected_llm_calls": 1, "expected_conversations": 1, "expected_messages": 2, "expected_assistants": 1},
-    {"scenario_id": "chat-stream-failure", "operation": "chat", "failure": "stream", "expected_llm_calls": 1, "expected_conversations": 1, "expected_messages": 1, "expected_assistants": 0},
-    {"scenario_id": "chat-cancelled", "operation": "chat", "failure": "cancel", "expected_llm_calls": 1, "expected_conversations": 1, "expected_messages": 1, "expected_assistants": 0},
-    {"scenario_id": "chat-assistant-commit-failure", "operation": "chat", "failure": "commit", "expected_llm_calls": 1, "expected_conversations": 1, "expected_messages": 1, "expected_assistants": 0},
-    {"scenario_id": "deep-review-plan-failure", "operation": "deep-review", "failure": "plan", "expected_llm_calls": 1, "expected_conversations": 0, "expected_messages": 0, "expected_assistants": 0},
-    {"scenario_id": "deep-review-commit-failure", "operation": "deep-review", "failure": "commit", "expected_llm_calls": 3, "expected_conversations": 0, "expected_messages": 0, "expected_assistants": 0},
-    {"scenario_id": "regenerate-commit-failure", "operation": "regenerate", "failure": "commit", "expected_llm_calls": 1, "expected_conversations": 1, "expected_messages": 2, "expected_assistants": 1}
+    {"scenario_id": "chat-success-control", "operation": "chat", "failure": "none", "expected_terminal": "finished", "expected_http_status": 200, "expected_llm_calls": 1, "expected_retrieval_calls": 1, "expected_deep_review_calls": 0, "expected_conversations": 1, "expected_messages": 2, "expected_assistants": 1},
+    {"scenario_id": "chat-stream-failure", "operation": "chat", "failure": "stream", "expected_terminal": "error", "expected_http_status": 200, "expected_llm_calls": 1, "expected_retrieval_calls": 1, "expected_deep_review_calls": 0, "expected_conversations": 1, "expected_messages": 1, "expected_assistants": 0},
+    {"scenario_id": "chat-cancelled", "operation": "chat", "failure": "cancel", "expected_terminal": "none", "expected_http_status": 200, "expected_llm_calls": 1, "expected_retrieval_calls": 1, "expected_deep_review_calls": 0, "expected_conversations": 1, "expected_messages": 1, "expected_assistants": 0},
+    {"scenario_id": "chat-assistant-commit-failure", "operation": "chat", "failure": "commit", "expected_terminal": "error", "expected_http_status": 200, "expected_llm_calls": 1, "expected_retrieval_calls": 1, "expected_deep_review_calls": 0, "expected_conversations": 1, "expected_messages": 1, "expected_assistants": 0},
+    {"scenario_id": "deep-review-plan-failure", "operation": "deep-review", "failure": "plan", "expected_terminal": "error", "expected_http_status": 200, "expected_llm_calls": 0, "expected_retrieval_calls": 0, "expected_deep_review_calls": 1, "expected_conversations": 0, "expected_messages": 0, "expected_assistants": 0},
+    {"scenario_id": "deep-review-commit-failure", "operation": "deep-review", "failure": "commit", "expected_terminal": "error", "expected_http_status": 200, "expected_llm_calls": 0, "expected_retrieval_calls": 1, "expected_deep_review_calls": 3, "expected_conversations": 0, "expected_messages": 0, "expected_assistants": 0},
+    {"scenario_id": "regenerate-commit-failure", "operation": "regenerate", "failure": "commit", "expected_terminal": "error", "expected_http_status": 200, "expected_llm_calls": 1, "expected_retrieval_calls": 1, "expected_deep_review_calls": 0, "expected_conversations": 1, "expected_messages": 2, "expected_assistants": 1}
   ]
 }

@@ -71,6 +71,9 @@ def test_cli_runs_in_clean_subprocess_and_publishes_content_free_report(tmp_path
     assert report["gate"]["passed"] is True
     assert len(report["scenarios"]) == 7
     assert report["offline_proof"] == {
+        "fake_llm_calls": 5,
+        "fake_retrieval_calls": 6,
+        "fake_deep_review_calls": 4,
         "network_attempts": 0,
         "subprocess_attempts": 0,
         "private_path_attempts": 0,
