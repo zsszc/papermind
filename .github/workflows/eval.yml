@@ -18,9 +18,13 @@ on:
       - "backend/app/services/generation_guardrails.py"
       - "backend/app/services/llm.py"
       - "backend/app/routers/chat.py"
+      - "backend/app/database.py"
+      - "backend/app/models.py"
+      - "backend/app/schemas.py"
       - "backend/tests/test_chat.py"
       - "backend/tests/test_eval_*.py"
       - "backend/tests/test_generation_guardrails_offline.py"
+      - "backend/tests/test_failure_transactions_offline.py"
       - "frontend/src/utils/sse.js"
       - "frontend/src/utils/sse.test.js"
       - "frontend/src/components/ChatPanel.jsx"
@@ -33,9 +37,13 @@ on:
       - "backend/app/services/generation_guardrails.py"
       - "backend/app/services/llm.py"
       - "backend/app/routers/chat.py"
+      - "backend/app/database.py"
+      - "backend/app/models.py"
+      - "backend/app/schemas.py"
       - "backend/tests/test_chat.py"
       - "backend/tests/test_eval_*.py"
       - "backend/tests/test_generation_guardrails_offline.py"
+      - "backend/tests/test_failure_transactions_offline.py"
       - "frontend/src/utils/sse.js"
       - "frontend/src/utils/sse.test.js"
       - "frontend/src/components/ChatPanel.jsx"
@@ -71,6 +79,7 @@ jobs:
           tests/test_eval_*.py
           tests/test_dataset.py
           tests/test_generation_guardrails_offline.py
+          tests/test_failure_transactions_offline.py
           -q
 
       - name: 安装 Node.js 22
@@ -124,6 +133,20 @@ jobs:
           PAPERMIND_DATA_DIR: ""
         run: python -m eval.generation_guardrails --report-dir eval/reports/public-generation
 
+      - name: 运行独立进程失败事务 Gate
+        working-directory: backend
+        env:
+          PYTHONPATH: ""
+          OPENAI_API_KEY: ""
+          KIMI_API_KEY: ""
+          MOONSHOT_API_KEY: ""
+          LANGFUSE_PUBLIC_KEY: ""
+          LANGFUSE_SECRET_KEY: ""
+          PAPERMIND_DATA_DIR: ""
+        run: >-
+          python -m eval.failure_transactions
+          --report-dir eval/reports/public-failure-transactions
+
       - name: 上传评测报告
         # 失败中的半成品可能尚未通过报告 schema/canary 校验，禁止上传。
         if: success()
@@ -134,5 +157,6 @@ jobs:
             backend/eval/reports/public-count/
             backend/eval/reports/public-bm25/
             backend/eval/reports/public-generation/
+            backend/eval/reports/public-failure-transactions/
           if-no-files-found: warn
           retention-days: 30

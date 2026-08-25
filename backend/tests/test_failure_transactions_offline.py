@@ -35,15 +35,16 @@ def test_gate_fails_closed_when_any_counter_is_nonzero():
 
 def test_cli_runs_in_clean_subprocess_and_publishes_content_free_report(tmp_path):
     report_dir = Path("eval/reports") / f"failure-{tmp_path.name}"
+    untrusted_runtime = tmp_path / "must-not-touch"
     env = {
         **os.environ,
         "PYTHONPATH": "",
-        "OPENAI_API_KEY": "",
-        "KIMI_API_KEY": "",
-        "MOONSHOT_API_KEY": "",
-        "LANGFUSE_PUBLIC_KEY": "",
-        "LANGFUSE_SECRET_KEY": "",
-        "PAPERMIND_DATA_DIR": "",
+        "OPENAI_API_KEY": "synthetic-secret-canary",
+        "KIMI_API_KEY": "synthetic-secret-canary",
+        "MOONSHOT_API_KEY": "synthetic-secret-canary",
+        "LANGFUSE_PUBLIC_KEY": "synthetic-secret-canary",
+        "LANGFUSE_SECRET_KEY": "synthetic-secret-canary",
+        "PAPERMIND_DATA_DIR": str(untrusted_runtime),
     }
     result = subprocess.run(
         [
@@ -62,7 +63,9 @@ def test_cli_runs_in_clean_subprocess_and_publishes_content_free_report(tmp_path
     )
 
     assert result.returncode == 0, result.stderr
+    assert untrusted_runtime.exists() is False
     report_path = report_dir / "failure_transactions_public_v1.json"
+    first_bytes = report_path.read_bytes()
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert report["report_schema"] == "papermind-failure-transactions-report-v1"
     assert report["gate"]["passed"] is True
@@ -82,6 +85,18 @@ def test_cli_runs_in_clean_subprocess_and_publishes_content_free_report(tmp_path
         str(Path.cwd().resolve()),
     ):
         assert forbidden not in rendered
+
+    second = subprocess.run(
+        result.args,
+        cwd=Path.cwd(),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert second.returncode == 0, second.stderr
+    assert report_path.read_bytes() == first_bytes
 
 
 def test_report_schema_rejects_unknown_or_content_fields():
