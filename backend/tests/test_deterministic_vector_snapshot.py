@@ -7,6 +7,7 @@ import sqlite3
 import pytest
 
 from eval.deterministic_vector_snapshot import (
+    _hnsw_binary_manifests,
     activate_deterministic_snapshot,
     audit_hnsw_sqlite_metadata,
     build_deterministic_snapshot,
@@ -74,6 +75,27 @@ def _manifest(path):
         "vector_manifest_sha256": hashlib.sha256(binary).hexdigest(),
         "hnsw_binary_manifest_sha256": hashlib.sha256(binary).hexdigest(),
     }
+
+
+def test_hnsw_manifest_separates_volatile_runtime_length(tmp_path):
+    segment = tmp_path / "segment-1"
+    segment.mkdir()
+    (segment / "data_level0.bin").write_bytes(b"vectors")
+    (segment / "header.bin").write_bytes(b"header")
+    (segment / "link_lists.bin").write_bytes(b"links")
+    (segment / "length.bin").write_bytes(b"runtime-a")
+
+    before = _hnsw_binary_manifests(tmp_path, "segment-1")
+    (segment / "length.bin").write_bytes(b"runtime-b")
+    after = _hnsw_binary_manifests(tmp_path, "segment-1")
+
+    assert before["hnsw_binary_manifest_sha256"] == after[
+        "hnsw_binary_manifest_sha256"
+    ]
+    assert before["hnsw_full_binary_manifest_sha256"] != after[
+        "hnsw_full_binary_manifest_sha256"
+    ]
+    assert before["hnsw_volatile_files"] == ["length.bin"]
 
 
 def test_builder_copies_then_freezes_threads_and_search_ef(tmp_path):

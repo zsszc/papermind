@@ -14,7 +14,10 @@ train Recall/MRR/NDCG 稳定为 0.667/0.424/0.485，P95 仍低于 1 秒。
 - 源必须是当前真实 `vector_db/`，先校验 SQLite/Chroma ID 全等、464 条、1024 维及 embedding SHA。
 - 后端/Electron 和所有 Chroma client 必须停止后才能复制或激活；不支持在线热切换。
 - 使用与生产 `vector_db/` 同父目录的唯一 stage 复制，不原地修改；冻结 `hnsw:num_threads=1`、
-  `hnsw:search_ef=vector_count`，修改前后 embedding SHA 必须相同。
+  `hnsw:search_ef=vector_count`，修改前后 embedding SHA 必须相同。Chroma 0.4.24 每次打开
+  collection 都会重写含进程内地址的 `length.bin`；因此源快照只做原始 SQLite/文件审计，
+  HNSW 结构指纹冻结 `data_level0.bin/header.bin/link_lists.bin`，同时单列 `length.bin` 全量
+  指纹用于证明源复制期间不变，不把运行时重写误判成 embedding/index 变化。
 - 激活沿用 `activate_staged_vector_store()` 的备份/原子 rename/回滚语义；激活前必须再次审计。
 - 生产配置、模型、语料和检索 profile 均不改变。
 
