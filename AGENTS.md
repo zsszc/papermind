@@ -194,7 +194,7 @@ cd ../electron && npm run build    # 产物在 frontend/out/（dmg/zip/exe）
 
 ## 8. 测试与评测
 
-### 单元/集成测试（pytest，894 个用例）
+### 单元/集成测试（pytest，911 个用例）
 
 ```bash
 cd backend
@@ -211,7 +211,7 @@ cd ../electron && npm test       # node:test（health / wait / restart / kill �
 ```
 
 前端测试依赖包含 MSW，新增网络交互测试不得连接真实后端；Electron 生命周期与安全策略纯模块不得
-`require('electron')`，确保 CI 无 GUI 也能运行。当前后端 894 个测试、前端 53 个测试、Electron 26 个测试。
+`require('electron')`，确保 CI 无 GUI 也能运行。当前后端 911 个测试、前端 55 个测试、Electron 26 个测试。
 
 ### RAG 评测（backend/eval/）
 
@@ -258,6 +258,12 @@ env -u PYTHONPATH venv/bin/python -m eval.deterministic_vector_snapshot \
   消息和真实计数一次提交。messages 新增 `revision` 轻量迁移，regenerate 要求
   `expected_revision`，以进程内 active-set 避免重复 Kimi 调用，并用 revision 条件更新
   防跨进程覆盖；冲突、目标删除、断流或取消后前端从 history 对账且有会话 epoch 门禁。
+- **Batch 23E 独立失败事务 Harness 完成**：新增 `eval.failure_transactions`，在干净子进程
+  中先重定向临时 runtime、安装网络/子进程/私有路径审计和 fake 服务，再导入真实 chat
+  router。七个公开合成场景逐项使用 NullPool 文件 SQLite/WAL，request、finalizer、verify
+  跨连接；commit 场景要求写事务、调用和异常注入均恰好一次，再以新连接验证回滚。
+  报告严格白名单、无正文/路径/异常，绑定 fixture/runner/生产事务代码 SHA；CI 另以
+  `python -S`、零依赖 job 结构性证明生成 Guardrail 未引入模型栈。
 - **Batch 21 邻域候选未晋级**：`hybrid-local-neighbor`（semantic top20、同论文 ±2、固定 rank-distance 衰减）dev 为 0.625/0.36389/0.43005，factoid 仍 0.333、P95=270.1ms；MRR/NDCG/factoid Gate 失败，生产默认保持 shared hybrid。候选仅供显式复现
 - **Batch 22 双语 v2 未进入 dev**：`bm25-bilingual-v2` 仅新增四条病理术语映射，train 质量与 v1 完全相同（0.66667/0.42361/0.48529，factoid=0.50），未达到至少新增 1 题的 Gate，因此按预案跳过 dev；生产继续使用 `bm25-bilingual`
 - **Batch 22B 消费者已收敛**：聊天、重新生成、深度综述、论文引用推荐和 eval 的 chunk RAG 都经共享 `RetrievalPipeline`；论文引用零证据时跳过 LLM，显式单篇论文范围禁止 graph 越界，论文发现页语义异常保留 FTS 结果
@@ -313,4 +319,4 @@ env -u PYTHONPATH venv/bin/python -m eval.deterministic_vector_snapshot \
 
 ---
 
-> 最后更新：2026-08-25，Batch 23D 生成并发与深度综述事务完成后同步。
+> 最后更新：2026-08-25，Batch 23E 独立失败事务 Harness 完成后同步。
