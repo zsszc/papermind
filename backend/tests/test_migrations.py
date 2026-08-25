@@ -1,6 +1,6 @@
 """database.py 的 ensure_schema 轻量迁移特征化测试（只测不改）。
 
-锁定 SCHEMA_MIGRATIONS 登记的 9 个迁移分支的现有行为：
+锁定 SCHEMA_MIGRATIONS 登记的 10 个迁移分支的现有行为：
 - 旧 schema 库（缺迁移目标列）执行 ensure_schema 后新列补齐、默认值/NULL 语义正确；
 - 存量数据在迁移后完整保留；
 - 幂等（重复执行不报错、不重复加列）；
@@ -20,7 +20,7 @@ from sqlalchemy import create_engine
 import app.database as database_module
 from app.database import SCHEMA_MIGRATIONS, ensure_schema
 
-# 9 个迁移分支的期望默认值（None 表示 ADD COLUMN 不带 DEFAULT，存量行应为 NULL）。
+# 10 个迁移分支的期望默认值（None 表示 ADD COLUMN 不带 DEFAULT，存量行应为 NULL）。
 # 新增迁移分支时需同步维护本表。
 MIGRATION_EXPECTATIONS = [
     ("chunks", "page_start", None),
@@ -32,6 +32,7 @@ MIGRATION_EXPECTATIONS = [
     ("messages", "citations", "[]"),
     ("messages", "skill_used", None),
     ("messages", "token_usage", None),
+    ("messages", "revision", 0),
 ]
 
 # 旧 schema：四张表都只含迁移前就存在的基础列，缺全部 9 个迁移目标列
@@ -99,16 +100,16 @@ def old_db(tmp_path, monkeypatch):
 
 
 def test_migration_registry_has_exactly_seven_branches():
-    """锁定：登记表当前恰好 9 个迁移分支（新增字段登记时应同步更新本测试）。"""
+    """锁定：登记表当前恰好 10 个迁移分支（新增字段登记时应同步更新本测试）。"""
     total = sum(len(cols) for cols in SCHEMA_MIGRATIONS.values())
-    assert total == 9
+    assert total == 10
     assert set(SCHEMA_MIGRATIONS) == {
         "papers", "chunks", "conversations", "messages"
     }
 
 
 class TestSevenMigrationBranches:
-    """逐一锁定 9 个 ADD COLUMN 分支：列被补齐且存量行获得预期默认值/NULL。"""
+    """逐一锁定 10 个 ADD COLUMN 分支：列被补齐且存量行获得预期默认值/NULL。"""
 
     @pytest.mark.parametrize(
         ("table", "column", "expected_default"),
@@ -128,7 +129,7 @@ class TestSevenMigrationBranches:
         assert _cell(old_db, table, column) == expected_default
 
     def test_all_seven_columns_present_after_migration(self, old_db):
-        """锁定：旧库执行一次 ensure_schema 后 9 个登记列全部存在。"""
+        """锁定：旧库执行一次 ensure_schema 后 10 个登记列全部存在。"""
         ensure_schema()
 
         for table, column, _ in MIGRATION_EXPECTATIONS:

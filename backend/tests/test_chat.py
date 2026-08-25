@@ -44,7 +44,10 @@ class TestRegenerate:
             lambda: SimpleNamespace(available=lambda: False),
         )
 
-        resp = client.post(f"/api/chat/conversations/{conv.id}/messages/{am.id}/regenerate")
+        resp = client.post(
+            f"/api/chat/conversations/{conv.id}/messages/{am.id}/regenerate",
+            json={"expected_revision": 0},
+        )
         assert resp.status_code == 200
         assert "new-answer" in resp.text
 
@@ -73,7 +76,10 @@ class TestRegenerate:
         monkeypatch.setattr("app.routers.chat.llm_service.chat_stream", fake_stream)
         monkeypatch.setattr("app.database.SessionLocal", TestingSessionLocal)
 
-        resp = client.post(f"/api/chat/conversations/{conv.id}/messages/{am.id}/regenerate")
+        resp = client.post(
+            f"/api/chat/conversations/{conv.id}/messages/{am.id}/regenerate",
+            json={"expected_revision": 0},
+        )
         frames = [
             json.loads(line[len("data: "):])
             for line in resp.text.splitlines() if line.startswith("data: ")
@@ -85,15 +91,23 @@ class TestRegenerate:
         saved = db.query(Message).filter(Message.id == am.id).one()
         assert saved.content == frames[-1]["content"]
         assert saved.citations[0]["removed"] == 1
+        assert saved.revision == 1
+        assert frames[-1]["revision"] == 1
 
     def test_404_when_conversation_missing(self, client):
-        resp = client.post("/api/chat/conversations/999/messages/1/regenerate")
+        resp = client.post(
+            "/api/chat/conversations/999/messages/1/regenerate",
+            json={"expected_revision": 0},
+        )
         assert resp.status_code == 404
 
     def test_404_when_target_not_assistant(self, client, conversation_with_pair):
         conv, _ = conversation_with_pair
         user_msg = [m for m in conv.messages if m.role == "user"][0]
-        resp = client.post(f"/api/chat/conversations/{conv.id}/messages/{user_msg.id}/regenerate")
+        resp = client.post(
+            f"/api/chat/conversations/{conv.id}/messages/{user_msg.id}/regenerate",
+            json={"expected_revision": 0},
+        )
         assert resp.status_code == 404
 
     def test_llm_error_sentinel_rolls_back_original_message(
@@ -117,7 +131,10 @@ class TestRegenerate:
         )
         monkeypatch.setattr("app.database.SessionLocal", TestingSessionLocal)
 
-        resp = client.post(f"/api/chat/conversations/{conv.id}/messages/{am.id}/regenerate")
+        resp = client.post(
+            f"/api/chat/conversations/{conv.id}/messages/{am.id}/regenerate",
+            json={"expected_revision": 0},
+        )
         frames = [
             json.loads(line[len("data: "):])
             for line in resp.text.splitlines() if line.startswith("data: ")
@@ -134,6 +151,71 @@ class TestRegenerate:
         saved = db.query(Message).filter(Message.id == am.id).one()
         assert saved.content == "old"
         assert saved.citations == [{"source": "p1_c0", "paper_id": 1, "title": "原引用"}]
+
+    def test_stale_revision_returns_409_before_llm(
+        self, client, conversation_with_pair, monkeypatch
+    ):
+        """RED：过期客户端不得进入检索或 LLM，更不能覆盖较新消息。"""
+        conv, am = conversation_with_pair
+        calls = {"llm": 0}
+
+        async def fake_stream(messages, enable_web_search=False):
+            calls["llm"] += 1
+            yield "不应调用"
+
+        monkeypatch.setattr("app.routers.chat.llm_service.chat_stream", fake_stream)
+        resp = client.post(
+            f"/api/chat/conversations/{conv.id}/messages/{am.id}/regenerate",
+            json={"expected_revision": 99},
+        )
+
+        assert resp.status_code == 409
+        assert calls["llm"] == 0
+
+    def test_concurrent_mutation_is_not_overwritten(
+        self, client, db, conversation_with_pair, monkeypatch
+    ):
+        """RED：生成期间外部更新 revision 后，终态条件更新失败且保留外部状态。"""
+        conv, am = conversation_with_pair
+        from .conftest import TestingSessionLocal
+
+        async def fake_stream(messages, enable_web_search=False):
+            with TestingSessionLocal() as other_db:
+                other = other_db.query(Message).filter(Message.id == am.id).one()
+                other.content = "外部较新答案"
+                other.citations = [{"source": "p9_c9", "paper_id": 9, "title": "外部引用"}]
+                if hasattr(other, "revision"):
+                    other.revision = 1
+                other_db.commit()
+            yield "本请求旧答案"
+
+        monkeypatch.setattr("app.routers.chat.llm_service.chat_stream", fake_stream)
+        monkeypatch.setattr(
+            "app.routers.chat.get_vector_store",
+            lambda: SimpleNamespace(available=lambda: False),
+        )
+        monkeypatch.setattr("app.database.SessionLocal", TestingSessionLocal)
+
+        resp = client.post(
+            f"/api/chat/conversations/{conv.id}/messages/{am.id}/regenerate",
+            json={"expected_revision": 0},
+        )
+        frames = self._frames(resp.text)
+
+        assert frames[-1]["error_code"] == "regenerate_conflict"
+        assert not any(frame.get("finished") is True for frame in frames)
+        db.expire_all()
+        saved = db.query(Message).filter(Message.id == am.id).one()
+        assert saved.content == "外部较新答案"
+        assert saved.citations[0]["source"] == "p9_c9"
+
+    @staticmethod
+    def _frames(resp_text):
+        return [
+            json.loads(line[len("data: "):])
+            for line in resp_text.splitlines()
+            if line.startswith("data: ")
+        ]
 
 
 class TestDeleteMessagesFrom:
@@ -564,6 +646,7 @@ class TestDeepReview:
         # plan 帧在先，携带子问题列表
         assert frames[0]["type"] == "plan"
         assert frames[0]["questions"] == questions
+        assert frames[0]["conversation_id"] is None
         # 尾帧 finished + citations + conversation_id
         assert frames[-1]["finished"] is True
         assert frames[-1]["delta"] == ""
@@ -573,6 +656,7 @@ class TestDeepReview:
         delta_frames = frames[1:-1]
         assert len(delta_frames) >= 2
         assert all(f["finished"] is False for f in delta_frames)
+        assert all(f["conversation_id"] is None for f in delta_frames)
         assert "".join(f["delta"] for f in delta_frames) == content
         # 服务层契约调用：plan(topic) / 逐子问题 execute / synthesize(topic, sub_answers)
         assert calls["plan"] == ["结直肠癌 T 分期综述"]
@@ -651,6 +735,7 @@ class TestDeepReview:
         assert "error" in frames[0]
         assert "LLM 不可用" not in frames[0]["error"]  # 异常原文不透出（宪法第 13 条）
         assert db.query(Message).count() == 0
+        assert db.query(Conversation).count() == 0
 
     def test_single_subquestion_failure_degrades(self, client, db, monkeypatch):
         """单个子问题失败降级为「该子问题检索不足」占位，不阻塞整体流程。"""
@@ -697,11 +782,19 @@ class TestDeepReview:
         assert "error" in frames[-1]
         assert all(not f.get("finished") for f in frames)
         assert db.query(Message).count() == 0
+        assert db.query(Conversation).count() == 0
 
     def test_appends_to_existing_conversation(self, client, db, monkeypatch):
         """携带 conversation_id：消息追加到已有会话，计数在原有基础上 +2。"""
-        conv = Conversation(title="已有会话", message_count=2)
+        conv = Conversation(title="已有会话", message_count=99)
         db.add(conv)
+        db.flush()
+        db.add(Message(
+            conversation_id=conv.id, role="user", content="旧问题", citations=[]
+        ))
+        db.add(Message(
+            conversation_id=conv.id, role="assistant", content="旧回答", citations=[]
+        ))
         db.commit()
         db.refresh(conv)
 
@@ -720,6 +813,46 @@ class TestDeepReview:
         db.expire_all()
         conv = db.query(Conversation).filter(Conversation.id == conv.id).first()
         assert conv.message_count == 4
+        assert db.query(Message).filter(Message.conversation_id == conv.id).count() == 4
+
+    @pytest.mark.parametrize("review", ["", "   ", {"content": None, "citations": []}])
+    def test_empty_review_emits_error_without_orphan(
+        self, client, db, monkeypatch, review
+    ):
+        """RED：空/非字符串汇总不得创建会话或发送 finished。"""
+        calls, fake_plan, fake_execute, _ = self._happy_fakes()
+
+        async def empty_synthesize(topic, sub_answers):
+            return review
+
+        self._install_fake_service(monkeypatch, fake_plan, fake_execute, empty_synthesize)
+        self._patch_sessionlocal(monkeypatch)
+
+        resp = client.post("/api/chat/deep-review", json={"topic": "MIL 综述"})
+        frames = self._frames(resp.text)
+
+        assert frames[-1]["error_code"] == "empty_generation"
+        assert not any(frame.get("finished") is True for frame in frames)
+        assert db.query(Conversation).count() == 0
+        assert db.query(Message).count() == 0
+
+    def test_guardrail_empty_review_emits_error_without_orphan(
+        self, client, db, monkeypatch
+    ):
+        """RED：正文只含越界引用，清洗为空时不得落库或假成功。"""
+        calls, fake_plan, fake_execute, fake_synthesize = self._happy_fakes(
+            content="[^9^]", citations=[self._chunk()]
+        )
+        self._install_fake_service(monkeypatch, fake_plan, fake_execute, fake_synthesize)
+        self._patch_sessionlocal(monkeypatch)
+
+        resp = client.post("/api/chat/deep-review", json={"topic": "MIL 综述"})
+        frames = self._frames(resp.text)
+
+        assert frames[-1]["error_code"] == "empty_generation"
+        assert not any(frame.get("finished") is True for frame in frames)
+        assert db.query(Conversation).count() == 0
+        assert db.query(Message).count() == 0
 
     def test_service_singleton_entrypoint(self, client, db, monkeypatch):
         """F1 若以 deep_review_service 单例暴露接口，路由同样可用。"""
@@ -786,6 +919,20 @@ class TestDeepReview:
             "/api/chat/deep-review", json={"topic": "x", "conversation_id": 999}
         )
         assert resp.status_code == 404
+
+    def test_zero_conversation_id_is_not_treated_as_missing_input(self, client, db):
+        """RED：显式 conversation_id=0 必须按指定会话校验，不得新建会话。"""
+        resp = client.post(
+            "/api/chat/deep-review", json={"topic": "x", "conversation_id": 0}
+        )
+        assert resp.status_code == 404
+        assert db.query(Conversation).count() == 0
+
+    def test_422_when_topic_blank(self, client, db):
+        """RED：纯空白主题在进入流式任务和数据库前拒绝。"""
+        resp = client.post("/api/chat/deep-review", json={"topic": "   "})
+        assert resp.status_code == 422
+        assert db.query(Conversation).count() == 0
 
     def test_422_when_topic_missing(self, client):
         """缺 topic → 422（topic 必填）。"""
