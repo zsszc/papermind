@@ -178,6 +178,16 @@ class TestGuardrailsIntegration:
         resp = client.post("/api/chat", json={"message": "MIL 是什么"})
         assert resp.status_code == 200
         assert '"finished": true' in resp.text
+        frames = [
+            json.loads(line[len("data: "):])
+            for line in resp.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        assert frames[-1]["content"] == "根据文献[^1^]，结论成立。"
+        assert frames[-1]["verification"] == {
+            "total": 2, "valid": 1, "removed": 1, "verified": False,
+        }
+        assert [item["source"] for item in frames[-1]["citations"]] == ["p1_c0"]
 
         msg = self._assistant_message(db, 1)
         assert msg.content == "根据文献[^1^]，结论成立。"
@@ -188,6 +198,23 @@ class TestGuardrailsIntegration:
         # 原 7 键不丢失
         assert saved["source"] == "p1_c0"
         assert saved["title"] == "结直肠癌T分期研究"
+
+    def test_finished_does_not_publish_retrieved_but_uncited_chunks(
+        self, client, db, monkeypatch
+    ):
+        chunk = self._chunk()
+        self._patch_deps(monkeypatch, "没有引用标记的回答。", [chunk])
+
+        resp = client.post("/api/chat", json={"message": "MIL 是什么"})
+        frames = [
+            json.loads(line[len("data: "):])
+            for line in resp.text.splitlines()
+            if line.startswith("data: ")
+        ]
+
+        assert frames[-1]["finished"] is True
+        assert frames[-1]["content"] == "没有引用标记的回答。"
+        assert frames[-1]["citations"] == []
 
     def test_all_valid_citations_verified(self, client, db, monkeypatch):
         """全部有效：文本不被篡改，citations 带 verified=true、removed=0。"""

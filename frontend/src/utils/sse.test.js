@@ -42,6 +42,33 @@ describe('readSSEStream', () => {
     expect(response.releaseLock).toHaveBeenCalledOnce()
   })
 
+  it('finished 将后端清洗正文作为原子终态传给调用方', async () => {
+    const response = responseFromChunks([
+      'data: {"delta":"原始[^9^]"}\n\n',
+      'data: {"finished":true,"content":"清洗后","citations":[],"verification":{"removed":1}}\n\n',
+    ])
+    const onFinish = vi.fn()
+
+    await readSSEStream(response, vi.fn(), onFinish)
+
+    expect(onFinish).toHaveBeenCalledWith(
+      [],
+      expect.objectContaining({ content: '清洗后', verification: { removed: 1 } }),
+    )
+  })
+
+  it('finished citations 类型畸形时拒绝进入成功态', async () => {
+    const response = responseFromChunks([
+      'data: {"finished":true,"content":"答案","citations":"private-path"}\n\n',
+    ])
+    const onFinish = vi.fn()
+
+    await expect(readSSEStream(response, vi.fn(), onFinish)).rejects.toBeInstanceOf(
+      SSEProtocolError
+    )
+    expect(onFinish).not.toHaveBeenCalled()
+  })
+
   it('错误事件结束流并调用错误回调', async () => {
     const response = responseFromChunks([
       'data: {"error":"服务繁忙"}\n\ndata: {"delta":"不应读取"}\n\n',

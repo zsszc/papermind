@@ -1,5 +1,5 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const apiMocks = vi.hoisted(() => ({
   listConversations: vi.fn(),
@@ -47,14 +47,40 @@ function pendingSSEForSignal(signal) {
 }
 
 
+function responseFromEvents(events) {
+  const encoder = new TextEncoder()
+  let sent = false
+  return {
+    ok: true,
+    body: {
+      getReader: () => ({
+        read: vi.fn(async () => {
+          if (sent) return { done: true, value: undefined }
+          sent = true
+          return {
+            done: false,
+            value: encoder.encode(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join('')),
+          }
+        }),
+        cancel: vi.fn(),
+        releaseLock: vi.fn(),
+      }),
+    },
+  }
+}
+
+
 describe('ChatPanel operation lifecycle', () => {
   beforeEach(() => {
+    vi.resetAllMocks()
     apiMocks.listConversations.mockResolvedValue({ data: [] })
     apiMocks.createConversation.mockResolvedValue({
       data: { id: 7, title: '新对话', message_count: 0 },
     })
     Element.prototype.scrollIntoView = vi.fn()
   })
+
+  afterEach(() => cleanup())
 
   it('快速双击发送只创建一个会话并只发出一个 POST', async () => {
     apiMocks.apiFetch.mockImplementation(async (_path, options) => pendingSSEForSignal(options.signal))
@@ -101,5 +127,45 @@ describe('ChatPanel operation lifecycle', () => {
 
     await waitFor(() => expect(screen.getByText('[请求失败，请稍后重试]')).toBeInTheDocument())
     expect(apiMocks.apiFetch).toHaveBeenCalledOnce()
+  })
+
+  it('finished 原子替换 provisional 正文并展示实际引用', async () => {
+    apiMocks.apiFetch.mockResolvedValue(responseFromEvents([
+      { delta: '答案[^1^]越界[^9^]', finished: false },
+      {
+        delta: '',
+        finished: true,
+        content: '答案[^1^]越界',
+        citations: [{ paper_id: 1, title: '公开合成论文', year: 2026 }],
+        verification: { total: 2, valid: 1, removed: 1, verified: false },
+      },
+    ]))
+    render(<ChatPanel fullHeight />)
+    fireEvent.change(screen.getByPlaceholderText('输入问题，基于文献库回答...'), {
+      target: { value: '引用问题' },
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /发送/ }))
+
+    await waitFor(() => expect(document.body.textContent).toContain('答案[^1^]越界'))
+    expect(document.body.textContent).not.toContain('[^9^]')
+    expect(screen.getByText('公开合成论文（2026）')).toBeInTheDocument()
+  })
+
+  it('delta 后 error 丢弃半条正文且不执行成功刷新', async () => {
+    apiMocks.apiFetch.mockResolvedValue(responseFromEvents([
+      { delta: '不应保留的半条秘密', finished: false },
+      { error: '服务失败' },
+    ]))
+    render(<ChatPanel fullHeight />)
+    fireEvent.change(screen.getByPlaceholderText('输入问题，基于文献库回答...'), {
+      target: { value: '失败问题' },
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /发送/ }))
+
+    expect(await screen.findByText('[请求失败，请稍后重试]')).toBeInTheDocument()
+    expect(document.body.textContent).not.toContain('不应保留的半条秘密')
+    expect(apiMocks.listConversations).toHaveBeenCalledTimes(1)
   })
 })
