@@ -357,13 +357,37 @@ async def analyze_image(
     filename = file.filename or "image.jpg"
 
     async def event_stream():
-        async for delta in image_analyzer_service.analyze_stream(
-            image_bytes=image_bytes,
-            filename=filename,
-            question=question,
-        ):
-            yield f"data: {json.dumps({'delta': delta, 'finished': False}, ensure_ascii=False)}\n\n"
-        yield f"data: {json.dumps({'delta': '', 'finished': True}, ensure_ascii=False)}\n\n"
+        full_content = ""
+        try:
+            async for delta in image_analyzer_service.analyze_stream(
+                image_bytes=image_bytes,
+                filename=filename,
+                question=question,
+            ):
+                full_content += delta
+                yield _sse_frame({"delta": delta, "finished": False})
+                await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            logger.info("[image-analyzer] streaming cancelled")
+            return
+        except Exception as e:
+            logger.error("[image-analyzer] 流式失败: %s", type(e).__name__)
+            yield _sse_frame({
+                "error": "图片分析失败，请稍后重试",
+                "error_code": "image_analysis_failed",
+            })
+            return
+        if not full_content.strip():
+            yield _sse_frame({
+                "error": "图片分析失败，请稍后重试",
+                "error_code": "empty_image_analysis",
+            })
+            return
+        yield _sse_frame({
+            "delta": "",
+            "finished": True,
+            "content": full_content,
+        })
 
     return StreamingResponse(
         event_stream(),

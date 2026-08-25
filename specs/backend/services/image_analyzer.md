@@ -1,6 +1,6 @@
 # services/image_analyzer.py（图片分析服务 ImageAnalyzerService）规格说明书
 
-> 本文件描述**行为契约**（做什么），不描述实现细节。依据 `backend/app/services/image_analyzer.py` 与 `backend/app/routers/chat.py` 实际代码反向整理（2026-08-04）。
+> 本文件描述**行为契约**（做什么），不描述实现细节。依据 `backend/app/services/image_analyzer.py` 与 `backend/app/routers/chat.py` 实际代码反向整理（2026-08-25）。
 
 ## 1. 背景与目标
 
@@ -89,19 +89,19 @@
 - **副作用**：
   - 网络调用：`client.chat.completions.create(model=self.model, messages=..., max_tokens=2048, temperature=self._get_temperature(), timeout=120)`（非流式）。
   - 消息结构：system 固定为 `你是一位学术研究助手，擅长分析论文截图、表格、公式和图表。请用中文简洁回答。`；user 消息为两段式 content（`image_url` 为 `data:{mime};base64,{b64}`，`text` 为 question 或默认提示）。
-  - 失败时写日志 `[image_analyzer] 图片分析失败: ...`（含堆栈）到 `logs/app.log`。
-- **异常**：**不向外抛**。一切异常被捕获并转为返回值 `f"[图片分析失败: {e}]"`。
+  - 失败日志只记录异常类型，不记录异常原文或堆栈。
+- **异常**：**不向外抛**。一切异常被捕获并转为固定返回值 `[图片分析失败，请稍后再试]`。
 
 ### 3.6 `ImageAnalyzerService.analyze_stream(self, image_bytes: bytes, filename: str, question: str) -> AsyncIterator[str]`
 
 - **输入**：同 3.5。
 - **输出**：`AsyncIterator[str]` —— 逐个 yield 模型的增量文本（`chunk.choices[0].delta.content`，空增量被跳过）。
 - **前置条件**：同 3.5。
-- **后置条件**：成功路径只 yield 模型增量文本；异常时 yield 一个以 `\n[图片分析失败: {e}]` 为内容的错误增量后结束迭代。
+- **后置条件**：成功路径只 yield 模型增量文本；异常时抛 `ImageAnalysisError`，错误正文不进入文本流。
 - **副作用**：
   - 网络调用：同 3.5，但 `stream=True`。
-  - 失败时写日志 `[image_analyzer_stream] 图片分析流式失败: ...`（含堆栈）。
-- **异常**：**不向外抛**，异常转为末尾的错误增量。
+  - 失败日志只记录异常类型。
+- **异常**：抛 `ImageAnalysisError`，由路由转为脱敏 SSE error 终态。
 
 ### 3.7 路由交互契约：`POST /api/chat/analyze-image`（`routers/chat.py`）
 
@@ -110,12 +110,12 @@
 - **路由层校验**：
   - `image_bytes = await file.read()` 为空 → `HTTPException 400, detail="图片内容为空"`。
   - `file.filename` 为空时回退 `"image.jpg"`（即 MIME 按 jpeg 处理）。
-  - **无大小上限、无扩展名白名单**。
+  - 超过 10MB → 413；仍无扩展名白名单。
 - **响应**：`StreamingResponse, media_type="text/event-stream"`，请求头 `Cache-Control: no-cache`、`Connection: keep-alive`、`X-Accel-Buffering: no`。
 - **SSE 事件序列**：
   1. 若干 `data: {"delta": <增量文本>, "finished": false}\n\n`
-  2. 结束固定一条 `data: {"delta": "", "finished": true}\n\n`
-  3. 服务异常时，错误文案作为普通 `delta` 增量流出（finished 事件照常发送），**HTTP 状态码仍是 200**。
+  2. 成功以 `data: {"delta":"","finished":true,"content":"<全文>"}\n\n` 结束。
+  3. 服务异常或空结果以固定 `{error,error_code}` 结束；不得再发送 finished，HTTP 状态码仍是 200。
 - **无会话副作用**：不写 `conversations`/`messages` 表，无 citations 字段。
 
 ## 4. 边界条件与错误处理
@@ -127,8 +127,8 @@
 | 文件名无扩展名/未知扩展名 | `_guess_mime` 兜底为 `image/jpeg` |
 | 文件名大小写混合（如 `A.PNG`） | 先 `lower()` 再匹配，正确识别 |
 | 扩展名与真实内容不符（如 .png 实为 jpeg） | 按扩展名声明 MIME，不做内容嗅探；识别后果由模型侧承担 |
-| 超大图片 | 服务与路由均**不限制**；base64 后整体放入单条消息，可能触发模型上下文/请求体上限，表现为调用失败文案 |
-| Kimi 接口超时/报错 | `analyze` 返回 `[图片分析失败: {e}]`；`analyze_stream` yield `\n[图片分析失败: {e}]`；均记 error 日志，HTTP 仍 200 |
+| 超大图片 | 路由在读取后以 10MB 上限拒绝，返回 413 |
+| Kimi 接口超时/报错 | `analyze` 返回固定失败文案；`analyze_stream` 抛类型化异常，路由发脱敏 error 且无 finished |
 | 模型返回空 content（非流式） | 返回空字符串 `""` |
 | 流式中出现空增量 | 跳过不 yield |
 | 配置缺 `llm.api_key` | 构造不拦截，调用时以失败文案形式返回 |
@@ -150,26 +150,22 @@
 - [ ] AC2：`_guess_mime` 对 `.png/.jpg/.jpeg/.gif/.webp`（含大写）返回对应 MIME，其他扩展名返回 `image/jpeg`
 - [ ] AC3：`question` 为空时，发给模型的 user 文本为默认提示（mock client 断言 messages 内容）
 - [ ] AC4：model 含 `kimi-k2` 时调用参数 `temperature=1.0`，否则 `0.3`；`max_tokens=2048`
-- [ ] AC5：流式成功路径按增量 yield，SSE 事件以 `{delta, finished:false}` 序列开始、以 `{delta:"", finished:true}` 结束
-- [ ] AC6：client 抛异常时 `analyze` 返回 `[图片分析失败: ...]` 开头文案且不抛异常；`analyze_stream` 末尾 yield `\n[图片分析失败: ...]`；均写 error 日志
+- [x] AC5：流式成功路径按增量 yield，SSE 事件以 `{delta, finished:false}` 序列开始、以 `{delta:"", finished:true, content}` 结束
+- [x] AC6：client 抛异常时 `analyze` 返回固定失败文案；`analyze_stream` 抛类型化异常，路由发脱敏 error 且无 finished；日志不含原异常
 - [ ] AC7：模型返回 `content=None` 时 `analyze` 返回 `""`
 - [ ] AC8：分析结果不产生任何 DB 写入（`messages`/`conversations` 表不变）
 
 ## 7. 现有测试覆盖与盲区
 
-- **已覆盖**：无。`backend/tests/` 15 个测试文件中没有任何针对 `image_analyzer` 或 `/analyze-image` 的用例（已全量检索 `image`/`analyze-image` 关键词确认）。
+- **已覆盖**：`tests/test_chat_image.py` 覆盖空/10MB/超限上传、非流式脱敏、流式类型化失败和路由 error 终态。
 - **盲区**：
-  - 【高】`/analyze-image` 端点整体零测试：空文件 400、SSE 事件序列、异常时错误文案经 SSE 流出且状态码仍 200，均未固定（AC1/AC5/AC6 无对应测试）
-  - 【高】`analyze` / `analyze_stream` 的异常吞没行为（返回/yield `[图片分析失败: {e}]`）未测试，重构成抛异常不会有测试报警
   - 【中】`_guess_mime` 扩展名映射与 jpeg 兜底（AC2）、`_get_temperature` 的 kimi-k2 特判（AC4）未测试
-  - 【中】上传无大小限制的行为未以测试固定——与 PDF 上传 50MB 上限（宪法安全纪律）存在不一致风险，是否补限制属产品决策
-  - 【低】异常原文 `{e}` 经 SSE 直达前端，与宪法第 13 条「异常脱敏」（通用文案 + error_code）相悖，现状无测试亦无告警
   - 【低】非流式 `analyze` 无调用方亦无测试，属事实上的备用 API
 
 ## 8. 关键设计决策
 
 - **绕过 `llm.py` 直连 `AsyncOpenAI`**：宪法第 8 条要求所有 LLM 调用经 `services/llm.py` 统一入口，本服务是现存的两个例外之一（另一个是 `web_search.py`）。后果：不享受统一重试（3 次指数退避）、消息截断与错误格式化，仅依赖 SDK 层 `max_retries=1`。后续治理（纳入 llm.py 或在宪法登记例外）需产品层面决策，本规格只记录现状。
-- **异常不抛出、转为文案返回**：让 SSE 通道在任何失败下都能以 200 正常收尾，前端处理简单；代价是异常原文（可能含内部细节）随文案透传到前端，与全局异常脱敏原则不一致。
-- **不做大小/格式校验**：多模态接口本身有请求体上限，依赖模型侧兜底；与 PDF 上传的严格白名单策略形成反差，属历史遗留而非有意设计。
+- **流式异常类型化**：服务层不再把失败伪装成正文，路由负责固定 error 终态；前端可统一丢弃 provisional。
+- **10MB 上限、格式仍按扩展名**：限制费用与内存放大，但暂不做图片内容嗅探。
 - **结果不入库**：图片分析定位为一次性问答，不进入会话历史与记忆体系，避免大段 base64 或长分析文本污染对话上下文。
 - **默认提示中文化**：system prompt 与默认 question 均固定中文，贴合单用户中文学术写作场景。

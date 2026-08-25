@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from app.services.image_analyzer import ImageAnalyzerService
+from app.services.image_analyzer import ImageAnalysisError, ImageAnalyzerService
 
 
 class TestAnalyzeImageUpload:
@@ -75,14 +75,33 @@ class TestAnalyzeExceptionSanitization:
         assert "boom-secret-detail" not in result
         assert result.startswith("[图片分析失败")
 
-    def test_analyze_stream_error_text_sanitized(self):
-        """analyze_stream() 尾帧错误文本同样脱敏。"""
+    def test_analyze_stream_raises_typed_sanitized_error(self):
+        """analyze_stream() 不再把错误当正文，而是抛不含原文的类型化异常。"""
         svc = self._svc_with_raising_client()
 
         async def collect():
             return [c async for c in svc.analyze_stream(b"img", "a.png", "q")]
 
-        chunks = asyncio.run(collect())
-        joined = "".join(chunks)
-        assert "boom-secret-detail" not in joined
-        assert "图片分析失败" in joined
+        with pytest.raises(ImageAnalysisError) as exc_info:
+            asyncio.run(collect())
+        assert "boom-secret-detail" not in str(exc_info.value)
+
+    def test_analyze_image_route_emits_error_terminal(self, client, monkeypatch):
+        """图片上游异常经路由转固定 error，禁止普通 delta/finished。"""
+        async def fail_stream(**kwargs):
+            yield "provisional"
+            raise ImageAnalysisError("private-image-canary")
+
+        monkeypatch.setattr(
+            "app.routers.chat.image_analyzer_service.analyze_stream", fail_stream
+        )
+        response = client.post(
+            "/api/chat/analyze-image",
+            files={"file": ("a.png", b"image", "image/png")},
+        )
+        frames = [
+            line for line in response.text.splitlines() if line.startswith("data: ")
+        ]
+        assert '"error_code": "image_analysis_failed"' in frames[-1]
+        assert '"finished": true' not in response.text
+        assert "private-image-canary" not in response.text

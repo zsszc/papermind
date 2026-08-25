@@ -16,7 +16,9 @@ on:
     paths:
       - "backend/eval/**"
       - "backend/app/services/generation_guardrails.py"
+      - "backend/app/services/llm.py"
       - "backend/app/routers/chat.py"
+      - "backend/tests/test_chat.py"
       - "backend/tests/test_eval_*.py"
       - "backend/tests/test_generation_guardrails_offline.py"
       - "frontend/src/utils/sse.js"
@@ -29,7 +31,9 @@ on:
     paths:
       - "backend/eval/**"
       - "backend/app/services/generation_guardrails.py"
+      - "backend/app/services/llm.py"
       - "backend/app/routers/chat.py"
+      - "backend/tests/test_chat.py"
       - "backend/tests/test_eval_*.py"
       - "backend/tests/test_generation_guardrails_offline.py"
       - "frontend/src/utils/sse.js"
@@ -121,7 +125,8 @@ jobs:
         run: python -m eval.generation_guardrails --report-dir eval/reports/public-generation
 
       - name: 上传评测报告
-        if: always()
+        # 失败中的半成品可能尚未通过报告 schema/canary 校验，禁止上传。
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: eval-reports

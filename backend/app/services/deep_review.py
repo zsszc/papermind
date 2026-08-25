@@ -136,7 +136,11 @@ async def plan(topic: str, n_papers: Optional[int] = None) -> List[SubQuestion]:
         messages, json_mode=True, trace_metadata={"stage": "deep_review_plan"}
     )
     questions = _parse_questions(raw)
-    logger.info(f"[deep_review] plan 完成：主题「{topic[:30]}」拆出 {len(questions)} 个子问题")
+    logger.info(
+        "[deep_review] plan 完成：topic_chars=%d sub_questions=%d",
+        len(topic),
+        len(questions),
+    )
     return [SubQuestion(index=i, question=q) for i, q in enumerate(questions, start=1)]
 
 
@@ -164,9 +168,14 @@ async def execute(sub_question: SubQuestion, *, db: Session) -> SubAnswer:
             diagnostics=diagnostics,
         )
     except Exception as e:
-        logger.error(f"[deep_review] 子问题 {sub_question.index} 检索失败: {e}")
+        error_type = type(e).__name__
+        logger.error(
+            "[deep_review] 子问题 %s 检索失败: %s",
+            sub_question.index,
+            error_type,
+        )
         return SubAnswer(
-            **base, answer=INSUFFICIENT_NOTICE, chunks=[], ok=False, error=str(e)
+            **base, answer=INSUFFICIENT_NOTICE, chunks=[], ok=False, error=error_type
         )
     if not chunks:
         logger.info(f"[deep_review] 子问题 {sub_question.index} 零检索片段，跳过 LLM 生成")
@@ -193,16 +202,23 @@ async def execute(sub_question: SubQuestion, *, db: Session) -> SubAnswer:
         )
     except Exception as e:
         # chat_completion 契约上不抛异常（返回带内错误串），此处为防御性兜底
-        logger.error(f"[deep_review] 子问题 {sub_question.index} LLM 调用异常: {e}")
+        error_type = type(e).__name__
+        logger.error(
+            "[deep_review] 子问题 %s LLM 调用异常: %s",
+            sub_question.index,
+            error_type,
+        )
         return SubAnswer(
-            **base, answer=INSUFFICIENT_NOTICE, chunks=[], ok=False, error=str(e)
+            **base, answer=INSUFFICIENT_NOTICE, chunks=[], ok=False, error=error_type
         )
     if answer.startswith(_LLM_ERROR_PREFIX):
-        logger.warning(
-            f"[deep_review] 子问题 {sub_question.index} LLM 生成失败: {answer[:80]}"
-        )
+        logger.warning("[deep_review] 子问题 %s LLM 生成失败", sub_question.index)
         return SubAnswer(
-            **base, answer=INSUFFICIENT_NOTICE, chunks=[], ok=False, error=answer
+            **base,
+            answer=INSUFFICIENT_NOTICE,
+            chunks=[],
+            ok=False,
+            error="llm_generation_failed",
         )
     return SubAnswer(**base, answer=answer, chunks=chunks, ok=True)
 
@@ -264,7 +280,9 @@ async def synthesize(topic: str, sub_answers: List[SubAnswer]) -> Review:
     if not content or content.startswith(_LLM_ERROR_PREFIX):
         raise DeepReviewError(f"synthesize 失败：LLM 调用出错（{content[:80]}）")
     logger.info(
-        f"[deep_review] synthesize 完成：主题「{topic[:30]}」，全局引用 {len(citations)} 条"
+        "[deep_review] synthesize 完成：topic_chars=%d citations=%d",
+        len(topic),
+        len(citations),
     )
     return Review(
         topic=topic, content=content, citations=citations, sub_answers=list(sub_answers)

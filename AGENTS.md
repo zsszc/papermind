@@ -95,7 +95,7 @@ Kimi API (kimi-k2.6) —— 对话 / 概括 / 联网搜索 / 图片分析
 │   │   ├── schemas.py      # Pydantic 请求/响应模型
 │   │   └── main.py         # FastAPI 入口（lifespan、CORS、/mcp 挂载、/static 白名单）
 │   ├── eval/               # RAG/生成 Guardrail 评测：公开 fixture、私有 QA、run.py、generation_guardrails.py
-│   ├── tests/              # pytest 套件（887 用例，内存 SQLite + TestClient）
+│   ├── tests/              # pytest 套件（894 用例，内存 SQLite + TestClient）
 │   ├── venv/               # Python 3.12 虚拟环境（会被 electron-builder 打包）
 │   ├── pyproject.toml      # 依赖声明 + pytest/ruff 配置
 │   └── requirements.txt    # 锁定依赖（与 pyproject 保持一致）
@@ -194,7 +194,7 @@ cd ../electron && npm run build    # 产物在 frontend/out/（dmg/zip/exe）
 
 ## 8. 测试与评测
 
-### 单元/集成测试（pytest，887 个用例）
+### 单元/集成测试（pytest，894 个用例）
 
 ```bash
 cd backend
@@ -211,7 +211,7 @@ cd ../electron && npm test       # node:test（health / wait / restart / kill �
 ```
 
 前端测试依赖包含 MSW，新增网络交互测试不得连接真实后端；Electron 生命周期与安全策略纯模块不得
-`require('electron')`，确保 CI 无 GUI 也能运行。当前后端 887 个测试、前端 50 个测试、Electron 26 个测试。
+`require('electron')`，确保 CI 无 GUI 也能运行。当前后端 894 个测试、前端 53 个测试、Electron 26 个测试。
 
 ### RAG 评测（backend/eval/）
 
@@ -248,6 +248,11 @@ env -u PYTHONPATH venv/bin/python -m eval.deterministic_vector_snapshot \
   Gate 的 citation P/R/F1 与负例拒答率均为 1.000，越界/畸形/重复/负例引用
   均为 0；执行阶段无网络、子进程、私有路径或禁止模块。本批未读取私有 QA/论文，
   未调用 Kimi/Embedding。
+- **Batch 23C 生成失败事务闭环完成**：流式 LLM 首 token 后失败不再重试拼接；错误串、
+  异常、空白与 Guardrail 清洗后为空均转脱敏 error，失败不落 assistant、不发 finished，
+  `message_count` 等于真实行数；regenerate 失败保留原正文/引用。前端引用改为消息级，
+  文本/图片 error、取消、EOF 与缺失最终正文均丢弃 provisional。生成相关日志不记录
+  问题、主题、异常原文或非法引用 token，CI 仅在 Gate 成功后上传报告。
 - **Batch 21 邻域候选未晋级**：`hybrid-local-neighbor`（semantic top20、同论文 ±2、固定 rank-distance 衰减）dev 为 0.625/0.36389/0.43005，factoid 仍 0.333、P95=270.1ms；MRR/NDCG/factoid Gate 失败，生产默认保持 shared hybrid。候选仅供显式复现
 - **Batch 22 双语 v2 未进入 dev**：`bm25-bilingual-v2` 仅新增四条病理术语映射，train 质量与 v1 完全相同（0.66667/0.42361/0.48529，factoid=0.50），未达到至少新增 1 题的 Gate，因此按预案跳过 dev；生产继续使用 `bm25-bilingual`
 - **Batch 22B 消费者已收敛**：聊天、重新生成、深度综述、论文引用推荐和 eval 的 chunk RAG 都经共享 `RetrievalPipeline`；论文引用零证据时跳过 LLM，显式单篇论文范围禁止 graph 越界，论文发现页语义异常保留 FTS 结果
@@ -303,4 +308,4 @@ env -u PYTHONPATH venv/bin/python -m eval.deterministic_vector_snapshot \
 
 ---
 
-> 最后更新：2026-08-25，Batch 23A 生成 Guardrail 离线 Harness 完成后同步。
+> 最后更新：2026-08-25，Batch 23C 生成失败事务闭环完成后同步。

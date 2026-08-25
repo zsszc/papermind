@@ -7,6 +7,10 @@ from app.core.config import config
 from app.core.logger import logger
 
 
+class ImageAnalysisError(RuntimeError):
+    """图片上游生成失败；异常正文不得直接返回客户端。"""
+
+
 class ImageAnalyzerService:
     """基于 Kimi 多模态能力的图片分析服务。"""
 
@@ -75,7 +79,7 @@ class ImageAnalyzerService:
             )
             return response.choices[0].message.content or ""
         except Exception as e:
-            logger.error(f"[image_analyzer] 图片分析失败: {e}", exc_info=True)
+            logger.error("[image_analyzer] 图片分析失败: %s", type(e).__name__)
             return "[图片分析失败，请稍后再试]"
 
     async def analyze_stream(
@@ -118,8 +122,11 @@ class ImageAnalyzerService:
                 if content:
                     yield content
         except Exception as e:
-            logger.error(f"[image_analyzer_stream] 图片分析流式失败: {e}", exc_info=True)
-            yield "\n[图片分析失败，请稍后再试]"
+            logger.error(
+                "[image_analyzer_stream] 图片分析流式失败: %s",
+                type(e).__name__,
+            )
+            raise ImageAnalysisError("upstream_failure") from None
 
 
 image_analyzer_service = ImageAnalyzerService()

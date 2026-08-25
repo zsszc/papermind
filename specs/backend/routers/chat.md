@@ -110,8 +110,8 @@
 - **输入**：`multipart/form-data`；`file: UploadFile` 必填；`question: str = Form("请描述这张图片的内容，并解释其在学术论文中可能的含义。")` 可选
 - **前置校验**：文件字节为空 → 400 `"图片内容为空"`；`filename` 缺失按 `"image.jpg"` 处理
 - **路由层无校验项**：不限制文件大小、不校验真实图片格式/mime（mime 由服务层按文件名后缀猜测，见 image_analyzer.md）
-- **输出**：SSE 流——增量帧 `{"delta": ..., "finished": false}`（**无 `conversation_id`**，不落库），尾帧 `{"delta": "", "finished": true}`
-- **异常**：分析过程异常由服务层吞掉并以带内错误串（`\n[图片分析失败: ...]`）作为普通 delta 产出（image_analyzer.md），路由层无 try/except
+- **输出**：SSE 流——增量帧 `{"delta": ..., "finished": false}`（**无 `conversation_id`**，不落库），成功尾帧携带 `{"delta":"","finished":true,"content":"<全文>"}`
+- **异常**：分析异常或空结果转固定脱敏 `{error,error_code}` 终态；不发送 finished，不把错误当正文
 - **副作用**：网络调用（多模态 LLM）；**无任何 DB 写入**
 - **死导入**：`schemas.ImageAnalysisRequest` 已定义且被本模块 import，但端点用 `Form` 参数、从未使用该模型
 
@@ -226,7 +226,7 @@
 - [ ] AC6：会话 CRUD——列表按 `updated_at` 降序；创建固定 `"新对话"`；history 消息升序且字段裁剪为 4 键；删除会话级联删除消息 → 204；不存在均 404
 - [ ] AC7：`delete_messages_from` 删除目标及其后全部消息；`message_count` 回溯为实际剩余消息数（已修复 Batch7b-F11，`TestDeleteMessagesFrom` 固化）
 - [x] AC8：regenerate 前置校验 404/400 分支；成功时原子替换清洗后内容与实际引用，取消/失败保留原内容
-- [ ] AC9：analyze-image 空文件 → 400；正常文件 SSE 帧序列 `delta* + finished`；服务层异常时带内错误串
+- [x] AC9：analyze-image 空文件 → 400；正常文件 SSE 帧序列 `delta* + finished(content)`；服务层异常时固定 error 且无 finished
 - [ ] AC10：`GET /api/chat/skills` 返回 6 个默认 Skill 的 3 键 dict 列表
 - [x] AC11：LLM 失败转固定脱敏 `{error,error_code}`，无 finished、无 assistant 写入，regenerate 原样回滚
 
