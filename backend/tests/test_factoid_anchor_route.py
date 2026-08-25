@@ -180,7 +180,7 @@ def test_anchor_route_failure_is_explicit_runtime_degradation(db, monkeypatch):
     }
 
 
-def test_eval_anchor_profile_is_train_dev_only_and_requires_snapshot(tmp_path):
+def test_eval_anchor_profile_is_train_only_and_requires_snapshot(tmp_path):
     parser = run.build_parser()
     safe = parser.parse_args([
         "--dataset", "eval/private/qa_private_v1.jsonl",
@@ -196,6 +196,8 @@ def test_eval_anchor_profile_is_train_dev_only_and_requires_snapshot(tmp_path):
 
     safe.split = "holdout"
     assert "禁止 holdout" in run._validate_cli_args(safe)
+    safe.split = "dev"
+    assert "只允许 train" in run._validate_cli_args(safe)
     safe.split = "train"
     safe.vector_dir = None
     assert "vector-dir" in run._validate_cli_args(safe)
