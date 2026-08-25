@@ -11,6 +11,7 @@ from typing import Any
 
 from eval.dataset import load_dataset, validate_dataset
 from eval.deterministic_hnsw_gate import evaluate_paired_dev
+from eval.deterministic_vector_snapshot import read_raw_snapshot_manifest
 from eval.metrics import latency_stats, mrr, ndcg_at_k, recall_at_k
 from eval.run import (
     Retriever,
@@ -94,12 +95,13 @@ def evaluate_paired_retrieval(
     return result
 
 
-def _snapshot_binding(audit: dict[str, Any]) -> dict[str, Any]:
+def _snapshot_binding(
+    audit: dict[str, Any], preopen: dict[str, Any]
+) -> dict[str, Any]:
     fields = (
         "vector_count",
         "embedding_dimension",
         "vector_manifest_sha256",
-        "hnsw_binary_manifest_sha256",
         "embedding_id_manifest_sha256",
         "hnsw_space",
         "hnsw_num_threads",
@@ -108,7 +110,20 @@ def _snapshot_binding(audit: dict[str, Any]) -> dict[str, Any]:
         "collection_metadata",
         "segment_metadata",
     )
-    return {field: audit.get(field) for field in fields}
+    return {
+        **{field: audit.get(field) for field in fields},
+        # 默认 HNSW 会在 client 打开/查询时重写 data_level0/length 的运行时
+        # 区域；同源结构必须绑定首次打开前的原始副本指纹。
+        "hnsw_binary_manifest_sha256": preopen[
+            "hnsw_binary_manifest_sha256"
+        ],
+        "preopen_full_binary_manifest_sha256": preopen[
+            "hnsw_full_binary_manifest_sha256"
+        ],
+        "postopen_binary_manifest_sha256": audit.get(
+            "hnsw_binary_manifest_sha256"
+        ),
+    }
 
 
 def run_paired_dev(args: argparse.Namespace) -> tuple[dict[str, Any], bool]:
@@ -146,6 +161,17 @@ def run_paired_dev(args: argparse.Namespace) -> tuple[dict[str, Any], bool]:
             )
         )
         benchmark["page_text_manifest_sha256"] = page_manifest
+
+        baseline_preopen = read_raw_snapshot_manifest(baseline_path)
+        candidate_preopen = read_raw_snapshot_manifest(candidate_path)
+        for key in (
+            "vector_count",
+            "embedding_dimension",
+            "embedding_id_manifest_sha256",
+            "hnsw_binary_manifest_sha256",
+        ):
+            if baseline_preopen.get(key) != candidate_preopen.get(key):
+                raise ValueError(f"配对快照首次打开前指纹不一致: {key}")
 
         baseline = Retriever(
             db,
@@ -189,11 +215,11 @@ def run_paired_dev(args: argparse.Namespace) -> tuple[dict[str, Any], bool]:
             "top_k": 5,
         },
         "baseline": {
-            **_snapshot_binding(baseline_audit),
+            **_snapshot_binding(baseline_audit, baseline_preopen),
             **paired["baseline"],
         },
         "candidate": {
-            **_snapshot_binding(candidate_audit),
+            **_snapshot_binding(candidate_audit, candidate_preopen),
             **paired["candidate"],
         },
         "items": paired["items"],
