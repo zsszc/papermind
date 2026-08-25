@@ -168,4 +168,77 @@ describe('ChatPanel operation lifecycle', () => {
     expect(document.body.textContent).not.toContain('不应保留的半条秘密')
     expect(apiMocks.listConversations).toHaveBeenCalledTimes(1)
   })
+
+  it('历史引用只渲染在所属 assistant 消息内', async () => {
+    apiMocks.listConversations.mockResolvedValue({
+      data: [{ id: 3, title: '引用历史', message_count: 4 }],
+    })
+    apiMocks.getHistory.mockResolvedValue({
+      data: {
+        messages: [
+          { id: 1, role: 'user', content: '问题一', citations: [] },
+          {
+            id: 2,
+            role: 'assistant',
+            content: '回答一',
+            citations: [{ paper_id: 1, title: '第一篇证据', year: 2024 }],
+          },
+          { id: 3, role: 'user', content: '问题二', citations: [] },
+          {
+            id: 4,
+            role: 'assistant',
+            content: '回答二',
+            citations: [{ paper_id: 2, title: '第二篇证据', year: 2025 }],
+          },
+        ],
+      },
+    })
+    render(<ChatPanel fullHeight />)
+
+    fireEvent.click(screen.getByRole('button', { name: /历史/ }))
+    fireEvent.click(await screen.findByText('引用历史'))
+
+    const firstAnswer = await screen.findByText('回答一')
+    const secondAnswer = await screen.findByText('回答二')
+    expect(firstAnswer.closest('[data-message-role="assistant"]')).toHaveTextContent('第一篇证据（2024）')
+    expect(firstAnswer.closest('[data-message-role="assistant"]')).not.toHaveTextContent('第二篇证据')
+    expect(secondAnswer.closest('[data-message-role="assistant"]')).toHaveTextContent('第二篇证据（2025）')
+  })
+
+  it('finished 缺少 content 时丢弃 provisional 并按协议失败', async () => {
+    apiMocks.apiFetch.mockResolvedValue(responseFromEvents([
+      { delta: '不完整的半条回答', finished: false },
+      { delta: '', finished: true, citations: [{ paper_id: 1, title: '不应提交的引用' }] },
+    ]))
+    render(<ChatPanel fullHeight />)
+    fireEvent.change(screen.getByPlaceholderText('输入问题，基于文献库回答...'), {
+      target: { value: '协议问题' },
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /发送/ }))
+
+    expect(await screen.findByText('[请求失败，请稍后重试]')).toBeInTheDocument()
+    expect(document.body.textContent).not.toContain('不完整的半条回答')
+    expect(document.body.textContent).not.toContain('不应提交的引用')
+  })
+
+  it('图片 delta 后 error 丢弃半条正文', async () => {
+    apiMocks.analyzeImage.mockResolvedValue(responseFromEvents([
+      { delta: '图片半条秘密', finished: false },
+      { error: '图片服务失败' },
+    ]))
+    const { container } = render(<ChatPanel fullHeight />)
+    const fileInput = container.querySelector('input[type="file"]')
+    fireEvent.change(fileInput, {
+      target: { files: [new File(['image'], 'figure.png', { type: 'image/png' })] },
+    })
+    fireEvent.change(screen.getByPlaceholderText('输入问题，基于文献库回答...'), {
+      target: { value: '分析图片' },
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /发送/ }))
+
+    expect(await screen.findByText('[图片分析失败，请稍后重试]')).toBeInTheDocument()
+    expect(document.body.textContent).not.toContain('图片半条秘密')
+  })
 })
