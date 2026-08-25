@@ -88,7 +88,7 @@ export async function readSSEStream(
         throw new SSEProtocolError('SSE error 必须是非空字符串')
       }
       terminal = 'error'
-      onError?.(data.error)
+      onError?.(data.error, data)
       return
     }
     if (Object.prototype.hasOwnProperty.call(data, 'delta') && typeof data.delta !== 'string') {

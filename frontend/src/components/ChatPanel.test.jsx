@@ -205,6 +205,55 @@ describe('ChatPanel operation lifecycle', () => {
     expect(secondAnswer.closest('[data-message-role="assistant"]')).toHaveTextContent('第二篇证据（2025）')
   })
 
+  it('重新生成冲突后按服务端历史对账正文、引用与 revision', async () => {
+    apiMocks.listConversations.mockResolvedValue({
+      data: [{ id: 5, title: '并发会话', message_count: 2 }],
+    })
+    apiMocks.getHistory
+      .mockResolvedValueOnce({
+        data: {
+          messages: [
+            { id: 1, role: 'user', content: '问题', citations: [], revision: 0 },
+            { id: 2, role: 'assistant', content: '旧回答', citations: [], revision: 0 },
+          ],
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          messages: [
+            { id: 1, role: 'user', content: '问题', citations: [], revision: 0 },
+            {
+              id: 2,
+              role: 'assistant',
+              content: '服务端较新回答',
+              citations: [{ paper_id: 7, title: '较新证据', year: 2026 }],
+              revision: 1,
+            },
+          ],
+        },
+      })
+    apiMocks.regenerateMessage.mockResolvedValue(responseFromEvents([
+      { delta: '本地 provisional', finished: false },
+      { error: '版本冲突', error_code: 'regenerate_conflict' },
+    ]))
+    render(<ChatPanel fullHeight />)
+
+    fireEvent.click(screen.getByRole('button', { name: /历史/ }))
+    fireEvent.click(await screen.findByText('并发会话'))
+    await screen.findByText('旧回答')
+    fireEvent.click(screen.getByLabelText('reload').closest('button'))
+
+    expect(await screen.findByText('服务端较新回答')).toBeInTheDocument()
+    expect(screen.getByText('较新证据（2026）')).toBeInTheDocument()
+    expect(document.body.textContent).not.toContain('本地 provisional')
+    expect(apiMocks.regenerateMessage).toHaveBeenCalledWith(
+      5,
+      2,
+      0,
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
+    )
+  })
+
   it('finished 缺少 content 时丢弃 provisional 并按协议失败', async () => {
     apiMocks.apiFetch.mockResolvedValue(responseFromEvents([
       { delta: '不完整的半条回答', finished: false },

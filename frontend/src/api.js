@@ -78,9 +78,11 @@ export const deleteConversation = (id) => api.delete(`/chat/conversations/${id}`
 export const getHistory = (id) => api.get(`/chat/conversations/${id}/history`)
 export const deleteMessagesFrom = (conversationId, messageId) =>
   api.delete(`/chat/conversations/${conversationId}/messages/${messageId}`)
-export const regenerateMessage = (conversationId, messageId, { signal } = {}) =>
+export const regenerateMessage = (conversationId, messageId, expectedRevision, { signal } = {}) =>
   apiFetch(`/api/chat/conversations/${conversationId}/messages/${messageId}/regenerate`, {
     method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ expected_revision: expectedRevision }),
     signal,
   })
 export const sendChatMessage = (data) =>

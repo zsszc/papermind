@@ -207,6 +207,8 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
   const fileInputRef = useRef(null)
   const messagesEndRef = useRef(null)
   const abortCtrlRef = useRef(null)
+  const currentIdRef = useRef(null)
+  const conversationEpochRef = useRef(0)
 
   const fetchConversations = useCallback(async () => {
     try {
@@ -235,8 +237,11 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
 
   const loadHistory = useCallback(async (id) => {
     abortCtrlRef.current?.abort()
+    const epoch = ++conversationEpochRef.current
     try {
       const res = await getHistory(id)
+      if (conversationEpochRef.current !== epoch) return
+      currentIdRef.current = id
       setCurrentId(id)
       setMessages(res.data.messages || [])
     } catch (err) {
@@ -246,10 +251,13 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
 
   const handleNewConversation = useCallback(async ({ cancelActive = true } = {}) => {
     if (cancelActive) abortCtrlRef.current?.abort()
+    const epoch = ++conversationEpochRef.current
     try {
       const res = await createConversation()
+      if (conversationEpochRef.current !== epoch) return null
       const newConv = res.data
       setConversations((prev) => [newConv, ...prev])
+      currentIdRef.current = newConv.id
       setCurrentId(newConv.id)
       setMessages([])
       setDrawerOpen(false)
@@ -263,12 +271,16 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
   const handleDeleteConversation = useCallback(
     async (e, id) => {
       e?.stopPropagation()
-      if (currentId === id) abortCtrlRef.current?.abort()
+      if (currentId === id) {
+        abortCtrlRef.current?.abort()
+        conversationEpochRef.current += 1
+      }
       try {
         await deleteConversation(id)
         message.success('会话已删除')
         setConversations((prev) => prev.filter((c) => c.id !== id))
         if (currentId === id) {
+          currentIdRef.current = null
           setCurrentId(null)
           setMessages([])
         }
@@ -477,15 +489,38 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
       setLoading(true)
       const originalContent = msg.content
       const originalCitations = Array.isArray(msg.citations) ? msg.citations : []
+      const expectedRevision = Number.isInteger(msg.revision) ? msg.revision : 0
+      const operationConversationId = currentId
+      const operationEpoch = conversationEpochRef.current
+
+      const reconcileHistory = async () => {
+        try {
+          const res = await getHistory(operationConversationId)
+          if (
+            currentIdRef.current === operationConversationId
+            && conversationEpochRef.current === operationEpoch
+          ) {
+            setMessages(res.data.messages || [])
+          }
+        } catch {
+          // 对账失败时保留原快照；provisional 已在调用方回滚。
+        }
+      }
 
       try {
-        const response = await regenerateMessage(currentId, msg.id, { signal: controller.signal })
+        const response = await regenerateMessage(
+          operationConversationId,
+          msg.id,
+          expectedRevision,
+          { signal: controller.signal }
+        )
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}`)
         }
 
         let newContent = ''
         let completed = false
+        let failedTerminal = false
         await readSSEStream(
           response,
           (delta) => {
@@ -500,16 +535,25 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
             if (typeof terminal?.content !== 'string') {
               throw new SSEProtocolError('SSE finished 缺少最终正文')
             }
+            if (!Number.isInteger(terminal?.revision)) {
+              throw new SSEProtocolError('SSE finished 缺少消息 revision')
+            }
             const finalContent = terminal.content
             setMessages((prev) => updateMessageByIdentity(
               prev,
               { id: msg.id },
-              { content: finalContent, citations: finalCitations || [], isInterrupted: false }
+              {
+                content: finalContent,
+                citations: finalCitations || [],
+                revision: terminal.revision,
+                isInterrupted: false,
+              }
             ))
             completed = true
           },
           // 后端通过 SSE 下发的 error 事件：提示即可，loading 由 finally 收尾
           (errorMsg) => {
+            failedTerminal = true
             message.error('重新生成失败：' + errorMsg)
             setMessages((prev) => updateMessageByIdentity(
               prev,
@@ -518,7 +562,11 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
             ))
           }
         )
-        if (completed) fetchConversations()
+        if (completed) {
+          fetchConversations()
+        } else if (failedTerminal) {
+          await reconcileHistory()
+        }
       } catch (err) {
         setMessages((prev) => updateMessageByIdentity(
           prev,
@@ -528,6 +576,7 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
         if (err.name !== 'AbortError') {
           message.error('重新生成失败：' + (err.message || '未知错误'))
         }
+        await reconcileHistory()
       } finally {
         if (finishChatOperation(abortCtrlRef, controller)) {
           setLoading(false)

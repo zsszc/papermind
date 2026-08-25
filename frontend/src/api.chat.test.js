@@ -20,11 +20,16 @@ describe('chat API abort signal', () => {
   it('重新生成传递 AbortSignal', async () => {
     const controller = new AbortController()
 
-    await regenerateMessage(2, 9, { signal: controller.signal })
+    await regenerateMessage(2, 9, 3, { signal: controller.signal })
 
     expect(apiFetchMock).toHaveBeenCalledWith(
       '/api/chat/conversations/2/messages/9/regenerate',
-      expect.objectContaining({ method: 'POST', signal: controller.signal })
+      expect.objectContaining({
+        method: 'POST',
+        signal: controller.signal,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ expected_revision: 3 }),
+      })
     )
   })
 

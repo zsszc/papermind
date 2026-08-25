@@ -74,7 +74,7 @@ describe('readSSEStream', () => {
 
   it('错误事件结束流并调用错误回调', async () => {
     const response = responseFromChunks([
-      'data: {"error":"服务繁忙"}\n\ndata: {"delta":"不应读取"}\n\n',
+      'data: {"error":"服务繁忙","error_code":"regenerate_conflict"}\n\ndata: {"delta":"不应读取"}\n\n',
     ])
     const onDelta = vi.fn()
     const onFinish = vi.fn()
@@ -82,7 +82,10 @@ describe('readSSEStream', () => {
 
     await readSSEStream(response, onDelta, onFinish, onError)
 
-    expect(onError).toHaveBeenCalledWith('服务繁忙')
+    expect(onError).toHaveBeenCalledWith(
+      '服务繁忙',
+      { error: '服务繁忙', error_code: 'regenerate_conflict' }
+    )
     expect(onDelta).not.toHaveBeenCalled()
     expect(onFinish).not.toHaveBeenCalled()
     expect(response.cancel).toHaveBeenCalledOnce()
