@@ -1742,6 +1742,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _validate_cli_args(args: argparse.Namespace) -> Optional[str]:
     """返回 CLI 安全契约错误；合法时返回 None。"""
+    if args.split == "holdout":
+        return "通用 CLI 禁止 holdout；必须经预注册专用 Gate"
     for name in ("threshold", "min_mrr", "min_ndcg", "min_factoid_recall"):
         value = getattr(args, name, None)
         if value is not None and not 0.0 <= value <= 1.0:

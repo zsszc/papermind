@@ -195,7 +195,7 @@ def test_eval_anchor_profile_is_train_only_and_requires_snapshot(tmp_path):
     assert run._validate_cli_args(safe) is None
 
     safe.split = "holdout"
-    assert "只允许 train" in run._validate_cli_args(safe)
+    assert "通用 CLI 禁止 holdout" in run._validate_cli_args(safe)
     safe.split = "dev"
     assert "只允许 train" in run._validate_cli_args(safe)
     safe.split = "train"
