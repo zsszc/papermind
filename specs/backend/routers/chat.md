@@ -2,7 +2,7 @@
 
 > 本文件描述 `backend/app/routers/chat.py` 的**行为契约**（做什么），不描述实现细节。
 > 本模块是对话子系统的 HTTP 包装层：LLM 调用契约归 `specs/backend/services/llm.md`（含 SSE 对线协议 3.6 节）、LLM 调用前编排归 `specs/backend/services/agent_graph.md`、记忆读写归 `specs/backend/services/memory_manager.md`、图片分析归 `specs/backend/services/image_analyzer.md`、Skill 注册表归 `specs/backend/services/skills.md`。本规格聚焦端点签名、参数校验、状态码、SSE 事件序列与落库时序，服务层细节一律引用衔接、不重复。
-> 依据源码实际内容反向工程整理；2026-08-25 同步 Batch 23A 生成 Guardrail 与原子 SSE 终态。
+> 依据源码实际内容反向工程整理；2026-08-25 同步 Batch 23D 生成并发、revision 与深度综述原子终态。
 
 ## 1. 背景与目标
 
@@ -223,9 +223,9 @@
 - [x] AC3：非流式分支与 stream/regenerate 使用同一引用清洗与实际引用子集契约
 - [ ] AC4：消息总数为 5 的倍数时 `update_short_term_memory` 被触发（mock 断言调用）；其抛异常时响应不受影响
 - [x] AC5：`message_count` 始终等于真实消息行数；assistant 与计数在同一事务提交
-- [ ] AC6：会话 CRUD——列表按 `updated_at` 降序；创建固定 `"新对话"`；history 消息升序且字段裁剪为 4 键；删除会话级联删除消息 → 204；不存在均 404
+- [ ] AC6：会话 CRUD——列表按 `updated_at` 降序；创建固定 `"新对话"`；history 消息升序且字段裁剪为 `id/role/content/citations/revision`；删除会话级联删除消息 → 204；不存在均 404
 - [ ] AC7：`delete_messages_from` 删除目标及其后全部消息；`message_count` 回溯为实际剩余消息数（已修复 Batch7b-F11，`TestDeleteMessagesFrom` 固化）
-- [x] AC8：regenerate 前置校验 404/400 分支；成功时原子替换清洗后内容与实际引用，取消/失败保留原内容
+- [x] AC8：regenerate 前置校验 404/400/409 分支；请求携带 `expected_revision`，同目标进程内 single-flight；成功时条件更新正文/引用并 revision+1，取消/失败/并发修改保留数据库权威状态
 - [x] AC9：analyze-image 空文件 → 400；正常文件 SSE 帧序列 `delta* + finished(content)`；服务层异常时固定 error 且无 finished
 - [ ] AC10：`GET /api/chat/skills` 返回 6 个默认 Skill 的 3 键 dict 列表
 - [x] AC11：LLM 失败转固定脱敏 `{error,error_code}`，无 finished、无 assistant 写入，regenerate 原样回滚
@@ -235,7 +235,7 @@
 - **已实现（Phase C）**：C1 路由集成——mock LLM 输出含越界引用，SSE 完成后落库 citations 带 `verified=false`、`removed=1`，落库文本越界标记已剔除；全部有效时 `verified=true` 且文本不篡改——`backend/tests/test_chat.py::TestGuardrailsIntegration`（2 用例）。纯函数与 C2 拒答硬约束用例见 `backend/tests/test_guardrails.py`（agent_graph.md 第 7 节）
 - **已覆盖**：`test_chat.py` 覆盖 stream/non-stream/regenerate/deep-review 与落库；`test_generation_guardrails_offline.py` 锁定引用数学、边界、拒答与报告脱敏；前端 SSE / ChatPanel 测试覆盖原子 finished、失败丢弃半条回答和幂等终态。
 - **剩余盲区**（按严重程度）：
-  - **中**：同一会话并发请求的 `message_count` 仍无锁，需要独立 SDD/TDD 循环。
+  - **中**：不同消息/主聊天在同一会话并发写入时，`message_count` 仍依赖最终真实 COUNT，但会话级写锁与顺序语义尚无独立多连接 Harness。
   - **高**：会话 CRUD 的列表/创建/历史/删除仍无测试（AC6）；`delete_messages_from` 的 from 截断语义与 message_count 回溯**已修复并固化（Batch7b-F11，`TestDeleteMessagesFrom` 3 用例：截断回溯/全删归 0/会话 404）**
   - **中**：`update_short_term_memory` 的触发时机（5 的倍数）与双重兜底在路由层无测试（AC4，memory_manager 服务层另有覆盖）
   - **中**：analyze-image 的 400 与 SSE 帧、服务层带内错误串透传无测试（AC9）
@@ -251,4 +251,5 @@
 - **assistant 落库用新 `SessionLocal`**：StreamingResponse 迭代发生在请求会话（Depends 生命周期）关闭之后，必须用全新会话写库；非流式分支无此问题，直接复用请求会话。
 - **citations 实际引用子集**：finished 和落库都不再发布未被答案引用的 retrieved chunk；前端仅在成功终态替换引用列表。
 - **regenerate 独立编排而非复用 agent_graph**：它已共用检索管线与生成 Guardrail，但仍与主链路存在历史截断/skill/联网提示差异；进一步统一须规格先行。
-- **后端从不发 `{error}` 帧**：错误一律带内化（llm.md 第 8 节决策），前端把错误串当正常回复渲染并落库——体验上「对话不中断」，代价是错误内容进入对话历史与后续 prompt 上下文。
+- **生成失败显式 `{error,error_code}` 终态**：错误串、空输出、冲突与最终事务失败都不再当普通正文；失败帧不与 finished 共存，异常原文只记录类型、不进入响应或数据库。
+- **deep-review 延迟建会话**：新任务的 plan/delta 帧 `conversation_id=null`，成功事务内才创建 Conversation、user、assistant 并按真实行数计数；已有会话成功前重新查询，失败保持原状。

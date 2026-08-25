@@ -253,6 +253,11 @@ env -u PYTHONPATH venv/bin/python -m eval.deterministic_vector_snapshot \
   `message_count` 等于真实行数；regenerate 失败保留原正文/引用。前端引用改为消息级，
   文本/图片 error、取消、EOF 与缺失最终正文均丢弃 provisional。生成相关日志不记录
   问题、主题、异常原文或非法引用 token，CI 仅在 Gate 成功后上传报告。
+- **Batch 23D 生成并发与深度综述事务完成**：deep-review 新任务在成功终态前不创建
+  Conversation，规划/汇总/空输出/Guardrail 清空/取消失败均无孤儿；成功时会话、两条
+  消息和真实计数一次提交。messages 新增 `revision` 轻量迁移，regenerate 要求
+  `expected_revision`，以进程内 active-set 避免重复 Kimi 调用，并用 revision 条件更新
+  防跨进程覆盖；冲突、目标删除、断流或取消后前端从 history 对账且有会话 epoch 门禁。
 - **Batch 21 邻域候选未晋级**：`hybrid-local-neighbor`（semantic top20、同论文 ±2、固定 rank-distance 衰减）dev 为 0.625/0.36389/0.43005，factoid 仍 0.333、P95=270.1ms；MRR/NDCG/factoid Gate 失败，生产默认保持 shared hybrid。候选仅供显式复现
 - **Batch 22 双语 v2 未进入 dev**：`bm25-bilingual-v2` 仅新增四条病理术语映射，train 质量与 v1 完全相同（0.66667/0.42361/0.48529，factoid=0.50），未达到至少新增 1 题的 Gate，因此按预案跳过 dev；生产继续使用 `bm25-bilingual`
 - **Batch 22B 消费者已收敛**：聊天、重新生成、深度综述、论文引用推荐和 eval 的 chunk RAG 都经共享 `RetrievalPipeline`；论文引用零证据时跳过 LLM，显式单篇论文范围禁止 graph 越界，论文发现页语义异常保留 FTS 结果
@@ -308,4 +313,4 @@ env -u PYTHONPATH venv/bin/python -m eval.deterministic_vector_snapshot \
 
 ---
 
-> 最后更新：2026-08-25，Batch 23C 生成失败事务闭环完成后同步。
+> 最后更新：2026-08-25，Batch 23D 生成并发与深度综述事务完成后同步。
