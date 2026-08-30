@@ -95,7 +95,7 @@ Kimi API (kimi-k2.6) —— 对话 / 概括 / 联网搜索 / 图片分析
 │   │   ├── schemas.py      # Pydantic 请求/响应模型
 │   │   └── main.py         # FastAPI 入口（lifespan、CORS、/mcp 挂载、/static 白名单）
 │   ├── eval/               # RAG/生成 Guardrail 评测：公开 fixture、私有 QA、run.py、generation_guardrails.py
-│   ├── tests/              # pytest 套件（894 用例，内存 SQLite + TestClient）
+│   ├── tests/              # pytest 套件（912 用例，内存 SQLite + TestClient）
 │   ├── venv/               # Python 3.12 虚拟环境（会被 electron-builder 打包）
 │   ├── pyproject.toml      # 依赖声明 + pytest/ruff 配置
 │   └── requirements.txt    # 锁定依赖（与 pyproject 保持一致）
@@ -194,7 +194,7 @@ cd ../electron && npm run build    # 产物在 frontend/out/（dmg/zip/exe）
 
 ## 8. 测试与评测
 
-### 单元/集成测试（pytest，911 个用例）
+### 单元/集成测试（pytest，912 个用例）
 
 ```bash
 cd backend
@@ -211,7 +211,7 @@ cd ../electron && npm test       # node:test（health / wait / restart / kill �
 ```
 
 前端测试依赖包含 MSW，新增网络交互测试不得连接真实后端；Electron 生命周期与安全策略纯模块不得
-`require('electron')`，确保 CI 无 GUI 也能运行。当前后端 911 个测试、前端 55 个测试、Electron 26 个测试。
+`require('electron')`，确保 CI 无 GUI 也能运行。当前后端 912 个测试、前端 55 个测试、Electron 26 个测试。
 
 ### RAG 评测（backend/eval/）
 
