@@ -107,6 +107,55 @@ def test_cli_runs_in_clean_subprocess_and_publishes_content_free_report(tmp_path
         "private_path_attempts": 0,
         "real_service_module_count": 0,
     }
+    by_id = {item["scenario_id"]: item for item in report["scenarios"]}
+    active = by_id["regenerate-active-second-request"]
+    assert active["terminal"] == "finished"
+    assert active["peer_http_status"] == 409
+    assert active["request_count"] == 2
+    assert active["fake_llm_calls"] == active["fake_retrieval_calls"] == 1
+    assert active["coordination_verified"] is True
+    assert active["active_release_verified"] is True
+    assert active["worker_join_verified"] is True
+
+    revision = by_id["regenerate-external-revision-conflict"]
+    assert revision["terminal"] == "error"
+    assert revision["error_code"] == "regenerate_conflict"
+    assert revision["external_commit_verified"] is True
+    assert revision["target_state_verified"] is True
+
+    deleted = by_id["regenerate-external-delete"]
+    assert deleted["peer_http_status"] == 204
+    assert deleted["error_code"] == "regenerate_target_missing"
+    assert deleted["external_commit_verified"] is True
+    assert deleted["target_state_verified"] is True
+
+    cancelled = by_id["regenerate-cancel-release-retry"]
+    assert cancelled["terminal"] == "none"
+    assert cancelled["retry_http_status"] == 200
+    assert cancelled["retry_finished_count"] == 1
+    assert cancelled["fake_llm_calls"] == cancelled["fake_retrieval_calls"] == 2
+    assert cancelled["active_release_verified"] is True
+    assert cancelled["target_state_verified"] is True
+
+    from eval.failure_transactions import validate_public_report
+
+    invalid_proof = json.loads(json.dumps(report))
+    invalid_proof["offline_proof"]["fake_llm_calls"] += 1
+    try:
+        validate_public_report(invalid_proof)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("报告 offline proof 与场景求和漂移时必须 fail closed")
+
+    invalid_pass = json.loads(json.dumps(report))
+    invalid_pass["scenarios"][-1]["retry_finished_count"] = 0
+    try:
+        validate_public_report(invalid_pass)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("场景 PASS 与冻结行为证据矛盾时必须 fail closed")
     rendered = report_path.read_text(encoding="utf-8")
     for forbidden in (
         "synthetic-question",

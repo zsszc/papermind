@@ -123,6 +123,8 @@ _SCENARIO_REPORT_KEYS = {
     "scenario_id",
     "operation",
     "failure",
+    "terminal",
+    "error_code",
     "passed",
     "terminal_count",
     "finished_count",
@@ -195,7 +197,22 @@ def validate_public_report(report: dict[str, Any]) -> None:
             char not in "0123456789abcdef" for char in value
         ):
             raise ValueError("失败事务报告 SHA256 格式无效")
+    allowed_error_codes = {
+        None,
+        "llm_generation_failed",
+        "finalization_failed",
+        "deep_review_plan_failed",
+        "regenerate_conflict",
+        "regenerate_target_missing",
+    }
     for item in scenarios:
+        expected = _EXPECTED_SCENARIOS[item["scenario_id"]]
+        if item["operation"] != expected[0] or item["failure"] != expected[1]:
+            raise ValueError("失败事务场景元数据与冻结契约不匹配")
+        if item["terminal"] not in {"finished", "error", "none", "invalid"}:
+            raise ValueError("失败事务场景终态枚举无效")
+        if item["error_code"] not in allowed_error_codes:
+            raise ValueError("失败事务场景错误码枚举无效")
         for key in (
             "passed",
             "db_invariants_passed",
@@ -226,8 +243,53 @@ def validate_public_report(report: dict[str, Any]) -> None:
                 isinstance(value, bool) or not isinstance(value, int) or value < 100
             ):
                 raise ValueError("失败事务场景可选状态码类型无效")
+        if item["fake_calls"] != (
+            item["fake_llm_calls"]
+            + item["fake_retrieval_calls"]
+            + item["fake_deep_review_calls"]
+        ):
+            raise ValueError("失败事务场景 fake 调用汇总不一致")
+        if item["passed"]:
+            expected_terminal_count = int(expected[2] != "none")
+            expected_finished_count = int(expected[2] == "finished")
+            expected_retry_finished = int(expected[6] is not None)
+            expected_coordination = item["scenario_id"] in {
+                "regenerate-active-second-request",
+                "regenerate-external-revision-conflict",
+                "regenerate-external-delete",
+            }
+            expected_external = item["scenario_id"] in {
+                "regenerate-external-revision-conflict",
+                "regenerate-external-delete",
+            }
+            passed_contract = (
+                item["terminal"] == expected[2]
+                and item["error_code"] == expected[3]
+                and item["http_status"] == expected[4]
+                and item["peer_http_status"] == expected[5]
+                and item["retry_http_status"] == expected[6]
+                and item["request_count"] == expected[7]
+                and item["fake_llm_calls"] == expected[8]
+                and item["fake_retrieval_calls"] == expected[9]
+                and item["fake_deep_review_calls"] == expected[10]
+                and item["terminal_count"] == expected_terminal_count
+                and item["finished_count"] == expected_finished_count
+                and item["retry_finished_count"] == expected_retry_finished
+                and item["db_invariants_passed"]
+                and item["coordination_verified"] is expected_coordination
+                and item["external_commit_verified"] is expected_external
+                and item["target_state_verified"]
+                and item["active_release_verified"]
+                and item["worker_join_verified"]
+            )
+            if not passed_contract:
+                raise ValueError("失败事务场景 PASS 与冻结行为证据不一致")
     if set(report.get("overall") or {}) != set(_VIOLATION_KEYS):
         raise ValueError("失败事务 overall schema 不兼容")
+    if report["overall"]["scenario_failure_count"] != sum(
+        not item["passed"] for item in scenarios
+    ):
+        raise ValueError("失败事务失败场景汇总不一致")
     if set(report.get("offline_proof") or {}) != {
         "fake_llm_calls",
         "fake_retrieval_calls",
@@ -1143,6 +1205,8 @@ def _run_scenario(
         "scenario_id": scenario_id,
         "operation": scenario["operation"],
         "failure": scenario["failure"],
+        "terminal": actual_terminal,
+        "error_code": actual_error_code,
         "passed": passed,
         "terminal_count": len(terminals),
         "finished_count": finished_count,
