@@ -181,8 +181,7 @@ _USER_PROMPT_TEMPLATE = """下面是论文「{title}」的按页内容摘录（�
 ---论文内容结束---
 
 请基于以上内容设计 {n} 条评测 QA，要求：
-1. 第 1 条 question_type 为 factoid（单一事实/数值），第 2 条为 method_detail
-   （方法细节），第 3 条为 summary（总结概括）；
+{type_instruction}
 2. 每条问题必须能由上述原文直接回答，不得涉及原文没有的信息；
 3. question 用中文，具体、聚焦；
 4. answer 为参考答案要点：用「、」分隔的短小关键短语（数值、模块名、结论词），
@@ -196,13 +195,27 @@ _USER_PROMPT_TEMPLATE = """下面是论文「{title}」的按页内容摘录（�
   "evidence_quote": "...", "evidence_page": 1}}]}}
 """
 
+_ROTATION_INSTRUCTION = (
+    "1. 第 1 条 question_type 为 factoid（单一事实/数值），第 2 条为 method_detail\n"
+    "   （方法细节），第 3 条为 summary（总结概括）；"
+)
 
-def build_messages(title: str, material: str, n: int) -> List[Dict[str, str]]:
-    """构造单篇论文 QA 生成的对话消息。"""
+
+def build_messages(
+    title: str, material: str, n: int, first_type: Optional[str] = None
+) -> List[Dict[str, str]]:
+    """构造单篇论文 QA 生成的对话消息。
+
+    first_type（仅 n=1 时生效）：指定本条的问题类型——逐条生成模式下由调用方轮换。
+    """
+    if first_type is not None and n == 1:
+        type_instruction = f"1. 本条 question_type 为 {first_type}；"
+    else:
+        type_instruction = _ROTATION_INSTRUCTION
     return [
         {"role": "system", "content": _SYSTEM_PROMPT},
         {"role": "user", "content": _USER_PROMPT_TEMPLATE.format(
-            title=title, material=material, n=n)},
+            title=title, material=material, n=n, type_instruction=type_instruction)},
     ]
 
 
@@ -367,32 +380,43 @@ def generate_for_paper(
     page_texts = [(p.get("text") or "") for p in ordered]
     material = build_material(
         paper.title, getattr(paper, "abstract", None), ordered, material_budget)
-    messages = build_messages(paper.title or "(无标题)", material, per_paper)
     prefix = f"gen2-p{paper.id:02d}"
 
-    last_error = "未知错误"
+    # Kimi 实测（2026-08-31）：单次请求多条长 JSON 输出易整包返回空；
+    # 改为逐条生成（每条独立重试），类型按 QUESTION_TYPE_ROTATION 轮换。
+    collected: List[dict] = []
     rejected_total = 0
-    for attempt in range(1, max_attempts + 1):
-        if attempt > 1 and retry_sleep > 0:
-            time.sleep(retry_sleep)
-        try:
-            raw_text = llm(messages)
-            payload = parse_llm_json(raw_text)
-        except Exception as e:  # 含 LLM 调用异常与解析失败
-            last_error = f"第 {attempt} 次调用/解析失败: {e}"
-            continue
-        items, rejected = build_items_from_payload(
-            payload,
-            paper_uid=paper_uid,
-            split=split,
-            page_texts=page_texts,
-            qa_id_prefix=prefix,
-        )
-        rejected_total += rejected
-        if items:
-            return items, "", rejected_total
-        last_error = f"第 {attempt} 次生成全部被过滤（schema/证据校验未过）"
-    return [], last_error, rejected_total
+    last_error = "未知错误"
+    for idx in range(per_paper):
+        qtype = QUESTION_TYPE_ROTATION[idx % len(QUESTION_TYPE_ROTATION)]
+        messages = build_messages(paper.title or "(无标题)", material, 1, first_type=qtype)
+        for attempt in range(1, max_attempts + 1):
+            if attempt > 1 and retry_sleep > 0:
+                time.sleep(retry_sleep)
+            try:
+                raw_text = llm(messages)
+                payload = parse_llm_json(raw_text)
+            except Exception as e:  # 含 LLM 调用异常与解析失败
+                last_error = f"第 {idx + 1} 条第 {attempt} 次调用/解析失败: {e}"
+                continue
+            items, rejected = build_items_from_payload(
+                payload,
+                paper_uid=paper_uid,
+                split=split,
+                page_texts=page_texts,
+                qa_id_prefix=prefix,
+                start_seq=len(collected) + 1,
+            )
+            rejected_total += rejected
+            # 只收与本次请求类型一致的条目（类型不匹配不落库，避免重复事实题）
+            matched = [it for it in items if it.get("question_type") == qtype]
+            if matched:
+                collected.append(matched[0])
+                break
+            last_error = f"第 {idx + 1} 条第 {attempt} 次生成全部被过滤（schema/证据校验未过）"
+    if not collected:
+        return [], last_error, rejected_total
+    return collected, "", rejected_total
 
 
 # ---------------------------------------------------------------------------

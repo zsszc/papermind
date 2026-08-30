@@ -348,12 +348,14 @@ class TestGenerateForPaper:
                      file_path=f"papers/p{pid}.pdf", filename=f"p{pid}.pdf")
 
     def test_retry_on_bad_json_then_success(self):
-        responses = iter(["not json", _valid_payload()])
+        # 逐条生成（Kimi 多条长 JSON 易空响应的实测对策）：
+        # 第 1 条首次坏 JSON、重试成功；第 2/3 条各一次成功 → 共 4 次调用
+        responses = iter(["not json", _valid_payload(), _valid_payload(), _valid_payload()])
         calls = []
         items, error, rejected = generate_qa_v2.generate_for_paper(
             self._paper(), _pages(), paper_uid="doi:10.1/alpha", split="train",
             call_llm=lambda m: (calls.append(m), next(responses))[1])
-        assert error == "" and len(items) == 3 and len(calls) == 2
+        assert error == "" and len(items) == 3 and len(calls) == 4
 
     def test_all_attempts_fail_degrades_empty(self):
         items, error, rejected = generate_qa_v2.generate_for_paper(
@@ -362,16 +364,17 @@ class TestGenerateForPaper:
         assert items == [] and "第 2 次" in error
 
     def test_prompt_asks_rotation_and_unique_short_quote(self):
-        """prompt 必须要求三种轮换类型与「短而独特」的逐字证据。"""
+        """逐条生成模式下，每次调用各要求一种轮换类型（三次调用覆盖三型）。"""
         seen = []
         generate_qa_v2.generate_for_paper(
             self._paper(), _pages(), paper_uid="doi:10.1/alpha", split="train",
             call_llm=lambda m: (seen.append(m), _valid_payload())[1])
-        user = seen[0][-1]["content"]
-        for qtype in ("factoid", "method_detail", "summary"):
+        assert len(seen) == 3
+        for call, qtype in zip(seen, ("factoid", "method_detail", "summary")):
+            user = call[-1]["content"]
             assert qtype in user
-        assert "逐字" in user and "独特" in user and "evidence_page" in user
-        assert "【第 1 页】" in user  # 素材带 1-based 页码标签
+            assert "逐字" in user and "独特" in user and "evidence_page" in user
+            assert "【第 1 页】" in user  # 素材带 1-based 页码标签
 
 
 # ---------------------------------------------------------------------------
@@ -494,7 +497,9 @@ class TestGenerateAll:
         ]}, ensure_ascii=False)
         summary, _ = self._run(
             db, tmp_path, call_llm=lambda m: payload)
-        assert summary["rejected"] == 2  # 两篇各拒 1 条
+        # 逐条生成：坏证据条目每次调用都被拒；factoid 槽位 1 次成功（拒 1），
+        # method_detail/summary 槽位类型不匹配各重试 3 次（各拒 3）→ 每篇 1+3+3=7，两篇 14
+        assert summary["rejected"] == 14
         assert summary["total"] == 2
 
 
