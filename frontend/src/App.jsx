@@ -180,6 +180,8 @@ function App() {
               size="small"
               icon={collapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
               onClick={() => setCollapsed((c) => !c)}
+              // a11y 契约（Batch 24 T2）：icon-only 按钮必须有中文可访问名称
+              aria-label={collapsed ? '展开侧边栏' : '收起侧边栏'}
               style={{ color: colors.textSecondary }}
             />
           </div>

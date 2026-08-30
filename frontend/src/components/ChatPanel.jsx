@@ -683,7 +683,8 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
       }
       extra={
         fullHeight ? null : (
-          <Button type="text" icon={<CloseOutlined />} onClick={() => setVisible(false)} />
+          // a11y 契约（Batch 24 T2）：icon-only 按钮必须有中文可访问名称
+          <Button type="text" icon={<CloseOutlined />} aria-label="关闭对话面板" onClick={() => setVisible(false)} />
         )
       }
       style={{
@@ -857,6 +858,8 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
                 rows={2}
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
+                // a11y 契约（Batch 24 T2）：placeholder 不算合规可访问名称，显式命名输入框
+                aria-label="对话输入框"
                 placeholder={
                   activeSkill
                     ? `当前 Skill：${activeSkill}，输入内容后点击发送...`
@@ -908,6 +911,8 @@ function ChatPanel({ fullHeight = false, onSelectPaper }) {
           shape="circle"
           icon={<MessageOutlined />}
           size="large"
+          // a11y 契约（Batch 24 T2）：icon-only 按钮必须有中文可访问名称
+          aria-label="打开对话面板"
           style={{
             ...componentStyles.fab,
             width: 56,
