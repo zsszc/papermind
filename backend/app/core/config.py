@@ -43,6 +43,39 @@ class Config:
         with open(config_path, "r", encoding="utf-8") as f:
             self._config = yaml.safe_load(f) or {}
 
+        # 回滚/升级兼容（Batch 24 T4）：数据目录模式下，旧版配置缺失的后增键
+        # 按公开模板递归补默认值——仅内存合并，不回写磁盘（不覆盖用户配置字节），
+        # 用户已有的自定义项（含真实 Key）一律保留优先。
+        if env_data_dir:
+            self._merge_template_defaults(project_root)
+
+    @staticmethod
+    def _deep_fill_missing(target: dict, template: dict) -> None:
+        """把 template 中 target 缺失的键递归补入（仅内存）；同名键以 target 为准。"""
+        for key, tpl_val in template.items():
+            if key not in target:
+                target[key] = tpl_val
+            elif isinstance(target.get(key), dict) and isinstance(tpl_val, dict):
+                Config._deep_fill_missing(target[key], tpl_val)
+
+    def _merge_template_defaults(self, project_root: Path) -> None:
+        example_config = project_root / "config.yaml.example"
+        if not isinstance(self._config, dict) or not example_config.exists():
+            return
+        try:
+            with open(example_config, "r", encoding="utf-8") as f:
+                template = yaml.safe_load(f) or {}
+            if isinstance(template, dict):
+                self._deep_fill_missing(self._config, template)
+        except Exception:
+            # 模板读取失败不阻断启动：缺失键维持 get() 的 default 兜底。
+            # logger 延迟导入——logger.py 依赖本模块的 config，顶层导入会循环。
+            try:
+                from app.core.logger import logger
+                logger.warning("[config] 模板默认补齐失败，按现有配置继续")
+            except Exception:
+                pass
+
     def get(self, key: str, default: Any = None) -> Any:
         keys = key.split(".")
         value = self._config

@@ -9,6 +9,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "preview": "vite preview",
+    "check:artifact": "python3 ../scripts/check_artifact_budget.py",
     "lint": "eslint . --ext js,jsx --report-unused-disable-directives --max-warnings 0",
     "electron:dev": "cd ../electron && NODE_ENV=development npx electron .",
     "electron:build": "npm run build && cd ../electron && npx electron-builder"
