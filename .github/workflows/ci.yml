@@ -45,6 +45,21 @@ jobs:
           PYTHONPATH: ""
         run: python -m pytest tests/ -q
 
+      - name: 安装 Node.js 20（发布候选 E2E 调度器）
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: 运行发布候选真实 E2E
+        working-directory: electron
+        env:
+          PAPERMIND_RELEASE_E2E: "1"
+          PAPERMIND_PYTHON: python
+        run: >-
+          node --test
+          test/release-flow.test.js
+          test/data-dir-migration.test.js
+
       - name: 运行真实回环身份 smoke
         working-directory: electron
         env:

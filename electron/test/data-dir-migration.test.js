@@ -26,8 +26,10 @@ const {
 const { getAvailablePort } = require('../runtime-identity')
 
 const PROJECT_ROOT = path.join(__dirname, '..', '..')
-const VENV_PYTHON = path.join(PROJECT_ROOT, 'backend', 'venv', 'bin', 'python')
+const REPO_VENV_PYTHON = path.join(PROJECT_ROOT, 'backend', 'venv', 'bin', 'python')
+const VENV_PYTHON = process.env.PAPERMIND_PYTHON || REPO_VENV_PYTHON
 const BACKEND_CWD = path.join(PROJECT_ROOT, 'backend')
+const RUN_RELEASE_E2E = process.env.PAPERMIND_RELEASE_E2E === '1'
 
 const BOOT_TIMEOUT_MS = 60_000
 const REQUEST_TIMEOUT_MS = 15_000
@@ -245,6 +247,9 @@ async function bootBackend(t, dataDir, label) {
 const fixture = { dir: '', dbPath: '', configPath: '', configSha256Before: '' }
 const active = { proc: null }
 
+if (!RUN_RELEASE_E2E) {
+  test('数据目录升级流程仅由显式 Gate 调度', { skip: '需 PAPERMIND_RELEASE_E2E=1' }, () => {})
+} else {
 test.before(() => {
   fixture.dir = fs.mkdtempSync(path.join(os.tmpdir(), 'papermind-v1-'))
   fs.mkdirSync(path.join(fixture.dir, 'vector_db'), { recursive: true })
@@ -336,3 +341,4 @@ test('回滚：旧配置缺字段按模板补默认且用户 Key 与自定义项
   assert.equal(loaded.api_key, 'sk-v1-user-key-abcdef0123456789', '用户 API Key 被覆盖')
   assert.equal(loaded.model, 'user-custom-model', '用户自定义 model 被模板覆盖')
 })
+}

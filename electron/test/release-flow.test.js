@@ -29,8 +29,10 @@ const {
 const { getAvailablePort } = require('../runtime-identity')
 
 const PROJECT_ROOT = path.join(__dirname, '..', '..')
-const VENV_PYTHON = path.join(PROJECT_ROOT, 'backend', 'venv', 'bin', 'python')
+const REPO_VENV_PYTHON = path.join(PROJECT_ROOT, 'backend', 'venv', 'bin', 'python')
+const VENV_PYTHON = process.env.PAPERMIND_PYTHON || REPO_VENV_PYTHON
 const BACKEND_CWD = path.join(PROJECT_ROOT, 'backend')
+const RUN_RELEASE_E2E = process.env.PAPERMIND_RELEASE_E2E === '1'
 
 // 硬上限：后端启动 60s（冷启动含 torch 导入失败路径）、单请求 30s、全程 120s
 const BOOT_TIMEOUT_MS = 60_000
@@ -230,7 +232,9 @@ function attachTarget() {
 }
 
 async function spawnBackend(t) {
-  assert.ok(fs.existsSync(VENV_PYTHON), `Python 解释器不存在: ${VENV_PYTHON}`)
+  if (path.isAbsolute(VENV_PYTHON)) {
+    assert.ok(fs.existsSync(VENV_PYTHON), `Python 解释器不存在: ${VENV_PYTHON}`)
+  }
   backend.port = await getAvailablePort()
   backend.token = crypto.randomBytes(32).toString('hex')
   backend.instanceId = crypto.randomUUID()
@@ -262,6 +266,9 @@ async function spawnBackend(t) {
   t.diagnostic(`后端已就绪: http://127.0.0.1:${backend.port}（启动含探针共 ${Date.now() - SUITE_STARTED_AT}ms）`)
 }
 
+if (!RUN_RELEASE_E2E) {
+  test('发布候选真实流程仅由显式 Gate 调度', { skip: '需 PAPERMIND_RELEASE_E2E=1' }, () => {})
+} else {
 test.before(async (t) => {
   if (process.env.RELEASE_FLOW_BACKEND_URL) attachTarget()
   else await spawnBackend(t)
@@ -372,3 +379,4 @@ test('后端子进程干净关闭（泄漏即失败）', { timeout: 15_000 }, as
   assert.equal(stopped, true, '后端子进程未能在 SIGTERM+SIGKILL 后退出')
   assert.equal(isProcessRunning(backend.proc), false, '后端子进程泄漏：退出后仍存活')
 })
+}

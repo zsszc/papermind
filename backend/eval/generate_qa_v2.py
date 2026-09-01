@@ -31,6 +31,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import stat
+import sys
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -369,6 +371,8 @@ def generate_for_paper(
     call_llm: Optional[Callable[[List[Dict[str, str]]], str]] = None,
     retry_sleep: float = 0.0,
     material_budget: Optional[int] = None,
+    question_types: Optional[List[str]] = None,
+    start_seq: int = 1,
 ) -> Tuple[List[dict], str, int]:
     """为单篇论文生成候选 QA，返回 (合格条目, 错误信息, 被拒条数)。
 
@@ -387,8 +391,11 @@ def generate_for_paper(
     collected: List[dict] = []
     rejected_total = 0
     last_error = "未知错误"
-    for idx in range(per_paper):
-        qtype = QUESTION_TYPE_ROTATION[idx % len(QUESTION_TYPE_ROTATION)]
+    requested_types = question_types or [
+        QUESTION_TYPE_ROTATION[idx % len(QUESTION_TYPE_ROTATION)]
+        for idx in range(per_paper)
+    ]
+    for idx, qtype in enumerate(requested_types):
         messages = build_messages(paper.title or "(无标题)", material, 1, first_type=qtype)
         for attempt in range(1, max_attempts + 1):
             if attempt > 1 and retry_sleep > 0:
@@ -405,7 +412,7 @@ def generate_for_paper(
                 split=split,
                 page_texts=page_texts,
                 qa_id_prefix=prefix,
-                start_seq=len(collected) + 1,
+                start_seq=start_seq + len(collected),
             )
             rejected_total += rejected
             # 只收与本次请求类型一致的条目（类型不匹配不落库，避免重复事实题）
@@ -426,7 +433,12 @@ def generate_for_paper(
 def _open_output(output_path: Path, resume: bool):
     """打开输出文件：resume 且已存在则追加；否则 O_EXCL + 0600 排他创建。"""
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    if resume and output_path.is_symlink():
+        raise ValueError("resume 输出文件不得为符号链接")
     if resume and output_path.exists():
+        mode = stat.S_IMODE(output_path.stat().st_mode)
+        if mode != 0o600:
+            raise PermissionError("resume 输出文件权限必须精确为 0600")
         return output_path.open("a", encoding="utf-8")
     try:
         descriptor = os.open(
@@ -435,6 +447,85 @@ def _open_output(output_path: Path, resume: bool):
         raise FileExistsError(
             f"输出文件已存在，拒绝覆盖（使用 --resume 断点续跑）: {output_path}")
     return os.fdopen(descriptor, "w", encoding="utf-8")
+
+
+def _required_question_types(per_paper: int) -> List[str]:
+    if isinstance(per_paper, bool) or not isinstance(per_paper, int) or per_paper < 1:
+        raise ValueError("per_paper 必须是正整数")
+    return [
+        QUESTION_TYPE_ROTATION[index % len(QUESTION_TYPE_ROTATION)]
+        for index in range(per_paper)
+    ]
+
+
+def _load_resume_items(
+    output_path: Path,
+    assignments: List[dict],
+    per_paper: int,
+) -> Dict[str, List[dict]]:
+    """严格读取既有候选；任何损坏、越界或重复都拒绝继续追加。"""
+    if output_path.is_symlink():
+        raise ValueError("resume 输出文件不得为符号链接")
+    mode = stat.S_IMODE(output_path.stat().st_mode)
+    if mode != 0o600:
+        raise PermissionError("resume 输出文件权限必须精确为 0600")
+
+    split_by_uid = {row["paper_uid"]: row["split"] for row in assignments}
+    required = _required_question_types(per_paper)
+    allowed_counts = {
+        qtype: required.count(qtype) for qtype in QUESTION_TYPE_ROTATION
+    }
+    by_uid: Dict[str, List[dict]] = {}
+    qa_ids: set[str] = set()
+    with output_path.open("r", encoding="utf-8") as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            if not raw_line.strip():
+                raise ValueError(f"resume JSONL 第 {line_number} 行为空")
+            try:
+                item = json.loads(raw_line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"resume JSONL 第 {line_number} 行损坏"
+                ) from exc
+            if not isinstance(item, dict):
+                raise ValueError(f"resume JSONL 第 {line_number} 行不是对象")
+            qa_id = item.get("qa_id")
+            uid = item.get("paper_uid")
+            split = item.get("split")
+            qtype = item.get("question_type")
+            if not isinstance(qa_id, str) or not qa_id:
+                raise ValueError(f"resume JSONL 第 {line_number} 行缺 qa_id")
+            if qa_id in qa_ids:
+                raise ValueError("resume JSONL 含重复 qa_id")
+            if uid not in split_by_uid:
+                raise ValueError("resume JSONL paper_uid 不在冻结 split 中")
+            if split != split_by_uid[uid]:
+                raise ValueError("resume JSONL split 与冻结分配不一致")
+            if qtype not in QUESTION_TYPE_ROTATION:
+                raise ValueError("resume JSONL question_type 无效")
+            existing = by_uid.setdefault(uid, [])
+            if sum(row["question_type"] == qtype for row in existing) >= allowed_counts[qtype]:
+                raise ValueError("resume JSONL 同论文 question_type 数量超出契约")
+            qa_ids.add(qa_id)
+            existing.append(item)
+    return by_uid
+
+
+def _missing_question_types(existing: List[dict], per_paper: int) -> List[str]:
+    remaining = _required_question_types(per_paper)
+    for item in existing:
+        remaining.remove(item["question_type"])
+    return remaining
+
+
+def _next_qa_sequence(existing: List[dict], prefix: str) -> int:
+    maximum = 0
+    marker = prefix + "-"
+    for item in existing:
+        qa_id = item["qa_id"]
+        if qa_id.startswith(marker) and qa_id[len(marker):].isdigit():
+            maximum = max(maximum, int(qa_id[len(marker):]))
+    return maximum + 1
 
 
 def generate_all(
@@ -460,23 +551,19 @@ def generate_all(
     返回汇总 dict：总条数、被拒条数、每篇状态、question_type 分布等。
     """
     assignments = load_frozen_splits(splits_path)
+    _required_question_types(per_paper)
     output_path = Path(output_path)
 
-    # 断点续跑：从已有输出解析已完成论文（以 paper_uid 为准）
+    # 断点续跑：严格解析已有条目，只跳过已满足全部类型契约的论文。
+    resume_items: Dict[str, List[dict]] = {}
     done_uids: set = set()
     if resume and output_path.exists():
-        with output_path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    item = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                uid = item.get("paper_uid")
-                if isinstance(uid, str) and uid:
-                    done_uids.add(uid)
+        resume_items = _load_resume_items(output_path, assignments, per_paper)
+        done_uids = {
+            uid
+            for uid, items in resume_items.items()
+            if not _missing_question_types(items, per_paper)
+        }
         if done_uids:
             print(f"[gen2] 续跑：跳过已完成论文 {len(done_uids)} 篇")
 
@@ -505,6 +592,8 @@ def generate_all(
             if paper is None:
                 continue  # 已计入 missing
             processed += 1
+            existing_items = resume_items.get(uid, [])
+            missing_types = _missing_question_types(existing_items, per_paper)
             try:
                 pages = loader(paper)
             except Exception as e:
@@ -519,7 +608,11 @@ def generate_all(
                 paper_uid=uid, split=split,
                 per_paper=per_paper, max_attempts=max_attempts,
                 call_llm=call_llm, retry_sleep=retry_sleep,
-                material_budget=material_budget)
+                material_budget=material_budget,
+                question_types=missing_types,
+                start_seq=_next_qa_sequence(
+                    existing_items, f"gen2-p{paper.id:02d}"
+                ))
             rejected_total += rejected
             if error:
                 print(f"[gen2] uid={uid}《{(paper.title or '')[:40]}》失败: {error}")
@@ -572,11 +665,37 @@ def build_parser() -> argparse.ArgumentParser:
                         help="重试前休眠秒数，应对 429 限流（默认 10，0 不休眠）")
     parser.add_argument("--material-chars", type=int, default=MATERIAL_CHAR_BUDGET,
                         help="每篇送给 LLM 的按页素材字符预算（默认 12000）")
+    parser.add_argument(
+        "--confirm-content-egress",
+        action="store_true",
+        help="确认把真实论文摘录发送给外部 LLM；缺少时 CLI 在读取配置前退出",
+    )
     return parser
+
+
+def _require_private_cli_path(path: Path, label: str) -> Path:
+    private_root = (Path(__file__).resolve().parent / "private").resolve()
+    resolved = path.resolve()
+    if resolved == private_root or private_root not in resolved.parents:
+        raise ValueError(f"{label} 必须位于 backend/eval/private/ 内")
+    return resolved
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
+
+    if not args.confirm_content_egress:
+        print(
+            "[gen2] REFUSED: 缺少 --confirm-content-egress，未读取配置或发送内容",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        splits_path = _require_private_cli_path(Path(args.splits), "splits")
+        output_path = _require_private_cli_path(Path(args.output), "output")
+    except ValueError as exc:
+        print(f"[gen2] REFUSED: {exc}", file=sys.stderr)
+        return 2
 
     from app.core.config import config  # 延迟导入，连接真实配置
     from app.database import SessionLocal
@@ -586,8 +705,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         summary = generate_all(
             db,
-            splits_path=Path(args.splits),
-            output_path=Path(args.output),
+            splits_path=splits_path,
+            output_path=output_path,
             runtime_root=config.runtime_root,
             per_paper=args.per_paper,
             limit=args.limit,
