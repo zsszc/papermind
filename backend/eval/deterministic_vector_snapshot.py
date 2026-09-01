@@ -178,13 +178,18 @@ def _hnsw_binary_manifests(
     expected = {
         "data_level0.bin", "header.bin", "length.bin", "link_lists.bin"
     }
+    # Chroma 0.4.24 向量增长后持久化 index_metadata.pickle（Batch 22L 实证）：
+    # 内容随索引结构确定，归为可选结构文件；旧 4 文件快照保持兼容。
+    optional_structural = {"index_metadata.pickle"}
     actual = {
         path.relative_to(segment_dir).as_posix()
         for path in segment_dir.rglob("*") if path.is_file()
     }
-    if actual != expected:
+    if not expected.issubset(actual) or not actual.issubset(
+        expected | optional_structural
+    ):
         raise ValueError("HNSW 二进制文件集合不符合冻结契约")
-    structural = sorted(expected - {"length.bin"})
+    structural = sorted((expected - {"length.bin"}) | (actual & optional_structural))
     return {
         "hnsw_binary_manifest_sha256": _hash_named_files(
             segment_dir, structural

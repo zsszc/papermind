@@ -98,6 +98,29 @@ def test_hnsw_manifest_separates_volatile_runtime_length(tmp_path):
     assert before["hnsw_volatile_files"] == ["length.bin"]
 
 
+def test_hnsw_manifest_accepts_index_metadata_pickle(tmp_path):
+    """Chroma 0.4.24 在向量增长后会持久化 index_metadata.pickle（Batch 22L 实证）。
+
+    该文件内容随索引结构确定，归为结构文件；旧 4 文件快照保持兼容。
+    """
+    segment = tmp_path / "segment-1"
+    segment.mkdir()
+    for name in ("data_level0.bin", "header.bin", "link_lists.bin", "length.bin"):
+        (segment / name).write_bytes(b"x")
+
+    without_pickle = _hnsw_binary_manifests(tmp_path, "segment-1")
+    (segment / "index_metadata.pickle").write_bytes(b"meta")
+    with_pickle = _hnsw_binary_manifests(tmp_path, "segment-1")
+
+    assert "index_metadata.pickle" in with_pickle["hnsw_structural_files"]
+    assert with_pickle["hnsw_volatile_files"] == ["length.bin"]
+    # pickle 计入结构哈希：加入后哈希变化，同内容稳定
+    assert without_pickle["hnsw_binary_manifest_sha256"] != with_pickle[
+        "hnsw_binary_manifest_sha256"
+    ]
+    assert _hnsw_binary_manifests(tmp_path, "segment-1") == with_pickle
+
+
 def test_builder_copies_then_freezes_threads_and_search_ef(tmp_path):
     source = tmp_path / "source"
     target = tmp_path / "target"
