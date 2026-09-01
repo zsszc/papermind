@@ -29,6 +29,7 @@ evidence_quote/evidence_page/paper_uid/split/reviewed:false。
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import stat
@@ -91,11 +92,22 @@ def load_frozen_splits(path: Any) -> List[dict]:
     assignments = artifact.get("assignments")
     if not isinstance(assignments, list) or not assignments:
         raise ValueError("split 冻结制品缺少 assignments")
+    seen_uids: set[str] = set()
+    seen_hashes: set[str] = set()
     for row in assignments:
         if not isinstance(row.get("paper_uid"), str) or not row["paper_uid"].strip():
             raise ValueError("assignment 缺少 paper_uid")
+        digest = row.get("pdf_sha256")
+        if not isinstance(digest, str) or len(digest) != 64 or any(
+            char not in "0123456789abcdef" for char in digest
+        ):
+            raise ValueError("assignment pdf_sha256 必须是 64 位小写十六进制")
         if row.get("split") not in _SPLITS:
             raise ValueError("assignment split 必须为 train/dev/holdout")
+        if row["paper_uid"] in seen_uids or digest in seen_hashes:
+            raise ValueError("split 冻结制品含重复 paper_uid 或 pdf_sha256")
+        seen_uids.add(row["paper_uid"])
+        seen_hashes.add(digest)
     return assignments
 
 
@@ -120,6 +132,28 @@ def map_uids_to_papers(
             mapping[uid] = paper
     missing = sorted(uids - set(mapping))
     return mapping, missing
+
+
+def verify_frozen_sources(
+    uid_map: Dict[str, Any], assignments: List[dict], runtime_root: Any
+) -> None:
+    """在任何 LLM 调用前验证当前 PDF 与 split 冻结 SHA 完全一致。"""
+    root = Path(runtime_root).resolve()
+    for row in assignments:
+        paper = uid_map.get(row["paper_uid"])
+        if paper is None:
+            continue  # 未命中项由 generate_all 计入 missing，不会进入 LLM
+        source = (root / paper.file_path).resolve()
+        if not source.is_relative_to(root):
+            raise ValueError("冻结论文路径不得逃逸语料根目录")
+        if not source.is_file():
+            raise ValueError("冻结论文源文件不存在")
+        digest = hashlib.sha256()
+        with source.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        if digest.hexdigest() != row["pdf_sha256"]:
+            raise ValueError("当前 PDF 与 split 冻结 SHA 不一致")
 
 
 # ---------------------------------------------------------------------------
@@ -542,6 +576,9 @@ def generate_all(
     call_llm: Optional[Callable[[List[Dict[str, str]]], str]] = None,
     resume: bool = False,
     page_loader: Optional[Callable[[Any], List[dict]]] = None,
+    source_verifier: Optional[
+        Callable[[Dict[str, Any], List[dict], Any], None]
+    ] = None,
 ) -> Dict[str, Any]:
     """全量生成入口：逐篇生成、逐行写 JSONL（带 flush），失败跳过并计数。
 
@@ -569,6 +606,8 @@ def generate_all(
 
     uids = {row["paper_uid"] for row in assignments}
     uid_map, missing = map_uids_to_papers(db, Path(runtime_root), uids)
+    verifier = source_verifier or verify_frozen_sources
+    verifier(uid_map, assignments, Path(runtime_root))
     if missing:
         print(f"[gen2] {len(missing)} 篇冻结论文未在 DB 命中，跳过")
 

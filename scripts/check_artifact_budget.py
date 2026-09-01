@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import posixpath
 import re
 import sys
 import zipfile
@@ -30,10 +31,11 @@ ARTIFACT_SUFFIXES = {".dmg", ".zip"}
 # 禁止夹带的数据文件路径模式（对齐 Batch 15 verify-artifact.js 的 FORBIDDEN_PATHS，
 # 数据目录锚定在 Resources 根 / backend 根，避免误伤 venv 内第三方包的 data/ 目录）
 FORBIDDEN_PATTERNS = [
-    re.compile(r"^config\.yaml$"),  # 真实配置（config.yaml.example 模板豁免）
+    # 真实配置任意深度禁止（config.yaml.example 模板不匹配）
+    re.compile(r"(?:^|/)config\.yaml$", re.IGNORECASE),
     re.compile(r"^(?:data|papers|notes|summaries|my-thesis|vector_db|logs|backups)(?:/|$)"),
     re.compile(r"^backend/(?:data|papers|notes|summaries|my-thesis|vector_db|logs|backups)(?:/|$)"),
-    re.compile(r"(?:^|/)\.env(?:\.|$)"),  # 环境密钥文件任意深度都禁止
+    re.compile(r"(?:^|/)\.env(?:\.|$)", re.IGNORECASE),  # 环境密钥文件任意深度都禁止
     re.compile(r"\.(?:db|sqlite|sqlite3)$", re.IGNORECASE),  # 数据库文件任意深度都禁止
 ]
 
@@ -46,11 +48,12 @@ _APP_RESOURCES_RE = re.compile(r"(?:^|/)[^/]+\.app/Contents/Resources/(.*)$")
 
 def normalize_entry(name: str) -> str:
     """把 zip 条目 / 松散文件的相对路径归一到「应用资源根」再比对禁止清单。"""
-    match = _APP_RESOURCES_RE.search(name)
+    normalized = posixpath.normpath(name.replace("\\", "/"))
+    match = _APP_RESOURCES_RE.search(normalized)
     if match:
         return match.group(1)
     # 只剥离 "./" 前缀（lstrip 会误吃 .env 的前导点）
-    return name[2:] if name.startswith("./") else name
+    return normalized[2:] if normalized.startswith("./") else normalized
 
 
 def is_forbidden(relative_path: str) -> bool:
