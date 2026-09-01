@@ -434,29 +434,66 @@ class TestGenerateAll:
             "evidence_quote": "x" * 30, "evidence_page": 1,
         }, ensure_ascii=False)
         out.write_text(done_line + "\n", encoding="utf-8")
+        out.chmod(0o600)
 
         summary, _ = self._run(db, tmp_path, output_path=out, resume=True)
 
         lines = out.read_text(encoding="utf-8").strip().splitlines()
         assert lines[0] == done_line  # 旧行原样保留
-        new_items = [json.loads(l) for l in lines[1:]]
-        assert len(new_items) == 3
-        assert all(it["paper_uid"] == "doi:10.1/beta" for it in new_items)
-        assert summary["total"] == 3 and summary["n_skipped"] == 1
+        items = [json.loads(l) for l in lines]
+        alpha = [it for it in items if it["paper_uid"] == "doi:10.1/alpha"]
+        beta = [it for it in items if it["paper_uid"] == "doi:10.1/beta"]
+        assert {it["question_type"] for it in alpha} == {
+            "factoid", "method_detail", "summary"
+        }
+        assert len(alpha) == 3 and len(beta) == 3
+        assert len({it["qa_id"] for it in items}) == 6
+        assert summary["total"] == 5 and summary["n_skipped"] == 0
 
     def test_resume_all_done_makes_no_llm_call(self, db, tmp_path):
         _seed_two_doi_papers(db)
         out = tmp_path / "qa_v2_candidates.jsonl"
         lines = ""
         for uid in ("doi:10.1/alpha", "doi:10.1/beta"):
-            lines += json.dumps({"qa_id": f"old-{uid}", "paper_uid": uid}) + "\n"
+            for qtype in generate_qa_v2.QUESTION_TYPE_ROTATION:
+                lines += json.dumps({
+                    "qa_id": f"old-{uid}-{qtype}",
+                    "paper_uid": uid,
+                    "split": "train" if uid.endswith("alpha") else "dev",
+                    "question_type": qtype,
+                }) + "\n"
         out.write_text(lines, encoding="utf-8")
+        out.chmod(0o600)
         calls = []
         summary, _ = self._run(
             db, tmp_path, output_path=out, resume=True,
             call_llm=lambda m: (calls.append(m), _valid_payload())[1])
         assert summary["total"] == 0 and not calls
-        assert len(out.read_text(encoding="utf-8").strip().splitlines()) == 2
+        assert len(out.read_text(encoding="utf-8").strip().splitlines()) == 6
+
+    def test_resume_rejects_corrupt_jsonl(self, db, tmp_path):
+        _seed_two_doi_papers(db)
+        out = tmp_path / "qa_v2_candidates.jsonl"
+        out.write_text("{not-json}\n", encoding="utf-8")
+        out.chmod(0o600)
+        with pytest.raises(ValueError, match="JSONL"):
+            self._run(db, tmp_path, output_path=out, resume=True)
+
+    def test_resume_rejects_insecure_permissions_and_symlink(self, db, tmp_path):
+        _seed_two_doi_papers(db)
+        out = tmp_path / "qa_v2_candidates.jsonl"
+        out.write_text("{}\n", encoding="utf-8")
+        out.chmod(0o644)
+        with pytest.raises(PermissionError, match="0600"):
+            self._run(db, tmp_path, output_path=out, resume=True)
+
+        target = tmp_path / "target.jsonl"
+        target.write_text("{}\n", encoding="utf-8")
+        target.chmod(0o600)
+        link = tmp_path / "link.jsonl"
+        link.symlink_to(target)
+        with pytest.raises(ValueError, match="符号链接"):
+            self._run(db, tmp_path, output_path=link, resume=True)
 
     def test_limit_processes_subset(self, db, tmp_path):
         _seed_two_doi_papers(db)
@@ -510,9 +547,12 @@ class TestGenerateAll:
 def test_build_parser_parameters():
     args = generate_qa_v2.build_parser().parse_args([])
     assert args.resume is False and args.limit is None
+    assert args.confirm_content_egress is False
     assert args.splits.endswith("benchmark_v2_splits.json")
     assert args.output.endswith("qa_v2_candidates.jsonl")
     args = generate_qa_v2.build_parser().parse_args([
-        "--splits", "a.json", "--output", "b.jsonl", "--resume", "--limit", "2"])
+        "--splits", "a.json", "--output", "b.jsonl", "--resume", "--limit", "2",
+        "--confirm-content-egress"])
     assert args.splits == "a.json" and args.output == "b.jsonl"
     assert args.resume is True and args.limit == 2
+    assert args.confirm_content_egress is True
