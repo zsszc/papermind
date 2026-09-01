@@ -95,7 +95,7 @@ Kimi API (kimi-k2.6) —— 对话 / 概括 / 联网搜索 / 图片分析
 │   │   ├── schemas.py      # Pydantic 请求/响应模型
 │   │   └── main.py         # FastAPI 入口（lifespan、CORS、/mcp 挂载、/static 白名单）
 │   ├── eval/               # RAG/生成 Guardrail 评测：公开 fixture、私有 QA、run.py、generation_guardrails.py
-│   ├── tests/              # pytest 套件（927 用例，内存 SQLite + TestClient）
+│   ├── tests/              # pytest 套件（979 用例，内存 SQLite + TestClient）
 │   ├── venv/               # Python 3.12 虚拟环境（会被 electron-builder 打包）
 │   ├── pyproject.toml      # 依赖声明 + pytest/ruff 配置
 │   └── requirements.txt    # 锁定依赖（与 pyproject 保持一致）
@@ -194,7 +194,7 @@ cd ../electron && npm run build    # 产物在 frontend/out/（dmg/zip/exe）
 
 ## 8. 测试与评测
 
-### 单元/集成测试（pytest，927 个用例）
+### 单元/集成测试（pytest，979 个用例）
 
 ```bash
 cd backend
@@ -208,10 +208,15 @@ env -u PYTHONPATH venv/bin/python -m pytest tests/ -v   # 注意必须 env -u PY
 ```bash
 cd frontend && npm test          # Vitest + jsdom + Testing Library（SSE / ErrorBoundary）
 cd ../electron && npm test       # node:test（health / wait / restart / kill 生命周期）
+# 真实发布 E2E：需后端依赖与回环监听权限，CI 在 backend job 显式执行
+cd ../electron
+PAPERMIND_RELEASE_E2E=1 PAPERMIND_PYTHON=../backend/venv/bin/python \
+  node --test test/release-flow.test.js test/data-dir-migration.test.js
 ```
 
 前端测试依赖包含 MSW，新增网络交互测试不得连接真实后端；Electron 生命周期与安全策略纯模块不得
-`require('electron')`，确保 CI 无 GUI 也能运行。当前后端 927 个测试、前端 66 个测试、Electron 36 个测试。
+`require('electron')`，确保 CI 无 GUI 也能运行。当前后端 979 个测试、前端 66 个测试；
+Electron 默认纯测试为 26 passed + 2 个显式 skipped，真实发布 E2E 单独为 10/10 passed。
 
 ### RAG 评测（backend/eval/）
 
@@ -243,6 +248,10 @@ env -u PYTHONPATH venv/bin/python -m eval.deterministic_vector_snapshot \
 - **Batch 22I factoid 锚点候选未晋级**：新增查询数字/缩写/ASCII 单位锚点和等权第三路 BM25，每题只计算一次共享 semantic/BM25 并派生生产/候选排序。真实 train 基线与候选 Recall/factoid 均为 `0.667/0.500`，候选 MRR/NDCG 由 `0.424/0.485` 回退到 `0.399/0.465`，method_detail Recall 回退 1/6；P95=435.9ms。Gate 失败后未运行 dev/holdout，未调权重，生产默认未变。
 - **Batch 22J 盲化基准 readiness 未通过**：`papers/` 的 36 个物理 PDF 仅有 19 份唯一内容，17 个是重复副本；v1 已覆盖 18 份，只有 1 篇可进入 v2，低于预注册的 12 篇下限。已增加 PDF/UID 双重覆盖、论文 split 预冻结、证据唯一解析、固定路径一次性 claim 与通用 `eval.run` holdout 禁止；未生成 v2 QA、未运行盲化基线、未消费 holdout。
 - **Batch 22K 就绪度可观测性完成**：共享覆盖核心同时服务 CLI 与应用 API；统计页显示 PASS/WAIT/不可用三态并独立重试。真实核心/API 均为 WAIT，36 个物理 PDF、19 份唯一内容、17 个副本、v1 覆盖 18、合格 1、缺 11。API 严格排除路径/标题/DOI/UID/SHA，manifest 自哈希、幽灵论文、根/PDF 软链接和快照变化均 fail closed；本批未打开 QA/holdout，未调用 Kimi。
+- **Batch 22L Benchmark v2 既有报告**：已提交报告记录 readiness 34/12、40 条已审 QA、train/dev
+  span coverage@5=`0.452/0.750`，train Gate 失败且 holdout 封存。本轮 Batch 25 接班审计未读取
+  `eval/private/` 或论文，不能把这些私有结果视为本轮独立复验。QA 生成器现要求显式内容出站确认，
+  并在调用 LLM 前校验冻结 PDF SHA、严格 JSONL/0600/symlink 与逐类型断点续跑状态。
 - **Batch 23A 生成 Guardrail 离线 Harness 完成**：生产 `[^n^]` 解析、实际引用子集、
   stream/non-stream/regenerate 清洗与 SSE finished 原子终态已统一。公开 CC0 合成
   Gate 的 citation P/R/F1 与负例拒答率均为 1.000，越界/畸形/重复/负例引用
@@ -264,6 +273,12 @@ env -u PYTHONPATH venv/bin/python -m eval.deterministic_vector_snapshot \
   跨连接；commit 场景要求写事务、调用和异常注入均恰好一次，再以新连接验证回滚。
   报告严格白名单、无正文/路径/异常，绑定 fixture/runner/生产事务代码 SHA；CI 另以
   `python -S`、零依赖 job 结构性证明生成 Guardrail 未引入模型栈。
+- **Batch 23F 并发事务矩阵 v2 完成**：失败事务场景扩为 11 个，覆盖双 Client 409、外部
+  revision 冲突、目标删除与取消后重试；公开报告双跑字节一致，Gate 为 PASS。
+- **Batch 24/25 发布候选与接班审计完成**：发布 E2E、a11y 契约、包体预算和旧数据目录兼容
+  Harness 已建立。Batch 25 将真实 E2E 移到具备后端依赖的 CI job，默认 Electron 套件保持纯
+  Node；同时加固安装包路径归一化敏感文件扫描。旧配置测试证明升级兼容，不等同于旧二进制回滚；
+  E2E 的外网隔离来自离线环境配置，不是系统调用级审计。
 - **Batch 21 邻域候选未晋级**：`hybrid-local-neighbor`（semantic top20、同论文 ±2、固定 rank-distance 衰减）dev 为 0.625/0.36389/0.43005，factoid 仍 0.333、P95=270.1ms；MRR/NDCG/factoid Gate 失败，生产默认保持 shared hybrid。候选仅供显式复现
 - **Batch 22 双语 v2 未进入 dev**：`bm25-bilingual-v2` 仅新增四条病理术语映射，train 质量与 v1 完全相同（0.66667/0.42361/0.48529，factoid=0.50），未达到至少新增 1 题的 Gate，因此按预案跳过 dev；生产继续使用 `bm25-bilingual`
 - **Batch 22B 消费者已收敛**：聊天、重新生成、深度综述、论文引用推荐和 eval 的 chunk RAG 都经共享 `RetrievalPipeline`；论文引用零证据时跳过 LLM，显式单篇论文范围禁止 graph 越界，论文发现页语义异常保留 FTS 结果
@@ -302,7 +317,9 @@ env -u PYTHONPATH venv/bin/python -m eval.deterministic_vector_snapshot \
 - **ChromaDB telemetry 警告**：启动时 `Failed to send telemetry event` 可忽略（已设置 `anonymized_telemetry=False`，残余警告无害）。
 - **Chroma 已完成原子重建**：当前库与 SQLite 的 464 个 chunk ID 完全一致，Embedding 为 1024 维并通过 query smoke；旧失配库保留在已忽略的 `vector_db.backup-*` 目录。后续重建必须继续使用显式 stage/activate CLI，不得原地修补。
 - **真实 SQLite 历史孤儿**：主库 `quick_check=ok`，但仍有 4 条 `paper_tags` 外键孤儿；Batch 18 已生成并验证 FK=0 的修复候选副本，未自动覆盖源库。切换前必须再次备份并由用户明确确认。
-- **Kimi 已恢复但私有生成烟测待授权**：2026-08-24 实际启动 `/api/health` 返回 `status=ok`、`llm_ready=true`，模型 `kimi-k2.6`。真实论文固定四题生成烟测会把 QA 与 top-5 证据发送到外部 Kimi，必须获得用户明确的内容出站授权后执行。
+- **Kimi 已恢复但 Batch 23B 私有生成烟测仍未执行**：2026-08-24 实际启动 `/api/health` 返回
+  `status=ok`、`llm_ready=true`，模型 `kimi-k2.6`。现有提交只有规格/计划/任务，没有实跑报告；
+  固定四题会把问题与 top-5 证据发送到外部 Kimi，执行前必须取得当前轮次的明确内容出站确认。
 - **本地 BGE-Reranker 不满足延迟 Gate**：2.1GiB 模型可正常加载，但 CPU 上首题超过约 4 分钟未完成，已安全中止；生产 `retrieval.rerank` 继续保持 `false`。
 - **`backend/=2.6.0` 文件**：是历史上 `pip install 包名=2.6.0`（少写一个 `=`）误生成的空文件，可删。
 - **旧设计文档**（`PaperMind_需求规格说明书_技术设计文档.md` 等）描述的是规划态，与实现有出入时以代码为准（例如 React Query、YAML Skill 注册表、Alembic 均未落地）。
@@ -319,4 +336,4 @@ env -u PYTHONPATH venv/bin/python -m eval.deterministic_vector_snapshot \
 
 ---
 
-> 最后更新：2026-08-25，Batch 23E 独立失败事务 Harness 完成后同步。
+> 最后更新：2026-09-01，Batch 25 接班审计与发布/QA 生成加固完成后同步。

@@ -52,3 +52,20 @@ dev factoid 0.667 / method_detail 0.833。train 明显弱于 dev——新语料�
 `eval/private/`：`benchmark_v2_splits.json`、`qa_v2_candidates.jsonl`、
 `qa_private_v2.jsonl`、`benchmark_v2_freeze.json`、`v2-vector-snapshot/`、
 `reports-v2-train-hybrid/`、`reports-v2-dev-hybrid/`、`corpus_manifest_v2.json`
+
+## 7. Batch 25 接班复核
+
+本节只审查版本库中的生成器与已提交报告，未读取上述私有制品、论文或配置，也未重新调用
+Kimi；因此第 1–5 节的私有数量与指标是 Batch 22L 报告记录，不是 Batch 25 独立复验。
+
+接班审计补齐了以下 fail-closed 契约：
+
+- `--resume` 必须严格解析 JSONL，只补齐缺失 question type，不再见到任一行就跳过整篇；
+- 候选文件必须为普通文件、权限精确为 0600，损坏/空行/重复/未知 UID 或 split 一律拒绝追加；
+- CLI 必须显式传 `--confirm-content-egress`，且 splits/output 限定在 `eval/private/`；
+- 调用 LLM 前逐篇校验 split 中冻结的 `pdf_sha256` 与当前 DOI 映射 PDF，阻断源语料漂移。
+
+## 8. 提交
+
+`d25ad61`（三件套）→ `dda3e93`（生成器）→ `744938c`（逐题调用）→ `992a98e`（冻结与报告）；
+Batch 25 修复见 `207b013`、`7207dce`、`7b3097f`、`1504c10`。

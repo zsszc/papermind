@@ -4,8 +4,9 @@
 
 发布候选四块基础设施全部落地并带硬门禁：关键流程 E2E 基线（真启后端子进程，7 用例）、
 可访问性契约（11 用例含 2 常驻破坏性反例）、包体预算 Gate（真实制品 PASS）、
-安装/升级/回滚数据目录验证（3 用例）。三端计数：后端 912→**927**、前端 55→**66**、
-Electron 26→**36**，全部全绿。零重型新依赖（无 Playwright/Cypress）。
+旧数据目录升级兼容验证（3 用例）。当批计数：后端 912→**927**、前端 55→**66**；
+Electron 新增真实发布用例 10 个。零重型新依赖（无 Playwright/Cypress）。Batch 25 接班
+审计后，默认 Electron 纯套件为 26 passed + 2 skipped，真实发布 E2E 独立为 10/10 passed。
 
 ## 2. 执行轨迹（含中断恢复）
 
@@ -25,14 +26,14 @@ Electron 26→**36**，全部全绿。零重型新依赖（无 Playwright/Cypres
 | AC1 | T1 E2E 全流程 PASS、子进程零泄漏、<120s | ✅ 7/7，13.5s，SIGTERM/SIGKILL 后确认退出 |
 | AC2 | T2 a11y 契约组全绿 + 破坏性 RED 常驻 | ✅ 11/11（含 2 反例） |
 | AC3 | T3 无制品 SKIP / 有制品 Gate，超预算夹带必 fail | ✅ 15 自测 + 真实制品 PASS（453.6MB zip < 800MB） |
-| AC4 | T4 升级保留数据、迁移幂等、回滚不炸 | ✅ 3/3（v1 旧库→新实例数据完整、二次启动幂等、旧配置内存补默认） |
-| AC5 | 三端全绿 | ✅ 927 / 66 / 36 |
+| AC4 | T4 升级保留数据、迁移幂等、旧配置兼容 | ✅ 3/3（v1 旧库→新实例数据完整、二次启动幂等、旧配置内存补默认） |
+| AC5 | 当批三端全绿 | ✅ 927 / 66 / 36（Batch 25 后按纯测试与真实 E2E 拆分计数） |
 | AC6 | 零重型新依赖 | ✅ package.json 无新增运行时依赖 |
 
 ## 4. 关键证据
 
 - T1 RED：`RELEASE_FLOW_BACKEND_URL=http://127.0.0.1:1` 下 6 流程断言全 fail（ECONNREFUSED）
-- T1 零外网手段：LLM 指向回环死端口、embedding 不存在模型名 + `HF_HUB_OFFLINE=1`、
+- T1 外网配置隔离手段：LLM 指向回环死端口、embedding 不存在模型名 + `HF_HUB_OFFLINE=1`、
   子进程环境白名单化（剥离代理/PYTHONPATH）
 - T4 RED：回滚用例预期失败（`retrieval.chat_profile` 补默认前为 null）
 - T4 GREEN：`config.py` `_merge_template_defaults()`（内存级，既有「配置文件字节不变」契约不回归）
@@ -43,7 +44,18 @@ Electron 26→**36**，全部全绿。零重型新依赖（无 Playwright/Cypres
 - E2E 覆盖到 SSE 帧格式/错误帧契约，不断言生成内容（真进程无真实 LLM）
 - 可访问性为契约基线而非全量审计；视觉回归与真实浏览器 E2E 属非目标
 - 包体预算 800MB 为现状（500MB+）缓冲值，集中在脚本顶部常量
+- T1 使用离线环境配置隔离外网，不是系统调用级网络审计。
+- T4 证明新版本可读取旧数据目录/配置，不等同于用旧二进制执行真实回滚。
 
-## 6. 提交
+## 6. Batch 25 接班复核
 
-`f6b997d`（三件套）→ 本次收尾提交（T1/T2/T3/T4 全部代码与文档）。
+- 修复真实 E2E 硬编码仓库 venv、错误混入默认纯 Node CI 的问题；后端 CI 现在显式安装
+  Node 并以 `PAPERMIND_RELEASE_E2E=1`、`PAPERMIND_PYTHON=python` 执行 10 个真实用例。
+- 安装包敏感文件扫描先做 POSIX 归一化和大小写折叠，拒绝 `Resources/./config.yaml`、
+  `backend/../config.yaml` 与大写 `.ENV` 等绕过。
+- 复核结果：Electron 默认 26 passed + 2 skipped；真实发布 E2E 10/10 passed。
+
+## 7. 提交
+
+`18bc45d`（三件套）→ `ff34279`、`0b21a51`（实现）→ `94cfeef`（报告）；
+Batch 25 修复见 `207b013`、`7207dce`、`7b3097f`、`1504c10`。
