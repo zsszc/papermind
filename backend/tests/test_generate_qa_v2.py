@@ -230,6 +230,20 @@ class TestLoadFrozenSplits:
         with pytest.raises(ValueError, match="split"):
             generate_qa_v2.load_frozen_splits(path)
 
+    def test_invalid_or_duplicate_frozen_identity_rejected(self, tmp_path):
+        bad_hash = _write_splits(tmp_path / "bad-hash.json", [
+            {"paper_uid": "doi:10.1/a", "pdf_sha256": "short", "split": "train"},
+        ])
+        with pytest.raises(ValueError, match="pdf_sha256"):
+            generate_qa_v2.load_frozen_splits(bad_hash)
+
+        duplicate = _write_splits(tmp_path / "duplicate.json", [
+            {"paper_uid": "doi:10.1/a", "pdf_sha256": "a" * 64, "split": "train"},
+            {"paper_uid": "doi:10.1/a", "pdf_sha256": "a" * 64, "split": "dev"},
+        ])
+        with pytest.raises(ValueError, match="重复"):
+            generate_qa_v2.load_frozen_splits(duplicate)
+
 
 # ---------------------------------------------------------------------------
 # map_uids_to_papers：paper_uid -> DB Paper 映射
@@ -268,6 +282,28 @@ class TestMapUidsToPapers:
             db, tmp_path, {"doi:10.1/alpha"})
         assert mapping == {}
         assert missing == ["doi:10.1/alpha"]
+
+    def test_frozen_pdf_hash_drift_rejected_before_generation(self, db, tmp_path):
+        papers_dir = tmp_path / "papers"
+        papers_dir.mkdir()
+        source = papers_dir / "p1.pdf"
+        source.write_bytes(b"changed-pdf-content")
+        db.add(Paper(
+            id=1, title="Changed", abstract=None, doi="10.1/alpha",
+            file_path="papers/p1.pdf", filename="p1.pdf", processed="done",
+        ))
+        db.commit()
+        paper = db.query(Paper).filter(Paper.id == 1).one()
+        with pytest.raises(ValueError, match="冻结 SHA"):
+            generate_qa_v2.verify_frozen_sources(
+                {"doi:10.1/alpha": paper},
+                [{
+                    "paper_uid": "doi:10.1/alpha",
+                    "pdf_sha256": "a" * 64,
+                    "split": "train",
+                }],
+                tmp_path,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +425,7 @@ class TestGenerateAll:
             splits_path=splits, output_path=out, runtime_root=tmp_path,
             call_llm=lambda m: _valid_payload(),
             page_loader=lambda paper: _pages(),
+            source_verifier=lambda uid_map, assignments, runtime_root: None,
         )
         kwargs.update(overrides)
         return generate_qa_v2.generate_all(db, **kwargs), out

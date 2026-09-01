@@ -98,6 +98,21 @@ def test_zip夹带config_yaml必失败(tmp_path, capsys):
 @pytest.mark.parametrize(
     "entry",
     [
+        "PaperMind.app/Contents/Resources/./config.yaml",
+        "PaperMind.app/Contents/Resources/backend/../config.yaml",
+        "PaperMind.app/Contents/Resources/.ENV",
+    ],
+)
+def test_zip非规范路径不得绕过密钥扫描(tmp_path, capsys, entry):
+    _make_zip(tmp_path / "PaperMind-1.0.0-mac.zip", [entry])
+    code = budget.main(["--dir", str(tmp_path)])
+    assert code == 1
+    assert "夹带" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
         "PaperMind.app/Contents/Resources/data/papers.db",
         "PaperMind.app/Contents/Resources/papers/论文.pdf",
         "PaperMind.app/Contents/Resources/backend/vector_db/chroma.sqlite3",
