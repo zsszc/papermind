@@ -134,7 +134,12 @@ def test_by_type_aggregation_is_conservative_and_complete():
             "降级",
         ),
         (lambda report: report.update(with_llm=True), "LLM"),
-        (lambda report: report["items"].append(report["items"][0]), "qa_id"),
+        (
+            lambda report: report["items"][-1].update(
+                qa_id=report["items"][0]["qa_id"]
+            ),
+            "qa_id",
+        ),
         (
             lambda report: report["items"][0].update(
                 retrieved_ids=["not-a-chunk"]
