@@ -95,7 +95,7 @@ Kimi API (kimi-k2.6) —— 对话 / 概括 / 联网搜索 / 图片分析
 │   │   ├── schemas.py      # Pydantic 请求/响应模型
 │   │   └── main.py         # FastAPI 入口（lifespan、CORS、/mcp 挂载、/static 白名单）
 │   ├── eval/               # RAG/生成 Guardrail 评测：公开 fixture、私有 QA、run.py、generation_guardrails.py
-│   ├── tests/              # pytest 套件（979 用例，内存 SQLite + TestClient）
+│   ├── tests/              # pytest 套件（992 用例，内存 SQLite + TestClient）
 │   ├── venv/               # Python 3.12 虚拟环境（会被 electron-builder 打包）
 │   ├── pyproject.toml      # 依赖声明 + pytest/ruff 配置
 │   └── requirements.txt    # 锁定依赖（与 pyproject 保持一致）
@@ -194,7 +194,7 @@ cd ../electron && npm run build    # 产物在 frontend/out/（dmg/zip/exe）
 
 ## 8. 测试与评测
 
-### 单元/集成测试（pytest，979 个用例）
+### 单元/集成测试（pytest，992 个用例）
 
 ```bash
 cd backend
@@ -215,7 +215,7 @@ PAPERMIND_RELEASE_E2E=1 PAPERMIND_PYTHON=../backend/venv/bin/python \
 ```
 
 前端测试依赖包含 MSW，新增网络交互测试不得连接真实后端；Electron 生命周期与安全策略纯模块不得
-`require('electron')`，确保 CI 无 GUI 也能运行。当前后端 979 个测试、前端 66 个测试；
+`require('electron')`，确保 CI 无 GUI 也能运行。当前后端 992 个测试、前端 66 个测试；
 Electron 默认纯测试为 26 passed + 2 个显式 skipped，真实发布 E2E 单独为 10/10 passed。
 
 ### RAG 评测（backend/eval/）
@@ -234,6 +234,10 @@ env -u PYTHONPATH venv/bin/python -m eval.generation_guardrails \
 env -u PYTHONPATH venv/bin/python -m eval.deterministic_vector_snapshot \
   --source eval/private/source-vector --target eval/private/deterministic-vector \
   --expected-vector-sha256 <已审计的64位embedding内容SHA>
+# 仅分析完整 train 评测报告；输出为去标识化聚合，显式拒绝 dev/holdout
+env -u PYTHONPATH venv/bin/python -m eval.train_failure_diagnostics \
+  --report eval/private/<train-report>.json \
+  --output eval/private/<new-diagnostics>.json
 ```
 
 - `eval/dataset/qa_seed.jsonl`：25 条种子 QA（含 3 条幻觉负例），schema 见 `eval/dataset/README.md`
@@ -279,6 +283,11 @@ env -u PYTHONPATH venv/bin/python -m eval.deterministic_vector_snapshot \
   Harness 已建立。Batch 25 将真实 E2E 移到具备后端依赖的 CI job，默认 Electron 套件保持纯
   Node；同时加固安装包路径归一化敏感文件扫描。旧配置测试证明升级兼容，不等同于旧二进制回滚；
   E2E 的外网隔离来自离线环境配置，不是系统调用级审计。
+- **Batch 26 v2 train 失败归因 Harness 完成**：新增纯本地只读分析器，将完整 train 报告的
+  逐题结果互斥归为跨论文召回、同论文定位、部分覆盖、空结果或完整覆盖；输出只含聚合计数、
+  比例、指标与指纹，CLI 限定 `eval/private/` 并显式拒绝 dev/holdout、symlink 和路径逃逸。
+  主导失败映射到单一预注册候选，完整 train 未通过前禁止运行 dev，holdout 始终禁止。本批
+  只用公开合成报告验证 Harness，未读取真实 v2 报告、QA/PDF，未调用 Kimi/Embedding。
 - **Batch 21 邻域候选未晋级**：`hybrid-local-neighbor`（semantic top20、同论文 ±2、固定 rank-distance 衰减）dev 为 0.625/0.36389/0.43005，factoid 仍 0.333、P95=270.1ms；MRR/NDCG/factoid Gate 失败，生产默认保持 shared hybrid。候选仅供显式复现
 - **Batch 22 双语 v2 未进入 dev**：`bm25-bilingual-v2` 仅新增四条病理术语映射，train 质量与 v1 完全相同（0.66667/0.42361/0.48529，factoid=0.50），未达到至少新增 1 题的 Gate，因此按预案跳过 dev；生产继续使用 `bm25-bilingual`
 - **Batch 22B 消费者已收敛**：聊天、重新生成、深度综述、论文引用推荐和 eval 的 chunk RAG 都经共享 `RetrievalPipeline`；论文引用零证据时跳过 LLM，显式单篇论文范围禁止 graph 越界，论文发现页语义异常保留 FTS 结果
@@ -336,4 +345,4 @@ env -u PYTHONPATH venv/bin/python -m eval.deterministic_vector_snapshot \
 
 ---
 
-> 最后更新：2026-09-01，Batch 25 接班审计与发布/QA 生成加固完成后同步。
+> 最后更新：2026-09-02，Batch 26 v2 train 失败归因 Harness 完成后同步。
