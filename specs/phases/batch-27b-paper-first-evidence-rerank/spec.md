@@ -33,11 +33,11 @@ train Gate 失败立即停止；通过后才允许一次配对 dev。holdout 始
 
 ## 4. 验收标准
 
-- [ ] AC1：纯融合函数稳定、不改输入、每论文上限 2，坏输入 fail closed。
-- [ ] AC2：共享 RetrievalPipeline 显式 profile 生效，异常标记 degraded；默认 hybrid 排序不变。
-- [ ] AC3：配对 Gate 对跨配置、dirty、子集、降级、指标/分型/延迟回退 fail closed。
-- [ ] AC4：fresh clean train 基线/候选完成；按 Gate 停止或一次运行 dev。
-- [ ] AC5：三端/公开 Gate、报告、台账、提交与 push 完成。
+- [x] AC1：纯融合函数稳定、不改输入、每论文上限 2，坏输入 fail closed。
+- [x] AC2：共享 RetrievalPipeline 显式 profile 生效，异常标记 degraded；默认 hybrid 排序不变。
+- [x] AC3：配对 Gate 对跨配置、dirty、子集、降级、指标/分型/延迟回退 fail closed。
+- [x] AC4：fresh clean train 基线/候选完成；Gate FAIL 后停止，未运行 dev/holdout。
+- [x] AC5：三端/公开 Gate、报告、台账与提交完成，待 push。
 
 ## 5. 非目标
 
