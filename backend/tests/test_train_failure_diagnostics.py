@@ -111,6 +111,111 @@ def test_analyzer_is_deterministic_and_uses_fixed_tie_priority():
     assert gate["holdout_policy"] == "forbidden"
 
 
+def test_dirty_report_is_rejected_by_default_and_requires_verified_override():
+    report = _report()
+    report["run"]["git_tracked_clean"] = False
+
+    with pytest.raises(ValueError, match="clean Git"):
+        diagnostics.analyze_train_report(report)
+    with pytest.raises(ValueError, match="祖先"):
+        diagnostics.analyze_train_report(
+            report,
+            allow_historical_dirty=True,
+            historical_commit_verified=False,
+        )
+
+
+def test_verified_historical_report_is_selection_only_and_keeps_original_sha():
+    report = _report()
+    report["run"]["git_tracked_clean"] = False
+    report["benchmark"].update({
+        "database_logical_manifest_sha256": "d" * 64,
+        "page_text_manifest_sha256": "e" * 64,
+        "vector_manifest_sha256": "f" * 64,
+        "hnsw_config_sha256": "1" * 64,
+        "hnsw_binary_manifest_sha256": "2" * 64,
+    })
+    report["diagnostics"]["vector_snapshot"] = {
+        "database_chunk_count": 5,
+        "vector_count": 5,
+        "missing_vector_ids": 0,
+        "extra_vector_ids": 0,
+        "embedding_dimension": 1024,
+        "hnsw_space": "cosine",
+        "hnsw_num_threads": 1,
+        "hnsw_search_ef": 5,
+        "vector_manifest_sha256": "f" * 64,
+        "hnsw_config_sha256": "1" * 64,
+        "hnsw_binary_manifest_sha256": "2" * 64,
+    }
+
+    result = diagnostics.analyze_train_report(
+        report,
+        allow_historical_dirty=True,
+        historical_commit_verified=True,
+    )
+
+    assert result["provenance"] == {
+        "source_git_tracked_clean": False,
+        "historical_dirty_override": True,
+        "historical_commit_verified": True,
+        "usage": "candidate-selection-only",
+        "promotion_eligible": False,
+    }
+    assert result["recommendation"]["train_gate"][
+        "requires_fresh_clean_baseline"
+    ] is True
+    assert result["input_report_sha256"] == diagnostics.report_sha256(report)
+
+
+def test_historical_override_rejects_incomplete_vector_contract():
+    report = _report()
+    report["run"]["git_tracked_clean"] = False
+    report["benchmark"].update({
+        "database_logical_manifest_sha256": "d" * 64,
+        "page_text_manifest_sha256": "e" * 64,
+        "vector_manifest_sha256": "f" * 64,
+        "hnsw_config_sha256": "1" * 64,
+        "hnsw_binary_manifest_sha256": "2" * 64,
+    })
+    report["diagnostics"]["vector_snapshot"] = {
+        "database_chunk_count": 5,
+        "vector_count": 4,
+    }
+
+    with pytest.raises(ValueError, match="向量快照"):
+        diagnostics.analyze_train_report(
+            report,
+            allow_historical_dirty=True,
+            historical_commit_verified=True,
+        )
+
+
+def test_commit_ancestor_verification_is_fail_closed(monkeypatch, tmp_path):
+    class Completed:
+        returncode = 0
+
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return Completed()
+
+    monkeypatch.setattr(diagnostics.subprocess, "run", fake_run)
+    assert diagnostics.verify_commit_ancestor("a" * 40, tmp_path) is True
+    assert calls[0][0] == [
+        "git", "merge-base", "--is-ancestor", "a" * 40, "HEAD",
+    ]
+
+    class Missing:
+        returncode = 128
+
+    monkeypatch.setattr(
+        diagnostics.subprocess, "run", lambda *args, **kwargs: Missing()
+    )
+    assert diagnostics.verify_commit_ancestor("b" * 40, tmp_path) is False
+
+
 def test_by_type_aggregation_is_conservative_and_complete():
     result = diagnostics.analyze_train_report(_report())
     rows = {row["question_type"]: row for row in result["by_question_type"]}
