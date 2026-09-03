@@ -75,6 +75,10 @@ _LOCAL_NEIGHBOR_DECAY = 0.5
 _LOCAL_NEIGHBOR_EXPANDED_CAP = 20
 _PARENT_CHILD_POOL = 40
 _PARENT_CHILD_DISCOUNTS = (1.0, 0.5, 0.25)
+_PAPER_FIRST_POOL = 20
+_PAPER_FIRST_RRF_K = 60
+_PAPER_FIRST_BONUS = 0.25
+_PAPER_FIRST_MAX_PER_PAPER = 2
 _ANCHOR_UNIT_TOKENS = frozenset({
     "mm", "cm", "m", "km", "ms", "s", "min", "h", "hz", "khz", "mhz",
     "kb", "mb", "gb", "tb", "mg", "g", "kg", "ml", "l",
@@ -91,6 +95,10 @@ class ParentMappingError(ValueError):
 
 class WeightedRRFError(ValueError):
     """Weighted-RRF 输入或冻结参数不满足候选契约。"""
+
+
+class PaperFirstRerankError(ValueError):
+    """论文优先证据重排的输入或冻结参数不满足候选契约。"""
 
 
 def tokenize_technical_terms(text: str) -> List[str]:
@@ -493,6 +501,110 @@ def rrf_fuse_chunks(
     return [copy.deepcopy(metas[cid]) for cid in ordered[:top_k]]
 
 
+def paper_first_evidence_fuse_chunks(
+    semantic_results: List[Dict[str, Any]],
+    keyword_results: List[Dict[str, Any]],
+    top_k: int,
+    *,
+    k: int = _PAPER_FIRST_RRF_K,
+    paper_bonus: float = _PAPER_FIRST_BONUS,
+    max_per_paper: int = _PAPER_FIRST_MAX_PER_PAPER,
+) -> List[Dict[str, Any]]:
+    """按论文先验重排两路 RRF，并限制单篇论文占用的最终名额。
+
+    候选只读取每路前 20 项。与生产旧 RRF 不同，此实验 profile 对输入
+    采取严格契约：每路不得重复，chunk ID 必须规范且与 paper_id 一致。
+    """
+    if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k < 0:
+        raise PaperFirstRerankError("top_k 必须是非负整数")
+    if top_k == 0:
+        return []
+    if not isinstance(k, int) or isinstance(k, bool) or k <= 0:
+        raise PaperFirstRerankError("k 必须是正整数")
+    if (
+        not isinstance(paper_bonus, (int, float))
+        or isinstance(paper_bonus, bool)
+        or not math.isfinite(float(paper_bonus))
+        or float(paper_bonus) < 0.0
+    ):
+        raise PaperFirstRerankError("paper_bonus 必须是有限非负数")
+    if (
+        not isinstance(max_per_paper, int)
+        or isinstance(max_per_paper, bool)
+        or max_per_paper <= 0
+    ):
+        raise PaperFirstRerankError("max_per_paper 必须是正整数")
+
+    scores: Dict[str, float] = {}
+    metas: Dict[str, Dict[str, Any]] = {}
+    order: Dict[str, int] = {}
+    papers: Dict[str, int] = {}
+
+    def _canonical(item: Dict[str, Any]) -> tuple[str, int]:
+        chunk_id = item.get("chunk_id")
+        match = _CHUNK_ID_FULL_RE.fullmatch(str(chunk_id or ""))
+        if match is None:
+            raise PaperFirstRerankError("chunk_id 必须是 canonical pN_cN")
+        paper_id, chunk_index = (int(value) for value in match.groups())
+        canonical = f"p{paper_id}_c{chunk_index}"
+        if (
+            paper_id <= 0
+            or chunk_index < -1
+            or canonical != chunk_id
+            or item.get("paper_id") != paper_id
+        ):
+            raise PaperFirstRerankError("chunk_id 与 paper_id 不符合契约")
+        return canonical, paper_id
+
+    def _add_route(results: List[Dict[str, Any]]) -> None:
+        seen: set[str] = set()
+        for rank, item in enumerate(results[:_PAPER_FIRST_POOL], start=1):
+            chunk_id, paper_id = _canonical(item)
+            if chunk_id in seen:
+                raise PaperFirstRerankError("单路结果含重复 chunk_id")
+            seen.add(chunk_id)
+            scores[chunk_id] = scores.get(chunk_id, 0.0) + 1.0 / (k + rank)
+            if chunk_id not in metas:
+                order[chunk_id] = len(order)
+                metas[chunk_id] = copy.deepcopy(item)
+                papers[chunk_id] = paper_id
+
+    _add_route(semantic_results)
+    _add_route(keyword_results)
+    paper_priors: Dict[int, float] = {}
+    for chunk_id, score in scores.items():
+        paper_id = papers[chunk_id]
+        paper_priors[paper_id] = max(paper_priors.get(paper_id, 0.0), score)
+    candidate_scores = {
+        chunk_id: score + float(paper_bonus) * paper_priors[papers[chunk_id]]
+        for chunk_id, score in scores.items()
+    }
+    ordered = sorted(
+        scores,
+        key=lambda chunk_id: (
+            -candidate_scores[chunk_id], order[chunk_id], chunk_id
+        ),
+    )
+    selected: List[Dict[str, Any]] = []
+    paper_counts: Counter[int] = Counter()
+    for chunk_id in ordered:
+        paper_id = papers[chunk_id]
+        if paper_counts[paper_id] >= max_per_paper:
+            continue
+        item = copy.deepcopy(metas[chunk_id])
+        item.update({
+            "score": candidate_scores[chunk_id],
+            "chunk_rrf_score": scores[chunk_id],
+            "paper_prior_score": paper_priors[paper_id],
+            "paper_first_score": candidate_scores[chunk_id],
+        })
+        selected.append(item)
+        paper_counts[paper_id] += 1
+        if len(selected) >= top_k:
+            break
+    return selected
+
+
 def anchor_rrf_fuse_chunks(
     semantic_results: List[Dict[str, Any]],
     keyword_results: List[Dict[str, Any]],
@@ -794,7 +906,8 @@ class RetrievalPipeline:
         if profile not in {
             "semantic", "hybrid", "hybrid-local-neighbor",
             "parent-child-v1", "weighted-rrf-v1",
-            "weighted-rrf-compat-v1", "hybrid-anchor-v1", "keyword"
+            "weighted-rrf-compat-v1", "hybrid-anchor-v1",
+            "paper-first-evidence-rerank-v1", "keyword"
         }:
             raise ValueError(f"不支持的检索 profile: {requested_profile}")
         weighted_profiles = {"weighted-rrf-v1", "weighted-rrf-compat-v1"}
@@ -806,13 +919,17 @@ class RetrievalPipeline:
         if profile in {
             "hybrid", "hybrid-local-neighbor", "parent-child-v1",
             "weighted-rrf-v1", "weighted-rrf-compat-v1",
-            "hybrid-anchor-v1", "keyword"
+            "hybrid-anchor-v1", "paper-first-evidence-rerank-v1", "keyword"
         }:
             try:
                 keyword_results = keyword_chunk_search(
                     self.db,
                     query,
-                    _PARENT_CHILD_POOL if profile == "parent-child-v1" else top_k * 2,
+                    _PARENT_CHILD_POOL
+                    if profile == "parent-child-v1"
+                    else _PAPER_FIRST_POOL
+                    if profile == "paper-first-evidence-rerank-v1"
+                    else top_k * 2,
                     lexical_profile=lexical_profile,
                     filters=filters,
                 )
@@ -865,6 +982,9 @@ class RetrievalPipeline:
                     _PARENT_CHILD_POOL
                     if profile == "parent-child-v1"
                     else
+                    _PAPER_FIRST_POOL
+                    if profile == "paper-first-evidence-rerank-v1"
+                    else
                     _LOCAL_NEIGHBOR_SEED_POOL
                     if profile == "hybrid-local-neighbor"
                     else top_k if profile == "semantic" else top_k * 2
@@ -905,6 +1025,39 @@ class RetrievalPipeline:
                 reason=semantic_reason,
             )
             return copy.deepcopy(semantic_results[:top_k])
+
+        if profile == "paper-first-evidence-rerank-v1":
+            if semantic_reason is not None:
+                self._write_diagnostics(
+                    diagnostics, requested_profile, "empty",
+                    degraded=True, reason=semantic_reason,
+                )
+                return []
+            if keyword_error:
+                self._write_diagnostics(
+                    diagnostics, requested_profile, "empty",
+                    degraded=True, reason="keyword_search_failed",
+                )
+                return []
+            try:
+                results = paper_first_evidence_fuse_chunks(
+                    semantic_results, keyword_results, top_k
+                )
+            except PaperFirstRerankError as exc:
+                logger.warning(
+                    "[retrieval_pipeline] 论文优先证据重排失败: "
+                    f"{type(exc).__name__}"
+                )
+                self._write_diagnostics(
+                    diagnostics, requested_profile, "empty",
+                    degraded=True, reason="paper_first_contract_invalid",
+                )
+                return []
+            self._write_diagnostics(
+                diagnostics, requested_profile, profile,
+                degraded=False, reason=None,
+            )
+            return results
 
         if profile in weighted_profiles:
             if semantic_reason is not None:

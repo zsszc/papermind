@@ -7,10 +7,12 @@ from copy import deepcopy
 import pytest
 
 from eval.paper_first_train_gate import evaluate_paper_first_train
+from eval.run import paper_first_contract_metadata
 
 
 def _report(profile: str, *, coverage: float = 0.46) -> dict:
     candidate = profile == "paper-first-evidence-rerank-v1"
+    contract = paper_first_contract_metadata()
     return {
         "report_schema": "2.0",
         "run": {"git_sha": "a" * 40, "git_tracked_clean": True},
@@ -23,7 +25,8 @@ def _report(profile: str, *, coverage: float = 0.46) -> dict:
             "vector_manifest_sha256": "5" * 64,
             "hnsw_config_sha256": "6" * 64,
             "hnsw_binary_manifest_sha256": "7" * 64,
-            **({"paper_first_formula_sha256": "8" * 64} if candidate else {}),
+            **({"paper_first_formula_sha256": contract["formula_sha256"]}
+               if candidate else {}),
         },
         "pipeline": {
             "profile": profile,
@@ -33,6 +36,7 @@ def _report(profile: str, *, coverage: float = 0.46) -> dict:
             "split": "train",
             "evidence_resolver": "page-span-v2",
             "top_k": 5,
+            **({"paper_first": contract} if candidate else {}),
         },
         "diagnostics": {"runtime_degraded_count": 0},
         "with_llm": False,

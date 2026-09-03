@@ -7,6 +7,7 @@ from copy import deepcopy
 import pytest
 
 from app.services import retrieval_pipeline as retrieval
+from eval import run
 
 
 def _item(chunk_id: str, *, source: str = "semantic") -> dict:
@@ -111,3 +112,74 @@ def test_pipeline_exposes_candidate_only_by_explicit_profile(monkeypatch):
         "degraded": False,
         "reason": None,
     }
+
+
+def test_pipeline_fails_closed_when_candidate_contract_is_invalid(monkeypatch):
+    duplicate = [_item("p1_c0"), _item("p1_c0")]
+
+    class Store:
+        def available(self):
+            return True
+
+        def search(self, **kwargs):
+            return [_item("p1_c0")]
+
+    monkeypatch.setattr(
+        retrieval,
+        "keyword_chunk_search",
+        lambda *args, **kwargs: deepcopy(duplicate),
+    )
+    diagnostics = {}
+    results = retrieval.RetrievalPipeline(
+        None, vector_store=Store()
+    ).search(
+        "query",
+        profile="paper-first-evidence-rerank-v1",
+        lexical_profile="bm25-bilingual",
+        diagnostics=diagnostics,
+    )
+
+    assert results == []
+    assert diagnostics == {
+        "requested_profile": "paper-first-evidence-rerank-v1",
+        "effective_profile": "empty",
+        "degraded": True,
+        "reason": "paper_first_contract_invalid",
+    }
+
+
+def test_eval_candidate_requires_full_train_and_frozen_configuration(tmp_path):
+    parser = run.build_parser()
+    common = [
+        "--dataset", "eval/private/qa_private_v2.jsonl",
+        "--database", str(tmp_path / "papers.db"),
+        "--corpus-root", str(tmp_path / "corpus"),
+        "--vector-dir", str(tmp_path / "vectors"),
+        "--retrieval-profile", "paper-first-evidence-rerank-v1",
+        "--lexical-profile", "bm25-bilingual",
+        "--evidence-resolver", "page-span-v2",
+        "--split", "train",
+    ]
+    safe = parser.parse_args(common)
+    assert run._validate_cli_args(safe) is None
+
+    safe.split = "dev"
+    assert "只允许完整 train" in run._validate_cli_args(safe)
+    safe.split = "train"
+    safe.qa_id = ["private-train-001"]
+    assert "QA 子集" in run._validate_cli_args(safe)
+    safe.qa_id = []
+    safe.lexical_profile = "count"
+    assert "bm25-bilingual" in run._validate_cli_args(safe)
+
+
+def test_paper_first_contract_is_stable_and_complete():
+    first = run.paper_first_contract_metadata()
+    second = run.paper_first_contract_metadata()
+
+    assert first == second
+    assert first["algorithm"] == "paper-first-evidence-rerank-v1"
+    assert first["route_limit"] == 20
+    assert first["paper_bonus"] == 0.25
+    assert first["max_chunks_per_paper"] == 2
+    assert len(first["formula_sha256"]) == 64
