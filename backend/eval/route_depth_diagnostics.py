@@ -114,12 +114,18 @@ def _require_sha(value: Any, field: str) -> str:
 
 
 def _canonical_chunk_ids(
-    values: Any, field: str, *, expected_length: int | None = None
+    values: Any,
+    field: str,
+    *,
+    expected_length: int | None = None,
+    max_length: int | None = None,
 ) -> list[str]:
     if not isinstance(values, list):
         raise ValueError(f"{field} 必须是列表")
     if expected_length is not None and len(values) != expected_length:
         raise ValueError(f"{field} 数量必须为 {expected_length}")
+    if max_length is not None and len(values) > max_length:
+        raise ValueError(f"{field} 数量不得超过 {max_length}")
     if len(values) != len(set(values)):
         raise ValueError(f"{field} 含重复 chunk ID")
     for value in values:
@@ -251,7 +257,7 @@ def validate_route_depth_records(
             record.get("semantic_ids"), "semantic_ids", expected_length=20
         )
         lexical = _canonical_chunk_ids(
-            record.get("lexical_ids"), "lexical_ids", expected_length=20
+            record.get("lexical_ids"), "lexical_ids", max_length=20
         )
         baseline = _canonical_chunk_ids(
             record.get("baseline_ids"), "baseline_ids", expected_length=5
@@ -455,9 +461,20 @@ def _validate_runtime_path(path: Path, *, directory: bool, label: str) -> Path:
     return resolved
 
 
-def _route_items_to_ids(items: list[dict[str, Any]], field: str) -> list[str]:
+def _route_items_to_ids(
+    items: list[dict[str, Any]],
+    field: str,
+    *,
+    expected_length: int | None = None,
+    max_length: int | None = None,
+) -> list[str]:
     ids = [item.get("chunk_id") for item in items]
-    canonical = _canonical_chunk_ids(ids, field, expected_length=20)
+    canonical = _canonical_chunk_ids(
+        ids,
+        field,
+        expected_length=expected_length,
+        max_length=max_length,
+    )
     for item, chunk_id in zip(items, canonical):
         paper_id = int(_CHUNK_ID_RE.fullmatch(chunk_id).group(1))  # type: ignore[union-attr]
         if item.get("paper_id") != paper_id:
@@ -499,11 +516,15 @@ def collect_route_depth_records(
         except Exception as exc:
             raise RouteDepthCollectionError("lexical-search") from exc
         try:
-            semantic_ids = _route_items_to_ids(semantic_items, "semantic_ids")
+            semantic_ids = _route_items_to_ids(
+                semantic_items, "semantic_ids", expected_length=20
+            )
         except ValueError as exc:
             raise RouteDepthCollectionError("semantic-contract") from exc
         try:
-            lexical_ids = _route_items_to_ids(lexical_items, "lexical_ids")
+            lexical_ids = _route_items_to_ids(
+                lexical_items, "lexical_ids", max_length=20
+            )
         except ValueError as exc:
             raise RouteDepthCollectionError("lexical-contract") from exc
         baseline_items = rrf_fuse_chunks(

@@ -286,3 +286,13 @@ def test_route_collector_reports_only_fixed_contract_reason(monkeypatch):
 
     assert captured.value.reason == "semantic-contract"
     assert "private" not in str(captured.value)
+
+
+def test_sparse_lexical_route_is_valid_because_bm25_drops_zero_scores():
+    records = _records()
+    records[0]["lexical_ids"] = records[0]["lexical_ids"][:3]
+    records[0]["baseline_ids"] = [
+        "p1_c1", "p200_c0", "p100_c1", "p200_c1", "p100_c2"
+    ]
+
+    validate_route_depth_records(records, _binding())

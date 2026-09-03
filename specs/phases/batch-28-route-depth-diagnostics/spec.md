@@ -9,8 +9,9 @@ semantic / `bm25-bilingual` 的 top-20 深层候选中，以及它位于 1–5�
 ## 2. 目标与冻结口径
 
 - 仅处理 Benchmark v2 完整 train：13 个正例，factoid/method_detail/summary=`8/4/1`。
-- semantic 与 `bm25-bilingual` 各取 top-20；生产基线仍按两路前 10 做 legacy RRF top-5，
-  不得用诊断深池改变生产基线。
+- semantic 请求并要求完整 top-20；`bm25-bilingual` 请求 top-20，但因零分结果按生产逻辑
+  丢弃，允许自然返回 0–20。生产基线仍按两路前 10 做 legacy RRF top-5，不得用诊断深池
+  改变生产基线。
 - 对两路及并集统计 evidence first-hit 深度桶、any-hit@5/10/20、span coverage@5/10/20。
 - 将每题互斥归为：`baseline_full`、`deep_route_recoverable`、
   `correct_paper_only`、`paper_absent`。
