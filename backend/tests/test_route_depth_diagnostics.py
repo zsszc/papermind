@@ -8,6 +8,8 @@ import pytest
 
 from eval.route_depth_diagnostics import (
     analyze_route_depth,
+    collect_route_depth_records,
+    require_offline_environment,
     validate_route_depth_records,
 )
 
@@ -24,12 +26,14 @@ def _binding() -> dict:
         "vector_manifest_sha256": "5" * 64,
         "hnsw_config_sha256": "6" * 64,
         "hnsw_binary_manifest_sha256": "7" * 64,
+        "vector_source_tree_sha256": "8" * 64,
         "split": "train",
         "evidence_resolver": "page-span-v2",
         "lexical_profile": "bm25-bilingual",
         "top_k": 5,
         "production_route_limit": 10,
         "diagnostic_route_limit": 20,
+        "semantic_rerank": False,
     }
 
 
@@ -50,7 +54,9 @@ def _record(index: int, category: str) -> dict:
     relevant = f"p{index + 1}_c1"
     semantic = [f"p{100 + index}_c{rank}" for rank in range(20)]
     keyword = [f"p{200 + index}_c{rank}" for rank in range(20)]
-    baseline = semantic[:3] + keyword[:2]
+    baseline = [
+        semantic[0], keyword[0], semantic[1], keyword[1], semantic[2]
+    ]
     if category == "baseline_full":
         semantic[0] = relevant
         baseline[0] = relevant
@@ -127,7 +133,7 @@ def test_analysis_is_deterministic_does_not_mutate_and_emits_no_identity():
     assert records == original
     rendered = str(first).lower()
     for forbidden in (
-        "qa_id", "chunk_id", "question", "content", "paper_uid",
+        "qa_id", "chunk_id", "'question':", "raw evidence content", "paper_uid",
         "doi:", "p1_c1", "/users/",
     ):
         assert forbidden not in rendered
@@ -138,8 +144,8 @@ def test_analysis_is_deterministic_does_not_mutate_and_emits_no_identity():
     [
         (lambda rows, binding: rows.pop(), "13"),
         (
-            lambda rows, binding: rows[0]["semantic_ids"].append(
-                rows[0]["semantic_ids"][0]
+            lambda rows, binding: rows[0]["semantic_ids"].__setitem__(
+                -1, rows[0]["semantic_ids"][0]
             ),
             "重复",
         ),
@@ -157,6 +163,10 @@ def test_analysis_is_deterministic_does_not_mutate_and_emits_no_identity():
             lambda rows, binding: binding.update(lexical_profile="count"),
             "bm25-bilingual",
         ),
+        (
+            lambda rows, binding: binding.update(question="private question"),
+            "未知字段",
+        ),
     ],
 )
 def test_invalid_or_incomplete_inputs_fail_closed(mutation, match):
@@ -170,8 +180,8 @@ def test_invalid_or_incomplete_inputs_fail_closed(mutation, match):
 
 def test_tied_failure_categories_follow_preregistered_priority():
     records = _records()
-    # 将一个 deep 改成 paper-only，使 deep/paper-only 同为 3，仍选 deep。
-    records[5] = _record(5, "correct_paper_only")
+    # 将 paper-absent 改成 paper-only，使 deep/paper-only 同为 4，仍选 deep。
+    records[12] = _record(12, "correct_paper_only")
 
     report = analyze_route_depth(records, _binding())
 
@@ -181,3 +191,69 @@ def test_tied_failure_categories_follow_preregistered_priority():
     assert report["recommendation"]["candidate"] == (
         "paper-preserving-deep-route-v1"
     )
+
+
+def test_offline_environment_is_mandatory():
+    require_offline_environment({
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+    })
+    with pytest.raises(ValueError, match="OFFLINE"):
+        require_offline_environment({"HF_HUB_OFFLINE": "1"})
+
+
+def test_real_route_collector_freezes_limits_rerank_and_legacy_baseline(
+    monkeypatch,
+):
+    semantic = [
+        {"chunk_id": f"p{index + 1}_c0", "paper_id": index + 1}
+        for index in range(20)
+    ]
+    lexical = [
+        {"chunk_id": f"p{index + 101}_c0", "paper_id": index + 101}
+        for index in range(20)
+    ]
+
+    class Store:
+        def search(self, **kwargs):
+            assert kwargs == {
+                "query": "private question",
+                "top_k": 20,
+                "filters": {},
+                "rerank": False,
+            }
+            return deepcopy(semantic)
+
+    def fake_keyword(db, query, limit, **kwargs):
+        assert db == "readonly-db"
+        assert query == "private question"
+        assert limit == 20
+        assert kwargs == {
+            "lexical_profile": "bm25-bilingual",
+            "filters": {},
+        }
+        return deepcopy(lexical)
+
+    monkeypatch.setattr(
+        "app.services.retrieval_pipeline.keyword_chunk_search", fake_keyword
+    )
+    groups = [_group("p1_c0")]
+    records = collect_route_depth_records(
+        "readonly-db",
+        [{
+            "qa_id": "private-id",
+            "question": "private question",
+            "question_type": "factoid",
+        }],
+        {"private-id": groups},
+        Store(),
+    )
+
+    assert records == [{
+        "question_type": "factoid",
+        "evidence_groups": groups,
+        "semantic_ids": [item["chunk_id"] for item in semantic],
+        "lexical_ids": [item["chunk_id"] for item in lexical],
+        "baseline_ids": ["p1_c0", "p101_c0", "p2_c0", "p102_c0", "p3_c0"],
+    }]
+    assert "private question" not in str(records)
