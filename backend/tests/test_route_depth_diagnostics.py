@@ -7,6 +7,7 @@ from copy import deepcopy
 import pytest
 
 from eval.route_depth_diagnostics import (
+    RouteDepthCollectionError,
     analyze_route_depth,
     collect_route_depth_records,
     require_offline_environment,
@@ -257,3 +258,31 @@ def test_real_route_collector_freezes_limits_rerank_and_legacy_baseline(
         "baseline_ids": ["p1_c0", "p101_c0", "p2_c0", "p102_c0", "p3_c0"],
     }]
     assert "private question" not in str(records)
+
+
+def test_route_collector_reports_only_fixed_contract_reason(monkeypatch):
+    class ShortStore:
+        def search(self, **kwargs):
+            return [
+                {"chunk_id": f"p{index + 1}_c0", "paper_id": index + 1}
+                for index in range(19)
+            ]
+
+    monkeypatch.setattr(
+        "app.services.retrieval_pipeline.keyword_chunk_search",
+        lambda *args, **kwargs: [],
+    )
+    with pytest.raises(RouteDepthCollectionError) as captured:
+        collect_route_depth_records(
+            None,
+            [{
+                "qa_id": "private-id",
+                "question": "private question",
+                "question_type": "factoid",
+            }],
+            {"private-id": [_group("p1_c0")]},
+            ShortStore(),
+        )
+
+    assert captured.value.reason == "semantic-contract"
+    assert "private" not in str(captured.value)

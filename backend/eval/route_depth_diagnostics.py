@@ -84,6 +84,14 @@ _CONTRACT = {
 }
 
 
+class RouteDepthCollectionError(ValueError):
+    """路由采集失败，并只携带不含私有内容的固定原因码。"""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
 def _canonical_bytes(value: Any) -> bytes:
     return json.dumps(
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -471,21 +479,33 @@ def collect_route_depth_records(
 
     records: list[dict[str, Any]] = []
     for entry in items:
-        semantic_items = store.search(
-            query=entry["question"],
-            top_k=20,
-            filters={},
-            rerank=False,
-        )
-        lexical_items = keyword_chunk_search(
-            db,
-            entry["question"],
-            20,
-            lexical_profile="bm25-bilingual",
-            filters={},
-        )
-        semantic_ids = _route_items_to_ids(semantic_items, "semantic_ids")
-        lexical_ids = _route_items_to_ids(lexical_items, "lexical_ids")
+        try:
+            semantic_items = store.search(
+                query=entry["question"],
+                top_k=20,
+                filters={},
+                rerank=False,
+            )
+        except Exception as exc:
+            raise RouteDepthCollectionError("semantic-search") from exc
+        try:
+            lexical_items = keyword_chunk_search(
+                db,
+                entry["question"],
+                20,
+                lexical_profile="bm25-bilingual",
+                filters={},
+            )
+        except Exception as exc:
+            raise RouteDepthCollectionError("lexical-search") from exc
+        try:
+            semantic_ids = _route_items_to_ids(semantic_items, "semantic_ids")
+        except ValueError as exc:
+            raise RouteDepthCollectionError("semantic-contract") from exc
+        try:
+            lexical_ids = _route_items_to_ids(lexical_items, "lexical_ids")
+        except ValueError as exc:
+            raise RouteDepthCollectionError("lexical-contract") from exc
         baseline_items = rrf_fuse_chunks(
             semantic_items[:10], lexical_items[:10], 5
         )
@@ -622,7 +642,12 @@ def main(argv: list[str] | None = None) -> int:
         stage = "report-write"
         write_report_exclusive(output_path, result)
     except (KeyError, OSError, ValueError, json.JSONDecodeError) as exc:
-        print(f"[route-depth] FAIL stage={stage} type={type(exc).__name__}")
+        reason = getattr(exc, "reason", None)
+        suffix = f" reason={reason}" if reason else ""
+        print(
+            f"[route-depth] FAIL stage={stage} type={type(exc).__name__}"
+            f"{suffix}"
+        )
         return 2
     finally:
         store = None
