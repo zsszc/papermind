@@ -8,6 +8,7 @@ import json
 import math
 import os
 import re
+import subprocess
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
@@ -56,6 +57,11 @@ def _sha256(value: Any) -> str:
     return hashlib.sha256(_canonical_bytes(value)).hexdigest()
 
 
+def report_sha256(report: dict[str, Any]) -> str:
+    """返回未改写输入报告的稳定 SHA-256。"""
+    return _sha256(report)
+
+
 def _require_sha(value: Any, field: str) -> str:
     if not isinstance(value, str) or _SHA_RE.fullmatch(value) is None:
         raise ValueError(f"报告缺少有效 SHA-256: {field}")
@@ -96,17 +102,85 @@ def _paper_ids(chunk_ids: list[str], field: str) -> set[int]:
     return papers
 
 
-def _validate_report(report: dict[str, Any]) -> list[dict[str, Any]]:
+def _validate_historical_vector_contract(report: dict[str, Any]) -> None:
+    """历史 dirty 报告必须以完整冻结指纹和确定性向量快照补强来源。"""
+    benchmark = report.get("benchmark") or {}
+    required = (
+        "dataset_sha256",
+        "qrels_sha256",
+        "corpus_manifest_sha256",
+        "database_logical_manifest_sha256",
+        "page_text_manifest_sha256",
+        "vector_manifest_sha256",
+        "hnsw_config_sha256",
+        "hnsw_binary_manifest_sha256",
+    )
+    for field in required:
+        _require_sha(benchmark.get(field), field)
+    if (
+        benchmark["database_logical_manifest_sha256"]
+        != benchmark["corpus_manifest_sha256"]
+    ):
+        raise ValueError("历史报告数据库与语料指纹不一致")
+
+    snapshot = (report.get("diagnostics") or {}).get("vector_snapshot") or {}
+    database_count = snapshot.get("database_chunk_count")
+    vector_count = snapshot.get("vector_count")
+    valid_counts = (
+        isinstance(database_count, int)
+        and not isinstance(database_count, bool)
+        and database_count > 0
+        and vector_count == database_count
+    )
+    if (
+        not valid_counts
+        or snapshot.get("missing_vector_ids") != 0
+        or snapshot.get("extra_vector_ids") != 0
+        or snapshot.get("embedding_dimension") != 1024
+        or snapshot.get("hnsw_space") != "cosine"
+        or snapshot.get("hnsw_num_threads") != 1
+        or snapshot.get("hnsw_search_ef") != vector_count
+    ):
+        raise ValueError("历史报告向量快照不完整")
+    for field in (
+        "vector_manifest_sha256",
+        "hnsw_config_sha256",
+        "hnsw_binary_manifest_sha256",
+    ):
+        if _require_sha(snapshot.get(field), f"vector_snapshot.{field}") != benchmark[field]:
+            raise ValueError("历史报告向量快照指纹不一致")
+
+
+def _validate_report(
+    report: dict[str, Any],
+    *,
+    allow_historical_dirty: bool = False,
+    historical_commit_verified: bool = False,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if not isinstance(report, dict) or report.get("report_schema") != "2.0":
         raise ValueError("只接受 eval.run report_schema=2.0 报告")
 
     run = report.get("run") or {}
-    if (
-        not isinstance(run.get("git_sha"), str)
-        or _GIT_SHA_RE.fullmatch(run["git_sha"]) is None
-        or run.get("git_tracked_clean") is not True
-    ):
+    if not isinstance(run.get("git_sha"), str) or _GIT_SHA_RE.fullmatch(
+        run["git_sha"]
+    ) is None:
         raise ValueError("train 报告必须绑定 clean Git SHA")
+    source_clean = run.get("git_tracked_clean") is True
+    if not source_clean:
+        if not allow_historical_dirty:
+            raise ValueError("train 报告必须绑定 clean Git SHA")
+        if not historical_commit_verified:
+            raise ValueError("历史报告 Git SHA 未验证为当前 HEAD 祖先")
+        _validate_historical_vector_contract(report)
+    provenance = {
+        "source_git_tracked_clean": source_clean,
+        "historical_dirty_override": not source_clean,
+        "historical_commit_verified": (
+            historical_commit_verified if not source_clean else False
+        ),
+        "usage": "candidate-selection-only" if not source_clean else "diagnostics",
+        "promotion_eligible": source_clean,
+    }
 
     benchmark = report.get("benchmark") or {}
     for field in (
@@ -188,7 +262,7 @@ def _validate_report(report: dict[str, Any]) -> list[dict[str, Any]]:
             raise ValueError("any_hit 与 span_coverage 不一致")
         if not retrieved and (coverage > _EPSILON or any_hit > _EPSILON):
             raise ValueError("空检索结果不能产生证据覆盖")
-    return items
+    return items, provenance
 
 
 def _classify(item: dict[str, Any]) -> str:
@@ -216,8 +290,6 @@ def _category_rows(counts: Counter[str], total: int) -> list[dict[str, Any]]:
         }
         for category in _CATEGORY_ORDER
     ]
-
-
 def _recommendation(
     counts: Counter[str], total: int, report: dict[str, Any]
 ) -> dict[str, Any]:
@@ -249,15 +321,25 @@ def _recommendation(
             "question_type_non_regression": qtypes,
             "maximum_p95_ms": 1000.0,
             "runtime_degraded_count": 0,
+            "requires_fresh_clean_baseline": True,
             "dev_policy": "run-once-only-after-train-pass",
             "holdout_policy": "forbidden",
         },
     }
 
 
-def analyze_train_report(report: dict[str, Any]) -> dict[str, Any]:
+def analyze_train_report(
+    report: dict[str, Any],
+    *,
+    allow_historical_dirty: bool = False,
+    historical_commit_verified: bool = False,
+) -> dict[str, Any]:
     """验证完整 train 报告并返回不含逐题身份的确定性聚合。"""
-    items = _validate_report(report)
+    items, provenance = _validate_report(
+        report,
+        allow_historical_dirty=allow_historical_dirty,
+        historical_commit_verified=historical_commit_verified,
+    )
     counts: Counter[str] = Counter()
     by_type: dict[str, Counter[str]] = defaultdict(Counter)
     type_coverage: dict[str, list[float]] = defaultdict(list)
@@ -275,7 +357,7 @@ def analyze_train_report(report: dict[str, Any]) -> dict[str, Any]:
     pipeline = report["pipeline"]
     return {
         "schema": SCHEMA,
-        "input_report_sha256": _sha256(report),
+        "input_report_sha256": report_sha256(report),
         "binding": {
             "git_sha": report["run"]["git_sha"],
             "dataset_sha256": benchmark["dataset_sha256"],
@@ -289,6 +371,7 @@ def analyze_train_report(report: dict[str, Any]) -> dict[str, Any]:
         },
         "total_items": total,
         "failure_items": total - counts.get("full_coverage", 0),
+        "provenance": provenance,
         "categories": _category_rows(counts, total),
         "by_question_type": [
             {
@@ -363,12 +446,35 @@ def write_report_exclusive(path: Path, payload: dict[str, Any]) -> None:
         raise
 
 
+def verify_commit_ancestor(commit: str, repo_root: Path) -> bool:
+    """仅当 commit 是当前 HEAD 的真实祖先时返回 true。"""
+    if not isinstance(commit, str) or _GIT_SHA_RE.fullmatch(commit) is None:
+        return False
+    try:
+        completed = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", commit, "HEAD"],
+            cwd=Path(repo_root),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="从完整 train 报告生成去标识化失败归因"
     )
     parser.add_argument("--report", required=True, help="私有 train eval 报告")
     parser.add_argument("--output", required=True, help="私有聚合输出路径")
+    parser.add_argument(
+        "--allow-historical-dirty-report",
+        action="store_true",
+        help="仅用于候选选择；仍禁止作为晋级证据",
+    )
     return parser
 
 
@@ -382,7 +488,17 @@ def main(argv: list[str] | None = None) -> int:
             Path(args.output), must_exist=False
         )
         report = json.loads(report_path.read_text(encoding="utf-8"))
-        result = analyze_train_report(report)
+        historical_verified = False
+        if args.allow_historical_dirty_report:
+            historical_verified = verify_commit_ancestor(
+                (report.get("run") or {}).get("git_sha"),
+                Path(__file__).resolve().parents[2],
+            )
+        result = analyze_train_report(
+            report,
+            allow_historical_dirty=args.allow_historical_dirty_report,
+            historical_commit_verified=historical_verified,
+        )
         write_report_exclusive(output_path, result)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"[train-diagnostics] FAIL: {type(exc).__name__}")
