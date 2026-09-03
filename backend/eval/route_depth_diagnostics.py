@@ -517,6 +517,7 @@ def main(argv: list[str] | None = None) -> int:
     engine = None
     db = None
     store = None
+    stage = "startup-contract"
     try:
         require_offline_environment()
         from app.services.data_integrity import open_readonly_sqlalchemy_database
@@ -537,6 +538,7 @@ def main(argv: list[str] | None = None) -> int:
         git_sha = _git_sha()
         if not isinstance(git_sha, str) or _GIT_SHA_RE.fullmatch(git_sha) is None:
             raise ValueError("无法读取有效 Git SHA")
+        stage = "path-contract"
         dataset_path = validate_cli_path(
             Path(args.dataset), private_root=PRIVATE_ROOT, must_exist=True
         )
@@ -554,9 +556,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         source_sha_before = _tree_sha256(vector_source)
 
+        stage = "dataset-contract"
         all_items = load_dataset(dataset_path)
         items = _select_split(all_items, "train")
         validate_dataset(items)
+        stage = "corpus-binding"
         engine, session_factory = open_readonly_sqlalchemy_database(database_path)
         db = session_factory()
         benchmark = _build_benchmark_metadata(
@@ -570,6 +574,7 @@ def main(argv: list[str] | None = None) -> int:
             "page_text_manifest_sha256": page_manifest,
         })
 
+        stage = "vector-audit"
         with tempfile.TemporaryDirectory(prefix="papermind-route-depth-") as temp:
             isolated_vector = Path(temp) / "vector"
             shutil.copytree(vector_source, isolated_vector)
@@ -577,10 +582,12 @@ def main(argv: list[str] | None = None) -> int:
             if not store.available():
                 raise ValueError("本地 Embedding 不可用")
             vector_audit = _audit_vector_snapshot(db, store)
+            stage = "route-collection"
             records = collect_route_depth_records(db, items, span_qrels, store)
             store = None
             gc.collect()
 
+        stage = "source-integrity"
         source_sha_after = _tree_sha256(vector_source)
         if source_sha_before != source_sha_after:
             raise ValueError("向量冻结源在诊断过程中发生变化")
@@ -610,10 +617,12 @@ def main(argv: list[str] | None = None) -> int:
             "production_route_limit": 10,
             "diagnostic_route_limit": 20,
         }
+        stage = "aggregate-contract"
         result = analyze_route_depth(records, binding)
+        stage = "report-write"
         write_report_exclusive(output_path, result)
     except (KeyError, OSError, ValueError, json.JSONDecodeError) as exc:
-        print(f"[route-depth] FAIL: {type(exc).__name__}")
+        print(f"[route-depth] FAIL stage={stage} type={type(exc).__name__}")
         return 2
     finally:
         store = None
