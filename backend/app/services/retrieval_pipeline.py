@@ -108,6 +108,10 @@ class DeepRouteContractError(ValueError):
     """保论文集合深层证据候选的输入不满足冻结契约。"""
 
 
+class WithinPaperContractError(ValueError):
+    """论文内全块查询候选的输入不满足冻结契约。"""
+
+
 def tokenize_technical_terms(text: str) -> List[str]:
     """提取 ASCII 技术锚点，保留连字符、小数、科学计数法和百分号。"""
     return [token.lower() for token in _TECHNICAL_TOKEN_RE.findall(text or "")]
@@ -357,6 +361,84 @@ def bm25_chunk_search(
         })
     scored.sort(key=lambda item: (-item["score"], item["chunk_id"]))
     return scored if limit is None else scored[:limit]
+
+
+def within_paper_bm25_search(
+    db: Session,
+    query: str,
+    *,
+    paper_ids: List[int],
+    filters: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """在生产已选论文的全部 chunk 上批量执行冻结双语 BM25。"""
+    if (
+        not isinstance(paper_ids, list)
+        or not paper_ids
+        or any(
+            not isinstance(value, int) or isinstance(value, bool) or value <= 0
+            for value in paper_ids
+        )
+        or len(paper_ids) != len(set(paper_ids))
+    ):
+        raise WithinPaperContractError("paper_ids 必须是非空唯一正整数列表")
+    query_tokens = query_technical_terms(query, bilingual=True)
+    if not query_tokens:
+        return []
+
+    rows = (
+        _filtered_chunk_query(db, filters)
+        .filter(Chunk.paper_id.in_(paper_ids))
+        .order_by(Chunk.paper_id, Chunk.chunk_index, Chunk.id)
+        .all()
+    )
+    if not rows:
+        return []
+    allowed_papers = set(paper_ids)
+    if any(chunk.paper_id not in allowed_papers for chunk, _ in rows):
+        raise WithinPaperContractError("局部查询返回未选论文")
+
+    tokenized = [
+        tokenize_technical_terms(chunk.content or "") for chunk, _ in rows
+    ]
+    lengths = [len(tokens) for tokens in tokenized]
+    avg_length = sum(lengths) / len(lengths) if lengths else 0.0
+    if avg_length <= 0.0:
+        return []
+    doc_freq = {
+        token: sum(1 for tokens in tokenized if token in set(tokens))
+        for token in query_tokens
+    }
+    n_docs = len(rows)
+    k1 = 1.2
+    b = 0.9
+    scored: List[Dict[str, Any]] = []
+    for (chunk, paper), tokens, doc_length in zip(rows, tokenized, lengths):
+        counts = Counter(tokens)
+        score = 0.0
+        for token in query_tokens:
+            tf = counts.get(token, 0)
+            if tf == 0:
+                continue
+            df = doc_freq[token]
+            idf = math.log(1.0 + (n_docs - df + 0.5) / (df + 0.5))
+            length_norm = 1.0 - b + b * doc_length / avg_length
+            score += idf * (tf * (k1 + 1.0)) / (tf + k1 * length_norm)
+        if score <= 0.0:
+            continue
+        scored.append({
+            "chunk_id": f"p{chunk.paper_id}_c{chunk.chunk_index}",
+            "paper_id": chunk.paper_id,
+            "title": paper.title,
+            "authors": paper.authors,
+            "year": paper.year,
+            "content": chunk.content or "",
+            "page_number": chunk.page_number,
+            "chunk_type": chunk.chunk_type,
+            "score": score,
+            "source": "within-paper-bm25-bilingual",
+        })
+    scored.sort(key=lambda item: (-item["score"], item["chunk_id"]))
+    return scored
 
 
 def anchor_chunk_search(
@@ -722,6 +804,111 @@ def paper_preserving_deep_route_fuse_chunks(
     return selected
 
 
+def within_paper_query_fuse_chunks(
+    semantic_results: List[Dict[str, Any]],
+    keyword_results: List[Dict[str, Any]],
+    local_results: List[Dict[str, Any]],
+    top_k: int,
+) -> List[Dict[str, Any]]:
+    """锁定生产论文 slot，只替换局部 BM25 为零的 incumbent。"""
+    if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k < 0:
+        raise WithinPaperContractError("top_k 必须是非负整数")
+    if top_k == 0:
+        return []
+
+    def canonical(
+        item: Dict[str, Any], *, require_positive_score: bool
+    ) -> tuple[str, int]:
+        chunk_id = item.get("chunk_id")
+        match = _CHUNK_ID_FULL_RE.fullmatch(str(chunk_id or ""))
+        if match is None:
+            raise WithinPaperContractError("chunk_id 必须是 canonical pN_cN")
+        paper_id, chunk_index = (int(value) for value in match.groups())
+        canonical_id = f"p{paper_id}_c{chunk_index}"
+        if (
+            paper_id <= 0
+            or chunk_index < -1
+            or canonical_id != chunk_id
+            or item.get("paper_id") != paper_id
+        ):
+            raise WithinPaperContractError("chunk_id 与 paper_id 不符合契约")
+        if require_positive_score:
+            score = item.get("score")
+            if (
+                not isinstance(score, (int, float))
+                or isinstance(score, bool)
+                or not math.isfinite(float(score))
+                or float(score) <= 0.0
+            ):
+                raise WithinPaperContractError("局部 BM25 分数必须为有限正数")
+        return canonical_id, paper_id
+
+    for route in (semantic_results, keyword_results):
+        seen: set[str] = set()
+        for item in route[:10]:
+            chunk_id, _ = canonical(item, require_positive_score=False)
+            if chunk_id in seen:
+                raise WithinPaperContractError("生产单路含重复 chunk_id")
+            seen.add(chunk_id)
+
+    baseline = rrf_fuse_chunks(
+        semantic_results[:10], keyword_results[:10], top_k, k=60
+    )
+    if not baseline:
+        if local_results:
+            raise WithinPaperContractError("无生产 slot 时不得存在局部候选")
+        return []
+    baseline_ids = [str(item["chunk_id"]) for item in baseline]
+    slot_papers = [int(item["paper_id"]) for item in baseline]
+    selected_papers = set(slot_papers)
+
+    local_by_id: Dict[str, Dict[str, Any]] = {}
+    for item in local_results:
+        chunk_id, paper_id = canonical(item, require_positive_score=True)
+        if chunk_id in local_by_id:
+            raise WithinPaperContractError("局部结果含重复 chunk_id")
+        if paper_id not in selected_papers:
+            raise WithinPaperContractError("局部结果含未选论文")
+        local_by_id[chunk_id] = copy.deepcopy(item)
+
+    incumbents = set(baseline_ids)
+    replacement_by_paper: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    for chunk_id, item in local_by_id.items():
+        if chunk_id not in incumbents:
+            replacement_by_paper[int(item["paper_id"])].append(item)
+    for rows in replacement_by_paper.values():
+        rows.sort(key=lambda item: (-float(item["score"]), item["chunk_id"]))
+
+    offsets: Counter[int] = Counter()
+    used = set(baseline_ids)
+    selected: List[Dict[str, Any]] = []
+    for slot, incumbent in enumerate(baseline):
+        incumbent_id = baseline_ids[slot]
+        paper_id = slot_papers[slot]
+        if incumbent_id in local_by_id:
+            selected.append(copy.deepcopy(incumbent))
+            continue
+        candidates = replacement_by_paper.get(paper_id, [])
+        offset = offsets[paper_id]
+        while offset < len(candidates) and candidates[offset]["chunk_id"] in used:
+            offset += 1
+        offsets[paper_id] = offset
+        if offset >= len(candidates):
+            selected.append(copy.deepcopy(incumbent))
+            continue
+        replacement = copy.deepcopy(candidates[offset])
+        offsets[paper_id] += 1
+        used.add(replacement["chunk_id"])
+        replacement["replaced_production_chunk"] = incumbent_id
+        selected.append(replacement)
+
+    if [int(item["paper_id"]) for item in selected] != slot_papers:
+        raise WithinPaperContractError("候选改变了冻结论文 slot")
+    if len({item["chunk_id"] for item in selected}) != len(selected):
+        raise WithinPaperContractError("候选产生重复 chunk")
+    return selected
+
+
 def anchor_rrf_fuse_chunks(
     semantic_results: List[Dict[str, Any]],
     keyword_results: List[Dict[str, Any]],
@@ -1025,7 +1212,8 @@ class RetrievalPipeline:
             "parent-child-v1", "weighted-rrf-v1",
             "weighted-rrf-compat-v1", "hybrid-anchor-v1",
             "paper-first-evidence-rerank-v1",
-            "paper-preserving-deep-route-v1", "keyword"
+            "paper-preserving-deep-route-v1",
+            "within-paper-query-rerank-v1", "keyword"
         }:
             raise ValueError(f"不支持的检索 profile: {requested_profile}")
         weighted_profiles = {"weighted-rrf-v1", "weighted-rrf-compat-v1"}
@@ -1038,7 +1226,8 @@ class RetrievalPipeline:
             "hybrid", "hybrid-local-neighbor", "parent-child-v1",
             "weighted-rrf-v1", "weighted-rrf-compat-v1",
             "hybrid-anchor-v1", "paper-first-evidence-rerank-v1",
-            "paper-preserving-deep-route-v1", "keyword"
+            "paper-preserving-deep-route-v1",
+            "within-paper-query-rerank-v1", "keyword"
         }:
             try:
                 keyword_results = keyword_chunk_search(
@@ -1149,6 +1338,54 @@ class RetrievalPipeline:
                 reason=semantic_reason,
             )
             return copy.deepcopy(semantic_results[:top_k])
+
+        if profile == "within-paper-query-rerank-v1":
+            if semantic_reason is not None:
+                self._write_diagnostics(
+                    diagnostics, requested_profile, "empty",
+                    degraded=True, reason=semantic_reason,
+                )
+                return []
+            if keyword_error:
+                self._write_diagnostics(
+                    diagnostics, requested_profile, "empty",
+                    degraded=True, reason="keyword_search_failed",
+                )
+                return []
+            try:
+                baseline = rrf_fuse_chunks(
+                    semantic_results, keyword_results, top_k
+                )
+                paper_ids = list(dict.fromkeys(
+                    int(item["paper_id"]) for item in baseline
+                ))
+                local_results = (
+                    within_paper_bm25_search(
+                        self.db,
+                        query,
+                        paper_ids=paper_ids,
+                        filters=filters,
+                    )
+                    if paper_ids else []
+                )
+                results = within_paper_query_fuse_chunks(
+                    semantic_results, keyword_results, local_results, top_k
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[retrieval_pipeline] 论文内全块查询候选失败: "
+                    f"{type(exc).__name__}"
+                )
+                self._write_diagnostics(
+                    diagnostics, requested_profile, "empty",
+                    degraded=True, reason="within_paper_query_failed",
+                )
+                return []
+            self._write_diagnostics(
+                diagnostics, requested_profile, profile,
+                degraded=False, reason=None,
+            )
+            return results
 
         if profile == "paper-first-evidence-rerank-v1":
             if semantic_reason is not None:
