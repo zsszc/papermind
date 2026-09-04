@@ -95,7 +95,7 @@ Kimi API (kimi-k2.6) —— 对话 / 概括 / 联网搜索 / 图片分析
 │   │   ├── schemas.py      # Pydantic 请求/响应模型
 │   │   └── main.py         # FastAPI 入口（lifespan、CORS、/mcp 挂载、/static 白名单）
 │   ├── eval/               # RAG/生成 Guardrail 评测：公开 fixture、私有 QA、run.py、generation_guardrails.py
-│   ├── tests/              # pytest 套件（1012 用例，内存 SQLite + TestClient）
+│   ├── tests/              # pytest 套件（1028 用例，内存 SQLite + TestClient）
 │   ├── venv/               # Python 3.12 虚拟环境（会被 electron-builder 打包）
 │   ├── pyproject.toml      # 依赖声明 + pytest/ruff 配置
 │   └── requirements.txt    # 锁定依赖（与 pyproject 保持一致）
@@ -194,7 +194,7 @@ cd ../electron && npm run build    # 产物在 frontend/out/（dmg/zip/exe）
 
 ## 8. 测试与评测
 
-### 单元/集成测试（pytest，992 个用例）
+### 单元/集成测试（pytest，1028 个用例）
 
 ```bash
 cd backend
@@ -215,7 +215,7 @@ PAPERMIND_RELEASE_E2E=1 PAPERMIND_PYTHON=../backend/venv/bin/python \
 ```
 
 前端测试依赖包含 MSW，新增网络交互测试不得连接真实后端；Electron 生命周期与安全策略纯模块不得
-`require('electron')`，确保 CI 无 GUI 也能运行。当前后端 1012 个测试、前端 66 个测试；
+`require('electron')`，确保 CI 无 GUI 也能运行。当前后端 1028 个测试、前端 66 个测试；
 Electron 默认纯测试为 26 passed + 2 个显式 skipped，真实发布 E2E 单独为 10/10 passed。
 
 ### RAG 评测（backend/eval/）
@@ -294,6 +294,12 @@ env -u PYTHONPATH venv/bin/python -m eval.train_failure_diagnostics \
   `bm25-bilingual` 重跑 13 题：Recall/MRR/NDCG/span/P95=`0.346/0.338/0.296/0.452/883.6ms`。
   主导失败仍为同论文定位 6/13；唯一候选 `paper-first-evidence-rerank-v1` 的 span/Recall/factoid
   Recall 回退至 `0.375/0.308/0.313`，配对 Gate FAIL，未运行 dev/holdout，生产默认未变。
+- **Batch 28 证据深度归因完成**：clean Git `23759fd` 的真实 v2 train 聚合将 13 题归为
+  baseline full/deep-route recoverable/correct-paper-only/paper-absent=`5/4/4/0`。双路并集
+  any-hit@5/10/20=`0.538/0.538/0.769`，span coverage=`0.529/0.529/0.760`；semantic
+  与 BM25 单路 span@20 分别为 `0.683/0.606`。按预注册规则只冻结下一候选
+  `paper-preserving-deep-route-v1`，本批未实现候选、未运行 dev/holdout、未调用 Kimi，
+  生产默认未变。
 - **Batch 21 邻域候选未晋级**：`hybrid-local-neighbor`（semantic top20、同论文 ±2、固定 rank-distance 衰减）dev 为 0.625/0.36389/0.43005，factoid 仍 0.333、P95=270.1ms；MRR/NDCG/factoid Gate 失败，生产默认保持 shared hybrid。候选仅供显式复现
 - **Batch 22 双语 v2 未进入 dev**：`bm25-bilingual-v2` 仅新增四条病理术语映射，train 质量与 v1 完全相同（0.66667/0.42361/0.48529，factoid=0.50），未达到至少新增 1 题的 Gate，因此按预案跳过 dev；生产继续使用 `bm25-bilingual`
 - **Batch 22B 消费者已收敛**：聊天、重新生成、深度综述、论文引用推荐和 eval 的 chunk RAG 都经共享 `RetrievalPipeline`；论文引用零证据时跳过 LLM，显式单篇论文范围禁止 graph 越界，论文发现页语义异常保留 FTS 结果
@@ -351,4 +357,4 @@ env -u PYTHONPATH venv/bin/python -m eval.train_failure_diagnostics \
 
 ---
 
-> 最后更新：2026-09-03，Batch 27/27B 配对 train Gate 完成后同步。
+> 最后更新：2026-09-04，Batch 28 真实 train route-depth 归因完成后同步。
