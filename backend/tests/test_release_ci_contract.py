@@ -25,3 +25,10 @@ def test_backend_ci_job_dispatches_real_release_e2e():
     assert "PAPERMIND_PYTHON: python" in workflow
     assert "test/release-flow.test.js" in workflow
     assert "test/data-dir-migration.test.js" in workflow
+
+
+def test_frontend_ci_enforces_chunk_budget_after_build():
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    build_position = workflow.index("run: npm run build")
+    budget_position = workflow.index("run: npm run check:chunks")
+    assert budget_position > build_position

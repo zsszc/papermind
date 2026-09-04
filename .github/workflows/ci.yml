@@ -3,7 +3,7 @@
 # 触发条件：push 或 Pull Request 目标分支为 main。
 # 包含三个并行 job：
 #   - backend ：Python 3.12，安装后端依赖并运行 pytest
-#   - frontend：Node 20，npm ci 后执行 test、lint 与 build
+#   - frontend：Node 20，npm ci 后执行 test、lint、build 与 chunk 预算 Gate
 #   - electron：Node 20，跳过二进制下载后执行 audit、node:test 与语法检查
 # pip / npm 均开启缓存以加速后续构建。
 
@@ -95,6 +95,10 @@ jobs:
       - name: 构建产物（vite build）
         working-directory: frontend
         run: npm run build
+
+      - name: 检查前端 chunk 预算
+        working-directory: frontend
+        run: npm run check:chunks
 
       - name: 前端依赖安全审计
         working-directory: frontend
