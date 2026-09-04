@@ -3,7 +3,9 @@
 import pytest
 
 from eval.full_corpus_qa import (
+    assemble_full_corpus_dataset,
     build_gap_plan,
+    merge_supplements,
     public_gap_summary,
     validate_full_coverage,
 )
@@ -100,3 +102,67 @@ def test_full_coverage_rejects_split_leak_duplicate_question_or_gap(mutate, mess
 
     with pytest.raises(ValueError, match=message):
         validate_full_coverage(items, assignments, minimum_per_paper=2)
+
+
+def test_merge_supplements_requires_the_exact_frozen_gap():
+    train_uid = "sha256:" + "a" * 64
+    dev_uid = "sha256:" + "b" * 64
+    assignments = [
+        _assignment(train_uid, "train"),
+        _assignment(dev_uid, "dev"),
+    ]
+    existing = [
+        _item("a1", train_uid, "train", "训练既有问题？"),
+        _item("b1", dev_uid, "dev", "开发既有问题？"),
+    ]
+    supplements = [
+        _item("a2", train_uid, "train", "训练补充问题？"),
+        _item("b2", dev_uid, "dev", "开发补充问题？"),
+    ]
+
+    merged = merge_supplements(existing, supplements, assignments)
+
+    assert [item["qa_id"] for item in merged] == ["a1", "b1", "a2", "b2"]
+    with pytest.raises(ValueError, match="补题数量"):
+        merge_supplements(existing, supplements[:-1], assignments)
+    with pytest.raises(ValueError, match="补题目标"):
+        merge_supplements(
+            existing,
+            supplements + [_item("a3", train_uid, "train", "不应超额的问题？")],
+            assignments,
+        )
+
+
+def test_assemble_full_corpus_dataset_moves_consumed_legacy_items_to_train():
+    legacy_uid = "sha256:" + "c" * 64
+    v2_uid = "sha256:" + "d" * 64
+    legacy_items = [
+        _item("legacy-1", legacy_uid, "dev", "历史问题一？"),
+        _item("legacy-2", legacy_uid, "holdout", "历史问题二？"),
+    ]
+    legacy_manifest = {
+        "documents": [
+            {
+                "paper_uid": legacy_uid,
+                "pdf_sha256": "c" * 64,
+            }
+        ]
+    }
+    v2_assignments = [_assignment(v2_uid, "dev")]
+    v2_items = [
+        _item("v2-1", v2_uid, "dev", "新问题一？"),
+        _item("v2-2", v2_uid, "dev", "新问题二？"),
+    ]
+
+    combined, assignments = assemble_full_corpus_dataset(
+        legacy_items,
+        legacy_manifest,
+        v2_items,
+        v2_assignments,
+    )
+
+    assert [item["split"] for item in combined[:2]] == ["train", "train"]
+    assert {row["split"] for row in assignments if row["paper_uid"] == legacy_uid} == {
+        "train"
+    }
+    assert validate_full_coverage(combined, assignments)["papers"] == 2

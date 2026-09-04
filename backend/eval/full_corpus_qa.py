@@ -187,6 +187,114 @@ def validate_full_coverage(
     }
 
 
+def merge_supplements(
+    existing: list[dict[str, Any]],
+    supplements: list[dict[str, Any]],
+    assignments: list[dict[str, Any]],
+    *,
+    minimum_per_paper: int = 2,
+) -> list[dict[str, Any]]:
+    """按冻结缺口精确合并补题，拒绝漏补、超补或补到非目标论文。"""
+    plan = build_gap_plan(
+        assignments,
+        existing,
+        minimum_per_paper=minimum_per_paper,
+    )
+    expected = {row["paper_uid"]: int(row["needed"]) for row in plan}
+    by_uid = _validate_assignments(assignments)
+    validate_dataset(supplements)
+    actual: Counter[str] = Counter()
+
+    for item in supplements:
+        uid = _item_paper_uid(item)
+        if uid is None:
+            raise ValueError("补题必须为正例")
+        if uid not in expected:
+            raise ValueError("补题目标不在冻结缺口")
+        if actual[uid] >= expected[uid]:
+            raise ValueError("补题目标已满足，不得超额补题")
+        if item.get("split") != by_uid[uid]["split"]:
+            raise ValueError("补题 split 与冻结分配不一致")
+        actual[uid] += 1
+
+    if actual != Counter(expected):
+        missing = sum((Counter(expected) - actual).values())
+        raise ValueError(f"补题数量与冻结缺口不一致: 尚缺 {missing} 条")
+
+    merged = [dict(item) for item in existing]
+    merged.extend(dict(item) for item in supplements)
+    validate_full_coverage(
+        merged,
+        assignments,
+        minimum_per_paper=minimum_per_paper,
+    )
+    return merged
+
+
+def assemble_full_corpus_dataset(
+    legacy_items: list[dict[str, Any]],
+    legacy_manifest: dict[str, Any],
+    v2_items: list[dict[str, Any]],
+    v2_assignments: list[dict[str, Any]],
+    *,
+    minimum_per_paper: int = 2,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """将已消费的 v1 全部转为 train，并与完整 v2 组成全语料 v3。"""
+    validate_dataset(legacy_items)
+    validate_full_coverage(
+        v2_items,
+        v2_assignments,
+        minimum_per_paper=minimum_per_paper,
+    )
+    v2_by_uid = _validate_assignments(v2_assignments)
+
+    documents = legacy_manifest.get("documents")
+    if not isinstance(documents, list):
+        raise ValueError("v1 manifest 缺少 documents")
+    manifest_by_uid: dict[str, dict[str, Any]] = {}
+    for document in documents:
+        if not isinstance(document, dict):
+            raise ValueError("v1 manifest 的 document 必须为对象")
+        uid = document.get("paper_uid")
+        if not isinstance(uid, str) or not uid or uid in manifest_by_uid:
+            raise ValueError("v1 manifest 含缺失或重复 paper_uid")
+        manifest_by_uid[uid] = document
+
+    legacy_uids: set[str] = set()
+    normalized_legacy: list[dict[str, Any]] = []
+    for item in legacy_items:
+        uid = _item_paper_uid(item)
+        if uid is not None:
+            legacy_uids.add(uid)
+        normalized_legacy.append({**item, "split": "train"})
+    if not legacy_uids:
+        raise ValueError("v1 数据集没有正例论文")
+    if legacy_uids & set(v2_by_uid):
+        raise ValueError("v1 与 v2 论文集合不得重叠")
+
+    legacy_assignments: list[dict[str, Any]] = []
+    v2_hashes = {row["pdf_sha256"].lower() for row in v2_by_uid.values()}
+    for uid in sorted(legacy_uids):
+        document = manifest_by_uid.get(uid)
+        if document is None:
+            raise ValueError("v1 QA 论文未在 manifest 中命中")
+        digest = document.get("pdf_sha256")
+        row = {"paper_uid": uid, "pdf_sha256": digest, "split": "train"}
+        validated = _validate_assignments([row])[uid]
+        if validated["pdf_sha256"].lower() in v2_hashes:
+            raise ValueError("v1 与 v2 PDF 内容不得重叠")
+        legacy_assignments.append(validated)
+
+    assignments = legacy_assignments + [dict(row) for row in v2_assignments]
+    combined = normalized_legacy + [dict(item) for item in v2_items]
+    validate_full_coverage(
+        combined,
+        assignments,
+        minimum_per_paper=minimum_per_paper,
+    )
+    return combined, assignments
+
+
 def _private_path(value: str | Path, *, must_exist: bool) -> Path:
     path = Path(value)
     if path.is_symlink():
@@ -212,6 +320,27 @@ def _write_private_json(path: Path, payload: Any) -> None:
             os.chmod(temp_path, 0o600)
             json.dump(payload, stream, ensure_ascii=False, indent=2, sort_keys=True)
             stream.write("\n")
+        temp_path.replace(path)
+        os.chmod(path, 0o600)
+    finally:
+        if temp_path is not None and temp_path.exists():
+            temp_path.unlink()
+
+
+def _write_private_jsonl(path: Path, items: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and path.is_symlink():
+        raise ValueError("输出路径不得为软链接")
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=path.parent, delete=False
+        ) as stream:
+            temp_path = Path(stream.name)
+            os.chmod(temp_path, 0o600)
+            for item in items:
+                stream.write(json.dumps(item, ensure_ascii=False, sort_keys=True))
+                stream.write("\n")
         temp_path.replace(path)
         os.chmod(path, 0o600)
     finally:
@@ -285,17 +414,27 @@ def build_parser() -> argparse.ArgumentParser:
     validate_parser.add_argument("--dataset", required=True)
     validate_parser.add_argument("--minimum-per-paper", type=int, default=2)
     validate_parser.add_argument("--resolve-evidence", action="store_true")
+
+    assemble_parser = subparsers.add_parser("assemble", help="合并补题并生成全语料 v3")
+    assemble_parser.add_argument("--legacy-manifest", required=True)
+    assemble_parser.add_argument("--legacy-dataset", required=True)
+    assemble_parser.add_argument("--splits", required=True)
+    assemble_parser.add_argument("--dataset", required=True)
+    assemble_parser.add_argument("--supplement", action="append", required=True)
+    assemble_parser.add_argument("--output", required=True)
+    assemble_parser.add_argument("--assignments-output", required=True)
+    assemble_parser.add_argument("--minimum-per-paper", type=int, default=2)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    splits_path = _private_path(args.splits, must_exist=True)
-    dataset_path = _private_path(args.dataset, must_exist=True)
-    assignments = load_frozen_splits(splits_path)
-    items = load_dataset(dataset_path)
 
     if args.command == "plan":
+        splits_path = _private_path(args.splits, must_exist=True)
+        dataset_path = _private_path(args.dataset, must_exist=True)
+        assignments = load_frozen_splits(splits_path)
+        items = load_dataset(dataset_path)
         output_path = _private_path(args.output, must_exist=False)
         plan = build_gap_plan(
             assignments, items, minimum_per_paper=args.minimum_per_paper
@@ -309,6 +448,50 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(public_gap_summary(rows), ensure_ascii=False, sort_keys=True))
         return 0
 
+    if args.command == "assemble":
+        splits_path = _private_path(args.splits, must_exist=True)
+        dataset_path = _private_path(args.dataset, must_exist=True)
+        legacy_dataset_path = _private_path(args.legacy_dataset, must_exist=True)
+        legacy_manifest_path = _private_path(args.legacy_manifest, must_exist=True)
+        output_path = _private_path(args.output, must_exist=False)
+        assignments_output = _private_path(args.assignments_output, must_exist=False)
+        assignments = load_frozen_splits(splits_path)
+        existing = load_dataset(dataset_path)
+        supplements: list[dict[str, Any]] = []
+        for value in args.supplement:
+            supplements.extend(load_dataset(_private_path(value, must_exist=True)))
+        v2_items = merge_supplements(
+            existing,
+            supplements,
+            assignments,
+            minimum_per_paper=args.minimum_per_paper,
+        )
+        legacy_items = load_dataset(legacy_dataset_path)
+        legacy_manifest = json.loads(legacy_manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(legacy_manifest, dict):
+            raise ValueError("v1 manifest 顶层必须为对象")
+        combined, combined_assignments = assemble_full_corpus_dataset(
+            legacy_items,
+            legacy_manifest,
+            v2_items,
+            assignments,
+            minimum_per_paper=args.minimum_per_paper,
+        )
+        summary = validate_full_coverage(
+            combined,
+            combined_assignments,
+            minimum_per_paper=args.minimum_per_paper,
+        )
+        summary["supplement_items"] = len(supplements)
+        _write_private_jsonl(output_path, combined)
+        _write_private_json(assignments_output, combined_assignments)
+        print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
+        return 0
+
+    splits_path = _private_path(args.splits, must_exist=True)
+    dataset_path = _private_path(args.dataset, must_exist=True)
+    assignments = load_frozen_splits(splits_path)
+    items = load_dataset(dataset_path)
     summary = validate_full_coverage(
         items, assignments, minimum_per_paper=args.minimum_per_paper
     )
