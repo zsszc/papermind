@@ -79,6 +79,9 @@ _PAPER_FIRST_POOL = 20
 _PAPER_FIRST_RRF_K = 60
 _PAPER_FIRST_BONUS = 0.25
 _PAPER_FIRST_MAX_PER_PAPER = 2
+_DEEP_ROUTE_PRODUCTION_POOL = 10
+_DEEP_ROUTE_CANDIDATE_POOL = 20
+_DEEP_ROUTE_RRF_K = 60
 _ANCHOR_UNIT_TOKENS = frozenset({
     "mm", "cm", "m", "km", "ms", "s", "min", "h", "hz", "khz", "mhz",
     "kb", "mb", "gb", "tb", "mg", "g", "kg", "ml", "l",
@@ -99,6 +102,10 @@ class WeightedRRFError(ValueError):
 
 class PaperFirstRerankError(ValueError):
     """论文优先证据重排的输入或冻结参数不满足候选契约。"""
+
+
+class DeepRouteContractError(ValueError):
+    """保论文集合深层证据候选的输入不满足冻结契约。"""
 
 
 def tokenize_technical_terms(text: str) -> List[str]:
@@ -605,6 +612,116 @@ def paper_first_evidence_fuse_chunks(
     return selected
 
 
+def paper_preserving_deep_route_fuse_chunks(
+    semantic_results: List[Dict[str, Any]],
+    keyword_results: List[Dict[str, Any]],
+    top_k: int,
+) -> List[Dict[str, Any]]:
+    """保持生产论文 slot，仅在同论文内以 top-20 RRF 选择证据块。
+
+    生产控制始终由两路前 10 项的 legacy RRF 决定；完整 top-20 只参与
+    已入选论文内部的 chunk 选择，不能引入、删除或移动论文 slot。
+    """
+    if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k < 0:
+        raise DeepRouteContractError("top_k 必须是非负整数")
+    if top_k == 0:
+        return []
+
+    route_rows: list[list[tuple[str, int, Dict[str, Any]]]] = []
+    for results in (semantic_results, keyword_results):
+        seen: set[str] = set()
+        rows: list[tuple[str, int, Dict[str, Any]]] = []
+        for item in results[:_DEEP_ROUTE_CANDIDATE_POOL]:
+            chunk_id = item.get("chunk_id")
+            match = _CHUNK_ID_FULL_RE.fullmatch(str(chunk_id or ""))
+            if match is None:
+                raise DeepRouteContractError("chunk_id 必须是 canonical pN_cN")
+            paper_id, chunk_index = (int(value) for value in match.groups())
+            canonical = f"p{paper_id}_c{chunk_index}"
+            if (
+                paper_id <= 0
+                or chunk_index < -1
+                or canonical != chunk_id
+                or item.get("paper_id") != paper_id
+            ):
+                raise DeepRouteContractError("chunk_id 与 paper_id 不符合契约")
+            if chunk_id in seen:
+                raise DeepRouteContractError("单路结果含重复 chunk_id")
+            seen.add(chunk_id)
+            rows.append((chunk_id, paper_id, item))
+        route_rows.append(rows)
+
+    semantic_rows, keyword_rows = route_rows
+    baseline = rrf_fuse_chunks(
+        [row[2] for row in semantic_rows[:_DEEP_ROUTE_PRODUCTION_POOL]],
+        [row[2] for row in keyword_rows[:_DEEP_ROUTE_PRODUCTION_POOL]],
+        top_k,
+        k=_DEEP_ROUTE_RRF_K,
+    )
+    if not baseline:
+        return []
+
+    baseline_ids = [str(item["chunk_id"]) for item in baseline]
+    baseline_rank = {chunk_id: rank for rank, chunk_id in enumerate(baseline_ids)}
+    slot_papers = [int(item["paper_id"]) for item in baseline]
+    paper_quota = Counter(slot_papers)
+
+    scores: Dict[str, float] = {}
+    papers: Dict[str, int] = {}
+    metas: Dict[str, Dict[str, Any]] = {}
+    first_seen: Dict[str, int] = {}
+    for rows in route_rows:
+        for rank, (chunk_id, paper_id, item) in enumerate(rows, start=1):
+            scores[chunk_id] = (
+                scores.get(chunk_id, 0.0)
+                + 1.0 / (_DEEP_ROUTE_RRF_K + rank)
+            )
+            papers.setdefault(chunk_id, paper_id)
+            if chunk_id not in metas:
+                first_seen[chunk_id] = len(first_seen)
+                metas[chunk_id] = copy.deepcopy(item)
+
+    selected_by_paper: Dict[int, List[str]] = {}
+    for paper_id, quota in paper_quota.items():
+        candidates = [
+            chunk_id for chunk_id, candidate_paper in papers.items()
+            if candidate_paper == paper_id
+        ]
+        candidates.sort(key=lambda chunk_id: (
+            -scores[chunk_id],
+            0 if chunk_id in baseline_rank else 1,
+            baseline_rank.get(chunk_id, len(baseline_rank)),
+            first_seen[chunk_id],
+            chunk_id,
+        ))
+        if len(candidates) < quota:
+            raise DeepRouteContractError("深层候选无法满足冻结论文 slot")
+        selected_by_paper[paper_id] = candidates[:quota]
+
+    paper_offsets: Counter[int] = Counter()
+    selected: List[Dict[str, Any]] = []
+    for slot, paper_id in enumerate(slot_papers):
+        offset = paper_offsets[paper_id]
+        chunk_id = selected_by_paper[paper_id][offset]
+        paper_offsets[paper_id] += 1
+        if chunk_id == baseline_ids[slot]:
+            selected.append(copy.deepcopy(baseline[slot]))
+            continue
+        item = copy.deepcopy(metas[chunk_id])
+        item.update({
+            "score": scores[chunk_id],
+            "deep_route_score": scores[chunk_id],
+            "replaced_production_chunk": baseline_ids[slot],
+        })
+        selected.append(item)
+
+    if [int(item["paper_id"]) for item in selected] != slot_papers:
+        raise DeepRouteContractError("候选改变了冻结论文 slot")
+    if len({item["chunk_id"] for item in selected}) != len(selected):
+        raise DeepRouteContractError("候选产生重复 chunk")
+    return selected
+
+
 def anchor_rrf_fuse_chunks(
     semantic_results: List[Dict[str, Any]],
     keyword_results: List[Dict[str, Any]],
@@ -907,7 +1024,8 @@ class RetrievalPipeline:
             "semantic", "hybrid", "hybrid-local-neighbor",
             "parent-child-v1", "weighted-rrf-v1",
             "weighted-rrf-compat-v1", "hybrid-anchor-v1",
-            "paper-first-evidence-rerank-v1", "keyword"
+            "paper-first-evidence-rerank-v1",
+            "paper-preserving-deep-route-v1", "keyword"
         }:
             raise ValueError(f"不支持的检索 profile: {requested_profile}")
         weighted_profiles = {"weighted-rrf-v1", "weighted-rrf-compat-v1"}
@@ -919,7 +1037,8 @@ class RetrievalPipeline:
         if profile in {
             "hybrid", "hybrid-local-neighbor", "parent-child-v1",
             "weighted-rrf-v1", "weighted-rrf-compat-v1",
-            "hybrid-anchor-v1", "paper-first-evidence-rerank-v1", "keyword"
+            "hybrid-anchor-v1", "paper-first-evidence-rerank-v1",
+            "paper-preserving-deep-route-v1", "keyword"
         }:
             try:
                 keyword_results = keyword_chunk_search(
@@ -929,6 +1048,8 @@ class RetrievalPipeline:
                     if profile == "parent-child-v1"
                     else _PAPER_FIRST_POOL
                     if profile == "paper-first-evidence-rerank-v1"
+                    else _DEEP_ROUTE_CANDIDATE_POOL
+                    if profile == "paper-preserving-deep-route-v1"
                     else top_k * 2,
                     lexical_profile=lexical_profile,
                     filters=filters,
@@ -984,6 +1105,9 @@ class RetrievalPipeline:
                     else
                     _PAPER_FIRST_POOL
                     if profile == "paper-first-evidence-rerank-v1"
+                    else
+                    _DEEP_ROUTE_CANDIDATE_POOL
+                    if profile == "paper-preserving-deep-route-v1"
                     else
                     _LOCAL_NEIGHBOR_SEED_POOL
                     if profile == "hybrid-local-neighbor"
@@ -1051,6 +1175,39 @@ class RetrievalPipeline:
                 self._write_diagnostics(
                     diagnostics, requested_profile, "empty",
                     degraded=True, reason="paper_first_contract_invalid",
+                )
+                return []
+            self._write_diagnostics(
+                diagnostics, requested_profile, profile,
+                degraded=False, reason=None,
+            )
+            return results
+
+        if profile == "paper-preserving-deep-route-v1":
+            if semantic_reason is not None:
+                self._write_diagnostics(
+                    diagnostics, requested_profile, "empty",
+                    degraded=True, reason=semantic_reason,
+                )
+                return []
+            if keyword_error:
+                self._write_diagnostics(
+                    diagnostics, requested_profile, "empty",
+                    degraded=True, reason="keyword_search_failed",
+                )
+                return []
+            try:
+                results = paper_preserving_deep_route_fuse_chunks(
+                    semantic_results, keyword_results, top_k
+                )
+            except DeepRouteContractError as exc:
+                logger.warning(
+                    "[retrieval_pipeline] 保论文深层证据候选失败: "
+                    f"{type(exc).__name__}"
+                )
+                self._write_diagnostics(
+                    diagnostics, requested_profile, "empty",
+                    degraded=True, reason="deep_route_contract_invalid",
                 )
                 return []
             self._write_diagnostics(

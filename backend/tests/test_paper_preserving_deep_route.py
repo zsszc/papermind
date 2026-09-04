@@ -45,10 +45,10 @@ def test_deep_cross_route_hit_replaces_chunk_without_changing_paper_slots():
         row["paper_id"] for row in baseline
     ]
     assert [row["chunk_id"] for row in baseline] == [
-        "p1_c0", "p2_c0", "p3_c0", "p4_c0", "p5_c0",
+        "p1_c0", "p11_c0", "p2_c0", "p12_c0", "p3_c0",
     ]
     assert [row["chunk_id"] for row in candidate] == [
-        "p1_c1", "p2_c0", "p3_c0", "p4_c0", "p5_c0",
+        "p1_c1", "p11_c0", "p2_c0", "p12_c0", "p3_c0",
     ]
     assert (semantic, keyword) == original
 
@@ -126,7 +126,7 @@ def test_pipeline_exposes_candidate_only_by_explicit_profile(monkeypatch):
         diagnostics=diagnostics,
     )
 
-    assert [row["paper_id"] for row in results] == [1, 2, 3, 4, 5]
+    assert [row["paper_id"] for row in results] == [1, 11, 2, 12, 3]
     assert results[0]["chunk_id"] == "p1_c1"
     assert diagnostics == {
         "requested_profile": "paper-preserving-deep-route-v1",

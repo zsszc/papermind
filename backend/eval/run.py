@@ -128,6 +128,20 @@ _PAPER_FIRST_FORMULA = {
     "invalid_input": "fail-closed",
 }
 
+_PAPER_PRESERVING_DEEP_ROUTE_FORMULA = {
+    "algorithm": "paper-preserving-deep-route-v1",
+    "routes": ["semantic", "bm25-bilingual"],
+    "production_route_limit": 10,
+    "candidate_route_limit": 20,
+    "rrf_k": 60,
+    "rank_base": 1,
+    "paper_slots": "production-legacy-rrf-order-and-quota",
+    "within_paper_selection": "candidate-depth-legacy-rrf",
+    "tie": "incumbent-then-first-seen-then-chunk-id",
+    "metadata": "unchanged-incumbent-or-first-seen-replacement",
+    "invalid_input": "fail-closed",
+}
+
 
 def _sha256_bytes(data: bytes) -> str:
     """返回 bytes 的 SHA256 十六进制摘要。"""
@@ -736,6 +750,20 @@ def paper_first_contract_metadata() -> Dict[str, Any]:
     }
 
 
+def paper_preserving_deep_route_contract_metadata() -> Dict[str, Any]:
+    """返回 Batch 29 保论文深层证据候选的冻结公式与指纹。"""
+    payload = json.dumps(
+        _PAPER_PRESERVING_DEEP_ROUTE_FORMULA,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return {
+        **_PAPER_PRESERVING_DEEP_ROUTE_FORMULA,
+        "formula_sha256": _sha256_bytes(payload),
+    }
+
+
 def _audit_vector_snapshot(db, store) -> Dict[str, Any]:
     """校验 SQLite/Chroma 全量 ID、维度并生成 embedding 内容指纹。"""
     from app.models import Chunk
@@ -908,6 +936,9 @@ class Retriever:
 
     @property
     def mode(self) -> str:
+        if self.retrieval_profile == "paper-preserving-deep-route-v1":
+            suffix = "" if not self.degraded else "(degraded)"
+            return f"paper-preserving-deep-route-v1{suffix}"
         if self.retrieval_profile == "paper-first-evidence-rerank-v1":
             suffix = "" if not self.degraded else "(degraded)"
             return f"paper-first-evidence-rerank-v1{suffix}"
@@ -953,6 +984,8 @@ class Retriever:
             profile = "parent-child-v1"
         elif self.retrieval_profile == "paper-first-evidence-rerank-v1":
             profile = "paper-first-evidence-rerank-v1"
+        elif self.retrieval_profile == "paper-preserving-deep-route-v1":
+            profile = "paper-preserving-deep-route-v1"
         elif self.retrieval_profile in _WEIGHTED_RRF_PROFILES:
             profile = self.retrieval_profile
         else:
@@ -1284,6 +1317,7 @@ def run_eval(args: argparse.Namespace) -> int:
         weighted_contract: Dict[str, Any] = {}
         anchor_contract: Dict[str, Any] = {}
         paper_first_contract: Dict[str, Any] = {}
+        paper_preserving_contract: Dict[str, Any] = {}
         if (
             args.vector_dir
             and args.database
@@ -1341,6 +1375,13 @@ def run_eval(args: argparse.Namespace) -> int:
             paper_first_contract = paper_first_contract_metadata()
             benchmark["paper_first_formula_sha256"] = (
                 paper_first_contract["formula_sha256"]
+            )
+        if args.retrieval_profile == "paper-preserving-deep-route-v1":
+            paper_preserving_contract = (
+                paper_preserving_deep_route_contract_metadata()
+            )
+            benchmark["paper_preserving_formula_sha256"] = (
+                paper_preserving_contract["formula_sha256"]
             )
         print(f"[eval] 检索模式: {retriever.mode}"
               + (f"（{retriever.degrade_reason}）" if retriever.degraded else ""))
@@ -1513,6 +1554,7 @@ def run_eval(args: argparse.Namespace) -> int:
             benchmark.get("weighted_rrf_formula_sha256", "none"),
             benchmark.get("factoid_anchor_formula_sha256", "none"),
             benchmark.get("paper_first_formula_sha256", "none"),
+            benchmark.get("paper_preserving_formula_sha256", "none"),
             str(args.top_k),
         ))
         runtime_valid = retriever.runtime_degraded_count == 0
@@ -1562,6 +1604,8 @@ def run_eval(args: argparse.Namespace) -> int:
                 **({"factoid_anchor": anchor_contract} if anchor_contract else {}),
                 **({"paper_first": paper_first_contract}
                    if paper_first_contract else {}),
+                **({"paper_preserving_deep_route": paper_preserving_contract}
+                   if paper_preserving_contract else {}),
             },
             "diagnostics": {
                 "unresolved_qrels": [],
@@ -1730,6 +1774,7 @@ def build_parser() -> argparse.ArgumentParser:
             "parent-child-v1", "weighted-rrf-v1",
             "weighted-rrf-compat-v1", "hybrid-anchor-v1",
             "paper-first-evidence-rerank-v1",
+            "paper-preserving-deep-route-v1",
         ),
         default="hybrid",
         help=("评测检索管线；hybrid-local-neighbor 为 Batch21 候选；"
@@ -1738,7 +1783,8 @@ def build_parser() -> argparse.ArgumentParser:
               "weighted-rrf-v1 为 Batch22F 严格候选；"
               "weighted-rrf-compat-v1 为 Batch22G 旧版兼容候选；"
               "hybrid-anchor-v1 为 Batch22I factoid 锚点候选；"
-              "paper-first-evidence-rerank-v1 为 Batch27B 论文优先候选"),
+              "paper-first-evidence-rerank-v1 为 Batch27B 论文优先候选；"
+              "paper-preserving-deep-route-v1 为 Batch29 保论文深层候选"),
     )
     parser.add_argument(
         "--vector-dir",
@@ -1878,6 +1924,27 @@ def _validate_cli_args(args: argparse.Namespace) -> Optional[str]:
             return "hybrid-anchor-v1 禁止 QA 子集与 LLM"
     if args.retrieval_profile == "paper-first-evidence-rerank-v1":
         profile = "paper-first-evidence-rerank-v1"
+        if args.keyword_only:
+            return f"{profile} 不得使用 --keyword-only"
+        if not args.database or not args.corpus_root or not args.vector_dir:
+            return (
+                f"{profile} 必须显式指定 --database/--corpus-root/"
+                "--vector-dir"
+            )
+        if args.parent_database:
+            return f"{profile} 不得指定 --parent-database"
+        if args.evidence_resolver != "page-span-v2":
+            return f"{profile} 必须使用 --evidence-resolver page-span-v2"
+        if args.top_k != 5:
+            return f"{profile} 必须使用 top-k=5"
+        if args.split != "train":
+            return f"{profile} 通用评测只允许完整 train，禁止 dev/holdout"
+        if args.lexical_profile != "bm25-bilingual":
+            return f"{profile} 必须使用 --lexical-profile bm25-bilingual"
+        if args.qa_id or args.with_llm:
+            return f"{profile} 禁止 QA 子集与 LLM"
+    if args.retrieval_profile == "paper-preserving-deep-route-v1":
+        profile = "paper-preserving-deep-route-v1"
         if args.keyword_only:
             return f"{profile} 不得使用 --keyword-only"
         if not args.database or not args.corpus_root or not args.vector_dir:
