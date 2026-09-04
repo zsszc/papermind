@@ -7,7 +7,7 @@ const apiMocks = vi.hoisted(() => ({
 }))
 
 vi.mock('../api', () => apiMocks)
-vi.mock('echarts-for-react', () => ({ default: () => <div data-testid="chart" /> }))
+vi.mock('echarts-for-react/lib/core', () => ({ default: () => <div data-testid="chart" /> }))
 
 import StatsPage from './StatsPage'
 

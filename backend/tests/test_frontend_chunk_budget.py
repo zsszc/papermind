@@ -31,3 +31,16 @@ def test_chunk_budget_rejects_oversize_or_missing_build(tmp_path):
     assert scan_chunks(tmp_path)[1] == ["缺少 dist/assets，请先执行生产构建"]
     _write(tmp_path / "assets" / "ui.js", JS_BUDGET_BYTES + 1)
     assert "ui.js" in scan_chunks(tmp_path)[1][0]
+
+
+def test_stats_page_uses_tree_shakeable_echarts_core():
+    source = (
+        Path(__file__).resolve().parents[2] / "frontend" / "src" / "pages" / "StatsPage.jsx"
+    ).read_text(encoding="utf-8")
+    assert "from 'echarts-for-react/lib/core'" in source
+    assert "from 'echarts/core'" in source
+    assert "from 'echarts/charts'" in source
+    assert "from 'echarts/components'" in source
+    assert "from 'echarts/renderers'" in source
+    assert "import ReactECharts from 'echarts-for-react'" not in source
+    assert "import * as echarts from 'echarts/core'" not in source

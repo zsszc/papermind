@@ -23,9 +23,6 @@ export default defineConfig({
           if (id.includes('/node_modules/react-pdf/') || id.includes('/node_modules/pdfjs-dist/')) {
             return 'pdf'
           }
-          if (id.includes('/node_modules/antd/') || id.includes('/node_modules/@ant-design/')) {
-            return 'ui'
-          }
           if (id.includes('/node_modules/react-markdown/') || id.includes('/node_modules/remark-gfm/')) {
             return 'markdown'
           }

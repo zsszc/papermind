@@ -12,6 +12,10 @@ JS_BUDGET_BYTES = 600 * 1024
 PDF_WORKER_BUDGET_BYTES = 1100 * 1024
 
 
+def is_pdf_worker(name: str) -> bool:
+    return name.startswith("pdf.worker.") or name.startswith("pdf.worker.min-")
+
+
 def scan_chunks(dist_dir: Path) -> tuple[list[tuple[str, int]], list[str]]:
     assets = dist_dir / "assets"
     if not assets.is_dir():
@@ -27,7 +31,7 @@ def scan_chunks(dist_dir: Path) -> tuple[list[tuple[str, int]], list[str]]:
     for path in chunks:
         size = path.stat().st_size
         rows.append((path.name, size))
-        worker = path.name.startswith("pdf.worker.") or path.name.startswith("pdf.worker.min-")
+        worker = is_pdf_worker(path.name)
         budget = PDF_WORKER_BUDGET_BYTES if worker else JS_BUDGET_BYTES
         if size > budget:
             errors.append(
@@ -45,9 +49,14 @@ def main(argv: list[str] | None = None) -> int:
         for error in errors:
             print(f"[frontend-chunks] FAIL: {error}", file=sys.stderr)
         return 1
-    largest = max((size for _, size in rows), default=0)
+    normal_sizes = [size for name, size in rows if not is_pdf_worker(name)]
+    worker_sizes = [size for name, size in rows if is_pdf_worker(name)]
+    largest_normal = max(normal_sizes, default=0)
+    largest_worker = max(worker_sizes, default=0)
     print(
-        f"[frontend-chunks] PASS: {len(rows)} 个 JS chunk，最大 {largest / 1024:.1f}KiB"
+        f"[frontend-chunks] PASS: {len(rows)} 个 JS chunk，"
+        f"普通最大 {largest_normal / 1024:.1f}KiB，"
+        f"PDF worker 最大 {largest_worker / 1024:.1f}KiB"
     )
     return 0
 

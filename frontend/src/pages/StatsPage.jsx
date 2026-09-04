@@ -1,8 +1,25 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Button, Card, Row, Col, Statistic, Spin, Empty, Tag } from 'antd'
-import ReactECharts from 'echarts-for-react'
+import ReactEChartsCore from 'echarts-for-react/lib/core'
+import { dispose, getInstanceByDom, init, use } from 'echarts/core'
+import { BarChart, GraphChart, PieChart } from 'echarts/charts'
+import { GridComponent, TitleComponent, TooltipComponent } from 'echarts/components'
+import { CanvasRenderer } from 'echarts/renderers'
 import { getBenchmarkV2Readiness, getPaperStats } from '../api'
 import { colors, componentStyles } from '../theme'
+
+use([
+  BarChart,
+  GraphChart,
+  PieChart,
+  GridComponent,
+  TitleComponent,
+  TooltipComponent,
+  CanvasRenderer,
+])
+
+// echarts-for-react 仅依赖这三个运行时方法；避免传入整个 namespace 阻碍 tree-shaking。
+const echarts = { dispose, getInstanceByDom, init }
 
 const readinessCountFields = [
   'physical_pdf_files',
@@ -232,22 +249,22 @@ function StatsPage({ onSelectPaper }) {
           <Row gutter={[16, 16]}>
         <Col xs={24} md={12}>
           <Card style={componentStyles.card}>
-            <ReactECharts option={yearOption} style={{ height: 300 }} />
+            <ReactEChartsCore echarts={echarts} option={yearOption} style={{ height: 300 }} />
           </Card>
         </Col>
         <Col xs={24} md={12}>
           <Card style={componentStyles.card}>
-            <ReactECharts option={statusOption} style={{ height: 300 }} />
+            <ReactEChartsCore echarts={echarts} option={statusOption} style={{ height: 300 }} />
           </Card>
         </Col>
         <Col xs={24}>
           <Card style={componentStyles.card}>
-            <ReactECharts option={tagOption} style={{ height: 320 }} />
+            <ReactEChartsCore echarts={echarts} option={tagOption} style={{ height: 320 }} />
           </Card>
         </Col>
         <Col xs={24}>
           <Card style={componentStyles.card}>
-            <ReactECharts option={graphOption} style={{ height: 450 }} />
+            <ReactEChartsCore echarts={echarts} option={graphOption} style={{ height: 450 }} />
           </Card>
         </Col>
         <Col xs={24}>
