@@ -104,6 +104,12 @@ def test_aggregate_classifies_depth_and_selects_single_candidate():
         "11-20": 0,
         "not_found": 4,
     }
+    assert report["routes"]["union"]["first_hit_depth"] == {
+        "1-5": 5,
+        "6-10": 4,
+        "11-20": 0,
+        "not_found": 4,
+    }
     assert report["recommendation"]["candidate"] == (
         "paper-preserving-deep-route-v1"
     )
@@ -121,6 +127,10 @@ def test_span_metrics_distinguish_top5_top10_and_top20():
     assert semantic["span_coverage@5"] == 5 / 13
     assert semantic["span_coverage@10"] == 9 / 13
     assert semantic["span_coverage@20"] == 9 / 13
+    union = report["routes"]["union"]
+    assert union["span_coverage@5"] == 5 / 13
+    assert union["span_coverage@10"] == 9 / 13
+    assert union["span_coverage@20"] == 9 / 13
 
 
 def test_analysis_is_deterministic_does_not_mutate_and_emits_no_identity():

@@ -314,6 +314,56 @@ def _route_summary(records: list[dict[str, Any]], field: str) -> dict[str, Any]:
     }
 
 
+def _union_route_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """按同一深度合并两路，避免把第二路错误解释为 rank 21–40。"""
+    buckets: Counter[str] = Counter()
+    any_hits: dict[int, list[float]] = defaultdict(list)
+    coverages: dict[int, list[float]] = defaultdict(list)
+    for record in records:
+        groups = record["evidence_groups"]
+        relevant = set(_evidence_ids(groups))
+        ranks = [
+            rank
+            for route in (record["semantic_ids"], record["lexical_ids"])
+            for rank, chunk_id in enumerate(route, start=1)
+            if chunk_id in relevant
+        ]
+        first_rank = min(ranks) if ranks else None
+        bucket = (
+            "not_found" if first_rank is None
+            else "1-5" if first_rank <= 5
+            else "6-10" if first_rank <= 10
+            else "11-20"
+        )
+        buckets[bucket] += 1
+        for depth in _DEPTHS:
+            union = list(dict.fromkeys(
+                record["semantic_ids"][:depth]
+                + record["lexical_ids"][:depth]
+            ))
+            any_hits[depth].append(
+                evidence_any_hit_at_k(union, groups, len(union))
+            )
+            coverages[depth].append(
+                evidence_span_coverage_at_k(union, groups, len(union))
+            )
+    count = len(records)
+    return {
+        "first_hit_depth": {
+            bucket: buckets.get(bucket, 0)
+            for bucket in ("1-5", "6-10", "11-20", "not_found")
+        },
+        **{
+            f"any_hit@{depth}": sum(any_hits[depth]) / count
+            for depth in _DEPTHS
+        },
+        **{
+            f"span_coverage@{depth}": sum(coverages[depth]) / count
+            for depth in _DEPTHS
+        },
+    }
+
+
 def _classify(record: dict[str, Any]) -> str:
     groups = record["evidence_groups"]
     baseline_coverage = evidence_span_coverage_at_k(
@@ -383,6 +433,7 @@ def analyze_route_depth(
         "routes": {
             "semantic": _route_summary(validated, "semantic_ids"),
             "bm25_bilingual": _route_summary(validated, "lexical_ids"),
+            "union": _union_route_summary(validated),
         },
         "by_question_type": [
             {
