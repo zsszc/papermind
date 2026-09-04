@@ -1467,6 +1467,26 @@ def run_eval(args: argparse.Namespace) -> int:
             benchmark["within_paper_semantic_formula_sha256"] = (
                 within_paper_semantic_contract["formula_sha256"]
             )
+            authorization = getattr(
+                args, "_semantic_dev_authorization", None
+            )
+            if authorization is not None:
+                train_binding = authorization["binding"]
+                for field in (
+                    "dataset_sha256",
+                    "vector_manifest_sha256",
+                    "hnsw_config_sha256",
+                    "hnsw_binary_manifest_sha256",
+                ):
+                    if benchmark.get(field) != train_binding.get(field):
+                        print(
+                            f"[eval] dev 授权运行时指纹不一致: {field}",
+                            file=sys.stderr,
+                        )
+                        return 2
+                benchmark["semantic_dev_train_gate_sha256"] = (
+                    authorization["train_gate_sha256"]
+                )
         print(f"[eval] 检索模式: {retriever.mode}"
               + (f"（{retriever.degrade_reason}）" if retriever.degraded else ""))
 
@@ -1641,6 +1661,7 @@ def run_eval(args: argparse.Namespace) -> int:
             benchmark.get("paper_preserving_formula_sha256", "none"),
             benchmark.get("within_paper_formula_sha256", "none"),
             benchmark.get("within_paper_semantic_formula_sha256", "none"),
+            benchmark.get("semantic_dev_train_gate_sha256", "none"),
             str(args.top_k),
         ))
         runtime_valid = retriever.runtime_degraded_count == 0
@@ -1919,6 +1940,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-llm-calls", type=int, default=0,
         help="真实生成调用硬上限；--with-llm 时必须大于等于白名单数",
     )
+    parser.add_argument(
+        "--train-gate", default=None,
+        help="Batch32 候选 dev 必需的已通过 train Gate 私有报告",
+    )
+    parser.add_argument(
+        "--dev-claim", default=None,
+        help="Batch32 候选 dev 的一次性私有 claim 文件（必须尚不存在）",
+    )
     parser.add_argument("--report-dir", default=str(DEFAULT_REPORT_DIR),
                         help="JSON 报告输出目录（默认 eval/reports/）")
     return parser
@@ -2094,8 +2123,12 @@ def _validate_cli_args(args: argparse.Namespace) -> Optional[str]:
             return f"{profile} 必须使用 --evidence-resolver page-span-v2"
         if args.top_k != 5:
             return f"{profile} 必须使用 top-k=5"
-        if args.split != "train":
-            return f"{profile} 通用评测只允许完整 train，禁止 dev/holdout"
+        if args.split not in {"train", "dev"}:
+            return f"{profile} 只允许完整 train 或已授权 dev，禁止 holdout"
+        if args.split == "dev" and (not args.train_gate or not args.dev_claim):
+            return f"{profile} dev 必须提供 --train-gate 与 --dev-claim"
+        if args.split == "train" and (args.train_gate or args.dev_claim):
+            return f"{profile} train 不得伪装 dev 授权"
         if args.lexical_profile != "bm25-bilingual":
             return f"{profile} 必须使用 --lexical-profile bm25-bilingual"
         if args.qa_id or args.with_llm:
@@ -2127,6 +2160,10 @@ def _validate_cli_args(args: argparse.Namespace) -> Optional[str]:
             return "semantic-production 必须显式指定 --semantic-rerank off/on"
     elif args.semantic_rerank is not None:
         return "--semantic-rerank 仅适用于 semantic-production"
+    if args.retrieval_profile != "within-paper-semantic-rerank-v1" and (
+        args.train_gate or args.dev_claim
+    ):
+        return "--train-gate/--dev-claim 仅适用于论文内语义候选 dev"
     if not args.keyword_only and not args.vector_dir:
         return "hybrid 评测必须显式指定 --vector-dir 隔离向量快照"
     return None
@@ -2135,6 +2172,67 @@ def _validate_cli_args(args: argparse.Namespace) -> Optional[str]:
 def _validate_fixture_args(args: argparse.Namespace) -> Optional[str]:
     """保留旧名供下游测试与调用方兼容。"""
     return _validate_cli_args(args)
+
+
+def _load_semantic_dev_authorization(path: Path) -> dict[str, Any]:
+    """验证 train Gate、Git 祖先及候选实现未变，返回脱敏绑定。"""
+    from eval.train_failure_diagnostics import validate_cli_path
+
+    gate_path = validate_cli_path(
+        path, private_root=PRIVATE_EVAL_ROOT, must_exist=True
+    )
+    payload = json.loads(gate_path.read_text(encoding="utf-8"))
+    if (
+        payload.get("schema") != "within-paper-semantic-train-gate-v1"
+        or payload.get("passed") is not True
+    ):
+        raise ValueError("dev 授权要求已通过的 Batch32 train Gate")
+    binding = payload.get("binding") or {}
+    gate_sha = str(binding.get("git_sha", ""))
+    if re.fullmatch(r"[0-9a-f]{40}", gate_sha) is None:
+        raise ValueError("train Gate 缺少有效 Git SHA")
+    contract = within_paper_semantic_rerank_contract_metadata()
+    if binding.get("within_paper_semantic_formula_sha256") != contract["formula_sha256"]:
+        raise ValueError("train Gate 候选公式与当前代码不一致")
+    if _git_tracked_clean() is not True:
+        raise ValueError("候选 dev 必须在 tracked Git clean 状态运行")
+    root = Path(__file__).resolve().parents[2]
+    ancestor = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", gate_sha, "HEAD"], cwd=root
+    )
+    if ancestor.returncode != 0:
+        raise ValueError("train Gate Git 提交不是当前提交祖先")
+    unchanged = subprocess.run([
+        "git", "diff", "--quiet", gate_sha, "HEAD", "--",
+        "backend/app/services/retrieval.py",
+        "backend/app/services/retrieval_pipeline.py",
+    ], cwd=root)
+    if unchanged.returncode != 0:
+        raise ValueError("train Gate 后候选实现发生变化，必须重跑 train")
+    return {
+        "train_gate_sha256": hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                       separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+        "binding": binding,
+    }
+
+
+def _claim_semantic_dev(path: Path, authorization: dict[str, Any]) -> None:
+    """在候选查询前原子消费一次性 dev claim。"""
+    from eval.train_failure_diagnostics import validate_cli_path, write_report_exclusive
+
+    claim_path = validate_cli_path(
+        path, private_root=PRIVATE_EVAL_ROOT, must_exist=False
+    )
+    write_report_exclusive(claim_path, {
+        "schema": "within-paper-semantic-dev-claim-v1",
+        "train_gate_sha256": authorization["train_gate_sha256"],
+        "git_sha": _git_sha(),
+        "formula_sha256": within_paper_semantic_rerank_contract_metadata()[
+            "formula_sha256"
+        ],
+    })
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -2148,6 +2246,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     if cli_error:
         print(f"[eval] 参数错误: {cli_error}", file=sys.stderr)
         return 2
+    if (
+        args.retrieval_profile == "within-paper-semantic-rerank-v1"
+        and args.split == "dev"
+    ):
+        try:
+            authorization = _load_semantic_dev_authorization(
+                Path(args.train_gate)
+            )
+            _claim_semantic_dev(Path(args.dev_claim), authorization)
+            args._semantic_dev_authorization = authorization
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(
+                f"[eval] dev 授权失败: {type(exc).__name__}", file=sys.stderr
+            )
+            return 2
     return run_eval(args)
 
 

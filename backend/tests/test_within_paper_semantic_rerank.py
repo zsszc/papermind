@@ -100,9 +100,45 @@ def test_eval_profile_is_train_only_and_contract_is_stable(tmp_path):
     ])
     assert run._validate_cli_args(args) is None
     args.split = "dev"
-    assert "完整 train" in run._validate_cli_args(args)
+    assert "train-gate" in run._validate_cli_args(args)
     contract = run.within_paper_semantic_rerank_contract_metadata()
     assert contract["algorithm"] == "within-paper-semantic-rerank-v1"
     assert contract["within_paper_depth"] == 5
     assert contract["embedding_calls_per_query"] == 1
     assert len(contract["formula_sha256"]) == 64
+
+
+def test_dev_requires_explicit_train_gate_and_one_time_claim(tmp_path):
+    parser = run.build_parser()
+    common = [
+        "--dataset", "eval/private/qa_private_v2.jsonl",
+        "--database", str(tmp_path / "papers.db"),
+        "--corpus-root", str(tmp_path / "corpus"),
+        "--vector-dir", str(tmp_path / "vectors"),
+        "--retrieval-profile", "within-paper-semantic-rerank-v1",
+        "--lexical-profile", "bm25-bilingual",
+        "--evidence-resolver", "page-span-v2", "--split", "dev",
+    ]
+    missing = parser.parse_args(common)
+    assert "train-gate" in run._validate_cli_args(missing)
+    authorized = parser.parse_args(common + [
+        "--train-gate", "eval/private/train-gate.json",
+        "--dev-claim", "eval/private/dev-claim.json",
+    ])
+    assert run._validate_cli_args(authorized) is None
+
+
+def test_dev_claim_is_exclusive_and_contains_no_private_content(tmp_path, monkeypatch):
+    private_root = tmp_path / "private"
+    private_root.mkdir()
+    claim = private_root / "claim.json"
+    monkeypatch.setattr(run, "PRIVATE_EVAL_ROOT", private_root)
+    monkeypatch.setattr(run, "_git_sha", lambda: "a" * 40)
+    authorization = {"train_gate_sha256": "b" * 64}
+
+    run._claim_semantic_dev(claim, authorization)
+
+    rendered = claim.read_text(encoding="utf-8")
+    assert "private question" not in rendered
+    with pytest.raises(FileExistsError):
+        run._claim_semantic_dev(claim, authorization)
