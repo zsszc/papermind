@@ -95,7 +95,7 @@ Kimi API (kimi-k2.6) —— 对话 / 概括 / 联网搜索 / 图片分析
 │   │   ├── schemas.py      # Pydantic 请求/响应模型
 │   │   └── main.py         # FastAPI 入口（lifespan、CORS、/mcp 挂载、/static 白名单）
 │   ├── eval/               # RAG/生成 Guardrail 评测：公开 fixture、私有 QA、run.py、generation_guardrails.py
-│   ├── tests/              # pytest 套件（1074 用例，内存 SQLite + TestClient）
+│   ├── tests/              # pytest 套件（1083 用例，内存 SQLite + TestClient）
 │   ├── venv/               # Python 3.12 虚拟环境（会被 electron-builder 打包）
 │   ├── pyproject.toml      # 依赖声明 + pytest/ruff 配置
 │   └── requirements.txt    # 锁定依赖（与 pyproject 保持一致）
@@ -194,7 +194,7 @@ cd ../electron && npm run build    # 产物在 frontend/out/（dmg/zip/exe）
 
 ## 8. 测试与评测
 
-### 单元/集成测试（pytest，1074 个用例）
+### 单元/集成测试（pytest，1083 个用例）
 
 ```bash
 cd backend
@@ -215,7 +215,7 @@ PAPERMIND_RELEASE_E2E=1 PAPERMIND_PYTHON=../backend/venv/bin/python \
 ```
 
 前端测试依赖包含 MSW，新增网络交互测试不得连接真实后端；Electron 生命周期与安全策略纯模块不得
-`require('electron')`，确保 CI 无 GUI 也能运行。当前后端 1074 个测试、前端 66 个测试；
+`require('electron')`，确保 CI 无 GUI 也能运行。当前后端 1083 个测试、前端 66 个测试；
 Electron 默认纯测试为 26 passed + 2 个显式 skipped，真实发布 E2E 单独为 10/10 passed。
 
 ### RAG 评测（backend/eval/）
