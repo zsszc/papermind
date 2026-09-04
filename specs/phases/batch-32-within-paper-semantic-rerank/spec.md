@@ -22,11 +22,11 @@
 
 ## 3. 验收标准
 
-- [ ] AC1：单向量复用和已选论文 top-5 查询有测试证明。
-- [ ] AC2：slot/名额不变，top-5 incumbent 锁定，其他 slot 同论文替换。
-- [ ] AC3：eval CLI、公式指纹和配对 Gate fail closed。
-- [ ] AC4：真实 train 按预注册 Gate 判定；仅通过才运行一次 dev。
-- [ ] AC5：全量回归、测试报告、台账、分段提交与 push 完成。
+- [x] AC1：单向量复用和已选论文 top-5 查询有测试证明。
+- [x] AC2：slot/名额不变，top-5 incumbent 锁定，其他 slot 同论文替换。
+- [x] AC3：eval CLI、公式指纹和配对 Gate fail closed。
+- [x] AC4：真实 train 按预注册 Gate 判定；通过后仅运行一次 dev，最终因延迟 Gate 未晋级。
+- [x] AC5：全量回归、测试报告、台账、分段提交与 push 完成。
 
 ## 4. 非目标
 
