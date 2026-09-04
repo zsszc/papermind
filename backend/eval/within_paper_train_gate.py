@@ -19,7 +19,10 @@ from eval.paper_first_train_gate import (
     _type_rows,
     _unit_number,
 )
-from eval.run import within_paper_query_contract_metadata
+from eval.run import (
+    within_paper_query_contract_metadata,
+    within_paper_semantic_rerank_contract_metadata,
+)
 from eval.train_failure_diagnostics import (
     validate_cli_path,
     write_report_exclusive,
@@ -27,10 +30,11 @@ from eval.train_failure_diagnostics import (
 
 
 SCHEMA = "within-paper-train-gate-v1"
+SEMANTIC_SCHEMA = "within-paper-semantic-train-gate-v1"
 
 
 def _validate_report(
-    report: dict[str, Any], *, candidate: bool
+    report: dict[str, Any], *, candidate: bool, semantic: bool = False
 ) -> tuple[dict[str, dict[str, Any]], set[str]]:
     label = "候选" if candidate else "基线"
     if not isinstance(report, dict) or report.get("report_schema") != "2.0":
@@ -50,7 +54,11 @@ def _validate_report(
     ):
         raise ValueError(f"{label}数据库与语料指纹不一致")
 
-    expected_profile = "within-paper-query-rerank-v1" if candidate else "hybrid"
+    expected_profile = (
+        "within-paper-semantic-rerank-v1"
+        if candidate and semantic
+        else "within-paper-query-rerank-v1" if candidate else "hybrid"
+    )
     pipeline = report.get("pipeline") or {}
     expected_pipeline = {
         "profile": expected_profile,
@@ -65,18 +73,29 @@ def _validate_report(
         if pipeline.get(field) != expected:
             raise ValueError(f"{label}完整 train 管线字段不符: {field}")
     if candidate:
-        contract = within_paper_query_contract_metadata()
+        contract = (
+            within_paper_semantic_rerank_contract_metadata()
+            if semantic else within_paper_query_contract_metadata()
+        )
+        formula_field = (
+            "within_paper_semantic_formula_sha256"
+            if semantic else "within_paper_formula_sha256"
+        )
+        pipeline_field = (
+            "within_paper_semantic" if semantic else "within_paper_query"
+        )
         formula_sha = _sha(
-            benchmark.get("within_paper_formula_sha256"),
-            "within_paper_formula_sha256",
+            benchmark.get(formula_field), formula_field,
         )
         if formula_sha != contract["formula_sha256"]:
             raise ValueError("候选公式指纹与当前代码不一致")
-        if pipeline.get("within_paper_query") != contract:
+        if pipeline.get(pipeline_field) != contract:
             raise ValueError("候选管线未绑定冻结公式")
     elif (
         "within_paper_formula_sha256" in benchmark
         or "within_paper_query" in pipeline
+        or "within_paper_semantic_formula_sha256" in benchmark
+        or "within_paper_semantic" in pipeline
     ):
         raise ValueError("基线不得伪装论文内全块候选")
 
@@ -178,6 +197,71 @@ def evaluate_within_paper_train(
     }
 
 
+def evaluate_within_paper_semantic_train(
+    baseline: dict[str, Any], candidate: dict[str, Any]
+) -> dict[str, Any]:
+    """验证 Batch 32 同提交完整 train，并返回去标识化 Gate。"""
+    baseline_types, baseline_ids = _validate_report(
+        baseline, candidate=False, semantic=True
+    )
+    candidate_types, candidate_ids = _validate_report(
+        candidate, candidate=True, semantic=True
+    )
+    if baseline["run"]["git_sha"] != candidate["run"]["git_sha"]:
+        raise ValueError("基线与候选必须来自同一 Git 提交")
+    for field in _SHARED_BENCHMARK_FIELDS:
+        if baseline["benchmark"][field] != candidate["benchmark"][field]:
+            raise ValueError(f"基线与候选冻结指纹不一致: {field}")
+    if baseline_ids != candidate_ids:
+        raise ValueError("基线与候选 13 题逐题集合不一致")
+
+    checks: dict[str, dict[str, Any]] = {}
+    base_overall, cand_overall = baseline["overall"], candidate["overall"]
+    coverage_gain = _unit_number(
+        cand_overall, "span_coverage@5"
+    ) - _unit_number(base_overall, "span_coverage@5")
+    checks["span_coverage_gain"] = _check(
+        coverage_gain, 1 / 13, ">=", coverage_gain + _EPSILON >= 1 / 13
+    )
+    for metric in ("recall@5", "mrr", "ndcg@5"):
+        gain = _unit_number(cand_overall, metric) - _unit_number(
+            base_overall, metric
+        )
+        checks[f"{metric.replace('@5', '')}_non_regression"] = _check(
+            gain, 0.0, ">=", gain >= -_EPSILON
+        )
+    for qtype in sorted(_QUESTION_TYPE_COUNTS):
+        for metric in ("recall", "span_coverage"):
+            gain = _unit_number(candidate_types[qtype], metric) - _unit_number(
+                baseline_types[qtype], metric
+            )
+            checks[f"{qtype}_{metric}_non_regression"] = _check(
+                gain, 0.0, ">=", gain >= -_EPSILON
+            )
+    p95 = _non_negative_number(candidate["latency"], "p95")
+    checks["candidate_p95_ms"] = _check(p95, 1000.0, "<", p95 < 1000.0)
+    contract = within_paper_semantic_rerank_contract_metadata()
+    return {
+        "schema": SEMANTIC_SCHEMA,
+        "passed": all(check["passed"] for check in checks.values()),
+        "checks": checks,
+        "input_report_sha256": {
+            "baseline": _report_sha256(baseline),
+            "candidate": _report_sha256(candidate),
+        },
+        "binding": {
+            "git_sha": baseline["run"]["git_sha"],
+            **{
+                field: baseline["benchmark"][field]
+                for field in _SHARED_BENCHMARK_FIELDS
+            },
+            "within_paper_semantic_formula_sha256": contract["formula_sha256"],
+            "split": "train", "top_k": 5, "item_count": 13,
+        },
+        "policy": {"dev": "run-once-only-after-pass", "holdout": "forbidden"},
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="比较同提交生产基线与论文内全块候选的完整 train 报告"
@@ -185,6 +269,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--baseline", required=True, help="私有基线 train 报告")
     parser.add_argument("--candidate", required=True, help="私有候选 train 报告")
     parser.add_argument("--output", required=True, help="私有 Gate 聚合输出")
+    parser.add_argument(
+        "--candidate-profile",
+        choices=("within-paper-query-rerank-v1", "within-paper-semantic-rerank-v1"),
+        default="within-paper-query-rerank-v1",
+    )
     return parser
 
 
@@ -196,7 +285,11 @@ def main(argv: list[str] | None = None) -> int:
         output_path = validate_cli_path(Path(args.output), must_exist=False)
         baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
         candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
-        result = evaluate_within_paper_train(baseline, candidate)
+        result = (
+            evaluate_within_paper_semantic_train(baseline, candidate)
+            if args.candidate_profile == "within-paper-semantic-rerank-v1"
+            else evaluate_within_paper_train(baseline, candidate)
+        )
         write_report_exclusive(output_path, result)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"[within-paper-train-gate] FAIL: {type(exc).__name__}")

@@ -158,6 +158,22 @@ _WITHIN_PAPER_QUERY_FORMULA = {
     "invalid_input": "fail-closed",
 }
 
+_WITHIN_PAPER_SEMANTIC_FORMULA = {
+    "algorithm": "within-paper-semantic-rerank-v1",
+    "routes": ["semantic", "bm25-bilingual"],
+    "route_limit": 10,
+    "rrf_k": 60,
+    "paper_slots": "production-legacy-rrf-order-and-quota",
+    "local_scope": "production-selected-papers",
+    "within_paper_depth": 5,
+    "embedding_calls_per_query": 1,
+    "embedding_reuse": "global-and-filtered-semantic",
+    "incumbent_in_local_top5": "lock-in-place",
+    "other_incumbent": "same-paper-best-unused",
+    "tie": "within-paper-rank-then-chunk-id",
+    "invalid_input": "fail-closed",
+}
+
 
 def _sha256_bytes(data: bytes) -> str:
     """返回 bytes 的 SHA256 十六进制摘要。"""
@@ -794,6 +810,20 @@ def within_paper_query_contract_metadata() -> Dict[str, Any]:
     }
 
 
+def within_paper_semantic_rerank_contract_metadata() -> Dict[str, Any]:
+    """返回 Batch 32 论文内语义选块候选的冻结公式与指纹。"""
+    payload = json.dumps(
+        _WITHIN_PAPER_SEMANTIC_FORMULA,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return {
+        **_WITHIN_PAPER_SEMANTIC_FORMULA,
+        "formula_sha256": _sha256_bytes(payload),
+    }
+
+
 def _audit_vector_snapshot(db, store) -> Dict[str, Any]:
     """校验 SQLite/Chroma 全量 ID、维度并生成 embedding 内容指纹。"""
     from app.models import Chunk
@@ -966,6 +996,9 @@ class Retriever:
 
     @property
     def mode(self) -> str:
+        if self.retrieval_profile == "within-paper-semantic-rerank-v1":
+            suffix = "" if not self.degraded else "(degraded)"
+            return f"within-paper-semantic-rerank-v1{suffix}"
         if self.retrieval_profile == "within-paper-query-rerank-v1":
             suffix = "" if not self.degraded else "(degraded)"
             return f"within-paper-query-rerank-v1{suffix}"
@@ -1021,6 +1054,8 @@ class Retriever:
             profile = "paper-preserving-deep-route-v1"
         elif self.retrieval_profile == "within-paper-query-rerank-v1":
             profile = "within-paper-query-rerank-v1"
+        elif self.retrieval_profile == "within-paper-semantic-rerank-v1":
+            profile = "within-paper-semantic-rerank-v1"
         elif self.retrieval_profile in _WEIGHTED_RRF_PROFILES:
             profile = self.retrieval_profile
         else:
@@ -1354,6 +1389,7 @@ def run_eval(args: argparse.Namespace) -> int:
         paper_first_contract: Dict[str, Any] = {}
         paper_preserving_contract: Dict[str, Any] = {}
         within_paper_contract: Dict[str, Any] = {}
+        within_paper_semantic_contract: Dict[str, Any] = {}
         if (
             args.vector_dir
             and args.database
@@ -1423,6 +1459,13 @@ def run_eval(args: argparse.Namespace) -> int:
             within_paper_contract = within_paper_query_contract_metadata()
             benchmark["within_paper_formula_sha256"] = (
                 within_paper_contract["formula_sha256"]
+            )
+        if args.retrieval_profile == "within-paper-semantic-rerank-v1":
+            within_paper_semantic_contract = (
+                within_paper_semantic_rerank_contract_metadata()
+            )
+            benchmark["within_paper_semantic_formula_sha256"] = (
+                within_paper_semantic_contract["formula_sha256"]
             )
         print(f"[eval] 检索模式: {retriever.mode}"
               + (f"（{retriever.degrade_reason}）" if retriever.degraded else ""))
@@ -1597,6 +1640,7 @@ def run_eval(args: argparse.Namespace) -> int:
             benchmark.get("paper_first_formula_sha256", "none"),
             benchmark.get("paper_preserving_formula_sha256", "none"),
             benchmark.get("within_paper_formula_sha256", "none"),
+            benchmark.get("within_paper_semantic_formula_sha256", "none"),
             str(args.top_k),
         ))
         runtime_valid = retriever.runtime_degraded_count == 0
@@ -1650,6 +1694,8 @@ def run_eval(args: argparse.Namespace) -> int:
                    if paper_preserving_contract else {}),
                 **({"within_paper_query": within_paper_contract}
                    if within_paper_contract else {}),
+                **({"within_paper_semantic": within_paper_semantic_contract}
+                   if within_paper_semantic_contract else {}),
             },
             "diagnostics": {
                 "unresolved_qrels": [],
@@ -1820,6 +1866,7 @@ def build_parser() -> argparse.ArgumentParser:
             "paper-first-evidence-rerank-v1",
             "paper-preserving-deep-route-v1",
             "within-paper-query-rerank-v1",
+            "within-paper-semantic-rerank-v1",
         ),
         default="hybrid",
         help=("评测检索管线；hybrid-local-neighbor 为 Batch21 候选；"
@@ -1830,7 +1877,8 @@ def build_parser() -> argparse.ArgumentParser:
               "hybrid-anchor-v1 为 Batch22I factoid 锚点候选；"
               "paper-first-evidence-rerank-v1 为 Batch27B 论文优先候选；"
               "paper-preserving-deep-route-v1 为 Batch29 保论文深层候选；"
-              "within-paper-query-rerank-v1 为 Batch30 论文内全块候选"),
+              "within-paper-query-rerank-v1 为 Batch30 论文内全块候选；"
+              "within-paper-semantic-rerank-v1 为 Batch32 论文内语义候选"),
     )
     parser.add_argument(
         "--vector-dir",
@@ -2012,6 +2060,27 @@ def _validate_cli_args(args: argparse.Namespace) -> Optional[str]:
             return f"{profile} 禁止 QA 子集与 LLM"
     if args.retrieval_profile == "within-paper-query-rerank-v1":
         profile = "within-paper-query-rerank-v1"
+        if args.keyword_only:
+            return f"{profile} 不得使用 --keyword-only"
+        if not args.database or not args.corpus_root or not args.vector_dir:
+            return (
+                f"{profile} 必须显式指定 --database/--corpus-root/"
+                "--vector-dir"
+            )
+        if args.parent_database:
+            return f"{profile} 不得指定 --parent-database"
+        if args.evidence_resolver != "page-span-v2":
+            return f"{profile} 必须使用 --evidence-resolver page-span-v2"
+        if args.top_k != 5:
+            return f"{profile} 必须使用 top-k=5"
+        if args.split != "train":
+            return f"{profile} 通用评测只允许完整 train，禁止 dev/holdout"
+        if args.lexical_profile != "bm25-bilingual":
+            return f"{profile} 必须使用 --lexical-profile bm25-bilingual"
+        if args.qa_id or args.with_llm:
+            return f"{profile} 禁止 QA 子集与 LLM"
+    if args.retrieval_profile == "within-paper-semantic-rerank-v1":
+        profile = "within-paper-semantic-rerank-v1"
         if args.keyword_only:
             return f"{profile} 不得使用 --keyword-only"
         if not args.database or not args.corpus_root or not args.vector_dir:

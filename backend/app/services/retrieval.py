@@ -187,6 +187,43 @@ class VectorStore:
             )
         return copy.deepcopy(output)
 
+    def search_by_embedding(
+        self,
+        query_embedding: List[float],
+        *,
+        top_k: int,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """使用调用方已生成的查询向量检索，供受控多范围检索复用向量。"""
+        if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k <= 0:
+            raise ValueError("top_k 必须是正整数")
+        where = self._build_where(filters)
+        results = self._query_with_fallback(
+            self.collection, query_embedding, top_k, where
+        )
+        ids = results.get("ids", [[]])[0]
+        docs = results.get("documents", [[]])[0]
+        metas = results.get("metadatas", [[]])[0]
+        distances = results.get("distances", [[]])[0]
+        if not (len(ids) == len(docs) == len(metas)):
+            raise ValueError("向量结果字段数量不一致")
+        output = []
+        for index, chunk_id in enumerate(ids):
+            metadata = metas[index]
+            output.append({
+                "chunk_id": chunk_id,
+                "paper_id": metadata.get("paper_id"),
+                "title": metadata.get("title"),
+                "authors": metadata.get("authors"),
+                "year": metadata.get("year"),
+                "content": docs[index],
+                "page_number": metadata.get("page_number"),
+                "chunk_type": metadata.get("chunk_type"),
+                "score": 1.0 - float(distances[index]) if distances else 0.0,
+                "source": "semantic",
+            })
+        return output
+
     @staticmethod
     def _rerank_enabled() -> bool:
         """retrieval.rerank 开关（默认 false）：每次调用时读取，配置重载即生效。"""

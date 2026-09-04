@@ -14,7 +14,7 @@ import re
 from collections import Counter, defaultdict
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import tuple_
+from sqlalchemy import func, tuple_
 from sqlalchemy.orm import Session
 
 from app.core.logger import logger
@@ -110,6 +110,10 @@ class DeepRouteContractError(ValueError):
 
 class WithinPaperContractError(ValueError):
     """论文内全块查询候选的输入不满足冻结契约。"""
+
+
+class WithinPaperSemanticContractError(ValueError):
+    """论文内语义选块候选的输入不满足冻结契约。"""
 
 
 def tokenize_technical_terms(text: str) -> List[str]:
@@ -439,6 +443,66 @@ def within_paper_bm25_search(
         })
     scored.sort(key=lambda item: (-item["score"], item["chunk_id"]))
     return scored
+
+
+def within_paper_semantic_search(
+    db: Session,
+    store: Any,
+    query_embedding: List[float],
+    *,
+    paper_ids: List[int],
+    filters: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """复用查询向量，仅获取生产已选论文各自的 semantic top-5。"""
+    if (
+        not isinstance(paper_ids, list)
+        or not paper_ids
+        or len(paper_ids) != len(set(paper_ids))
+        or any(
+            not isinstance(value, int) or isinstance(value, bool) or value <= 0
+            for value in paper_ids
+        )
+    ):
+        raise WithinPaperSemanticContractError(
+            "paper_ids 必须是非空唯一正整数列表"
+        )
+    counts = dict(
+        db.query(Chunk.paper_id, func.count(Chunk.id))
+        .filter(Chunk.paper_id.in_(paper_ids))
+        .group_by(Chunk.paper_id)
+        .all()
+    )
+    if set(counts) != set(paper_ids):
+        raise WithinPaperSemanticContractError("已选论文缺少 chunk")
+    output: List[Dict[str, Any]] = []
+    for paper_id in paper_ids:
+        scoped_filters = dict(filters or {})
+        existing = scoped_filters.get("paper_id")
+        if existing is not None and existing != paper_id:
+            raise WithinPaperSemanticContractError("论文过滤范围冲突")
+        scoped_filters["paper_id"] = paper_id
+        limit = min(5, int(counts[paper_id]))
+        rows = store.search_by_embedding(
+            query_embedding, top_k=limit, filters=scoped_filters
+        )
+        if len(rows) != limit:
+            raise WithinPaperSemanticContractError("论文内向量结果数量不完整")
+        for rank, item in enumerate(rows, start=1):
+            chunk_id = str(item.get("chunk_id", ""))
+            match = _CHUNK_ID_FULL_RE.fullmatch(chunk_id)
+            if (
+                match is None
+                or int(match.group(1)) != paper_id
+                or item.get("paper_id") != paper_id
+            ):
+                raise WithinPaperSemanticContractError("论文内向量结果越界")
+            row = copy.deepcopy(item)
+            row.update({
+                "within_paper_rank": rank,
+                "source": "within-paper-semantic",
+            })
+            output.append(row)
+    return output
 
 
 def anchor_chunk_search(
@@ -909,6 +973,96 @@ def within_paper_query_fuse_chunks(
     return selected
 
 
+def within_paper_semantic_fuse_chunks(
+    semantic_results: List[Dict[str, Any]],
+    keyword_results: List[Dict[str, Any]],
+    local_results: List[Dict[str, Any]],
+    top_k: int,
+) -> List[Dict[str, Any]]:
+    """冻结生产论文 slot，锁定局部 top-5 incumbent 并同论文替换。"""
+    if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k < 0:
+        raise WithinPaperSemanticContractError("top_k 必须是非负整数")
+    if top_k == 0:
+        return []
+
+    def canonical(item: Dict[str, Any]) -> tuple[str, int]:
+        chunk_id = item.get("chunk_id")
+        match = _CHUNK_ID_FULL_RE.fullmatch(str(chunk_id or ""))
+        if match is None:
+            raise WithinPaperSemanticContractError("chunk_id 非法")
+        paper_id, chunk_index = (int(value) for value in match.groups())
+        if (
+            paper_id <= 0
+            or chunk_index < -1
+            or chunk_id != f"p{paper_id}_c{chunk_index}"
+            or item.get("paper_id") != paper_id
+        ):
+            raise WithinPaperSemanticContractError("chunk 与论文 metadata 不一致")
+        return str(chunk_id), paper_id
+
+    baseline = rrf_fuse_chunks(
+        semantic_results[:10], keyword_results[:10], top_k, k=60
+    )
+    if not baseline:
+        if local_results:
+            raise WithinPaperSemanticContractError("无生产 slot 时存在局部结果")
+        return []
+    baseline_ids = [canonical(item)[0] for item in baseline]
+    slot_papers = [canonical(item)[1] for item in baseline]
+    selected_papers = set(slot_papers)
+
+    by_paper: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    seen_ids: set[str] = set()
+    seen_ranks: Dict[int, set[int]] = defaultdict(set)
+    for item in local_results:
+        chunk_id, paper_id = canonical(item)
+        rank = item.get("within_paper_rank")
+        if (
+            not isinstance(rank, int)
+            or isinstance(rank, bool)
+            or not 1 <= rank <= 5
+        ):
+            raise WithinPaperSemanticContractError("论文内语义 rank 非法")
+        if paper_id not in selected_papers:
+            raise WithinPaperSemanticContractError("局部结果含未选论文")
+        if chunk_id in seen_ids or rank in seen_ranks[paper_id]:
+            raise WithinPaperSemanticContractError("局部结果含重复 ID 或 rank")
+        seen_ids.add(chunk_id)
+        seen_ranks[paper_id].add(rank)
+        by_paper[paper_id].append(copy.deepcopy(item))
+    for rows in by_paper.values():
+        rows.sort(key=lambda item: (item["within_paper_rank"], item["chunk_id"]))
+
+    used = set(baseline_ids)
+    selected: List[Dict[str, Any]] = []
+    for incumbent, incumbent_id, paper_id in zip(
+        baseline, baseline_ids, slot_papers
+    ):
+        local_ids = {item["chunk_id"] for item in by_paper.get(paper_id, [])}
+        if incumbent_id in local_ids:
+            selected.append(copy.deepcopy(incumbent))
+            continue
+        replacement = next(
+            (
+                item for item in by_paper.get(paper_id, [])
+                if item["chunk_id"] not in used
+            ),
+            None,
+        )
+        if replacement is None:
+            selected.append(copy.deepcopy(incumbent))
+            continue
+        row = copy.deepcopy(replacement)
+        row["replaced_production_chunk"] = incumbent_id
+        used.add(row["chunk_id"])
+        selected.append(row)
+    if [int(item["paper_id"]) for item in selected] != slot_papers:
+        raise WithinPaperSemanticContractError("候选改变论文 slot")
+    if len({item["chunk_id"] for item in selected}) != len(selected):
+        raise WithinPaperSemanticContractError("候选产生重复 chunk")
+    return selected
+
+
 def anchor_rrf_fuse_chunks(
     semantic_results: List[Dict[str, Any]],
     keyword_results: List[Dict[str, Any]],
@@ -1213,7 +1367,8 @@ class RetrievalPipeline:
             "weighted-rrf-compat-v1", "hybrid-anchor-v1",
             "paper-first-evidence-rerank-v1",
             "paper-preserving-deep-route-v1",
-            "within-paper-query-rerank-v1", "keyword"
+            "within-paper-query-rerank-v1",
+            "within-paper-semantic-rerank-v1", "keyword"
         }:
             raise ValueError(f"不支持的检索 profile: {requested_profile}")
         weighted_profiles = {"weighted-rrf-v1", "weighted-rrf-compat-v1"}
@@ -1227,7 +1382,8 @@ class RetrievalPipeline:
             "weighted-rrf-v1", "weighted-rrf-compat-v1",
             "hybrid-anchor-v1", "paper-first-evidence-rerank-v1",
             "paper-preserving-deep-route-v1",
-            "within-paper-query-rerank-v1", "keyword"
+            "within-paper-query-rerank-v1",
+            "within-paper-semantic-rerank-v1", "keyword"
         }:
             try:
                 keyword_results = keyword_chunk_search(
@@ -1283,10 +1439,18 @@ class RetrievalPipeline:
 
         semantic_results: List[Dict[str, Any]] = []
         semantic_reason: Optional[str] = None
+        shared_query_embedding: Optional[List[float]] = None
         try:
             store = self._store()
             if not store.available():
                 semantic_reason = "semantic_unavailable"
+            elif profile == "within-paper-semantic-rerank-v1":
+                shared_query_embedding = store.embedding_service.embed_query(query)
+                semantic_results = store.search_by_embedding(
+                    shared_query_embedding,
+                    top_k=20,
+                    filters=filters,
+                )[:10]
             else:
                 semantic_top_k = (
                     _PARENT_CHILD_POOL
@@ -1379,6 +1543,55 @@ class RetrievalPipeline:
                 self._write_diagnostics(
                     diagnostics, requested_profile, "empty",
                     degraded=True, reason="within_paper_query_failed",
+                )
+                return []
+            self._write_diagnostics(
+                diagnostics, requested_profile, profile,
+                degraded=False, reason=None,
+            )
+            return results
+
+        if profile == "within-paper-semantic-rerank-v1":
+            if semantic_reason is not None or shared_query_embedding is None:
+                self._write_diagnostics(
+                    diagnostics, requested_profile, "empty",
+                    degraded=True, reason=semantic_reason or "embedding_missing",
+                )
+                return []
+            if keyword_error:
+                self._write_diagnostics(
+                    diagnostics, requested_profile, "empty",
+                    degraded=True, reason="keyword_search_failed",
+                )
+                return []
+            try:
+                baseline = rrf_fuse_chunks(
+                    semantic_results, keyword_results, top_k
+                )
+                paper_ids = list(dict.fromkeys(
+                    int(item["paper_id"]) for item in baseline
+                ))
+                local_results = (
+                    within_paper_semantic_search(
+                        self.db,
+                        store,
+                        shared_query_embedding,
+                        paper_ids=paper_ids,
+                        filters=filters,
+                    )
+                    if paper_ids else []
+                )
+                results = within_paper_semantic_fuse_chunks(
+                    semantic_results, keyword_results, local_results, top_k
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[retrieval_pipeline] 论文内语义选块候选失败: "
+                    f"{type(exc).__name__}"
+                )
+                self._write_diagnostics(
+                    diagnostics, requested_profile, "empty",
+                    degraded=True, reason="within_paper_semantic_failed",
                 )
                 return []
             self._write_diagnostics(
