@@ -56,16 +56,18 @@ def _record(index: int, category: str, latency_ms: float = 40.0) -> dict:
     baseline = [f"p{index + 1}_c0"] + [
         f"p{100 + index + slot}_c0" for slot in range(4)
     ]
-    within = [[f"p{index + 1}_c{rank}" for rank in range(12)]]
+    within = [[f"p{index + 1}_c{rank}" for rank in range(12)]] + [
+        [f"p{100 + index + slot}_c0"] for slot in range(4)
+    ]
     if category == "baseline_full":
         baseline[0] = relevant
     elif category == "recoverable":
         pass
     elif category == "semantic_missing":
-        within = [[f"p{index + 1}_c{rank}" for rank in range(9)]]
+        within[0] = [f"p{index + 1}_c{rank}" for rank in range(9)]
     elif category == "paper_absent":
         baseline[0] = f"p{300 + index}_c0"
-        within = [[f"p{300 + index}_c{rank}" for rank in range(3)]]
+        within[0] = [f"p{300 + index}_c{rank}" for rank in range(3)]
     else:
         raise AssertionError(category)
     return {
@@ -115,7 +117,7 @@ def test_aggregate_classifies_rank_latency_and_recommends_candidate():
 
 def test_gate_rejects_slow_or_nonrecoverable_diagnostic():
     slow = _records()
-    slow[-1]["filtered_latency_ms"] = 400.0
+    slow[-1]["filtered_latency_ms"] = 4000.0
     assert analyze_within_paper_semantic(slow, _binding())["recommendation"]["candidate"] == "none"
 
     no_gain = [_record(i, "baseline_full") for i in range(13)]
@@ -200,7 +202,7 @@ def test_collector_reuses_exactly_one_embedding_and_limits_paper_scope(monkeypat
     assert query_calls[0]["n_results"] == 20
     assert query_calls[0].get("where") is None
     selected = {call["where"]["paper_id"] for call in query_calls[1:]}
-    assert selected == {1, 2, 3}
+    assert selected == {1, 2, 3, 101, 102}
     assert all(call["query_embeddings"] == [[0.1, 0.2]] for call in query_calls)
 
 
