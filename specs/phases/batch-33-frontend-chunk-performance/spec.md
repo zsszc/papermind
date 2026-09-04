@@ -16,11 +16,11 @@ Batch 32 最终回归显示 `ui` 与 `StatsPage` 两个 JS chunk 分别约 1.12M
 
 ## 3. 验收标准
 
-- [ ] AC1：旧构建被 chunk Gate 明确拒绝，记录超限文件与大小。
-- [ ] AC2：新构建所有普通 JS ≤600KiB，PDF worker ≤1100KiB。
-- [ ] AC3：统计页现有测试与新增模块化契约通过，未扩大初始页面同步依赖。
-- [ ] AC4：前端测试/lint/build、后端、Electron、发布 E2E 与公开 Gate 全绿。
-- [ ] AC5：测试报告、进度台账、分段提交与 push 完成。
+- [x] AC1：旧构建被 chunk Gate 明确拒绝，记录超限文件与大小。
+- [x] AC2：新构建所有普通 JS ≤600KiB，PDF worker ≤1100KiB。
+- [x] AC3：统计页现有测试与新增模块化契约通过，未扩大初始页面同步依赖。
+- [x] AC4：前端测试/lint/build、后端、Electron、发布 E2E 与公开 Gate 全绿。
+- [x] AC5：测试报告、进度台账、分段提交与 push 完成。
 
 ## 4. 非目标
 
