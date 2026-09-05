@@ -226,6 +226,17 @@ def test_by_type_aggregation_is_conservative_and_complete():
     assert set(rows) == {"factoid", "method_detail", "summary"}
 
 
+def test_analyzer_accepts_dataset_schema_comparison_type():
+    report = _report()
+    report["items"][2]["question_type"] = "comparison"
+
+    result = diagnostics.analyze_train_report(report)
+
+    assert "comparison" in {
+        row["question_type"] for row in result["by_question_type"]
+    }
+
+
 @pytest.mark.parametrize(
     ("mutate", "match"),
     [

@@ -20,7 +20,7 @@ _SHA_RE = re.compile(r"[0-9a-f]{64}")
 _GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
 _CHUNK_ID_RE = re.compile(r"p([1-9][0-9]*)_c-?[0-9]+")
 _QUESTION_TYPES = frozenset({
-    "experiment_data", "factoid", "method_detail", "summary",
+    "comparison", "experiment_data", "factoid", "method_detail", "summary",
 })
 _CATEGORY_ORDER = (
     "cross_paper_miss",
