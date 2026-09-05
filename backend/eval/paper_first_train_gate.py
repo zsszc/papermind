@@ -20,11 +20,13 @@ from eval.train_failure_diagnostics import (
 SCHEMA = "paper-first-train-gate-v1"
 _GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
 _SHA_RE = re.compile(r"[0-9a-f]{64}")
-_QUESTION_TYPE_COUNTS = {
-    "factoid": 8,
-    "method_detail": 4,
-    "summary": 1,
-}
+_POSITIVE_QUESTION_TYPES = frozenset({
+    "comparison",
+    "experiment_data",
+    "factoid",
+    "method_detail",
+    "summary",
+})
 _SHARED_BENCHMARK_FIELDS = (
     "dataset_sha256",
     "qrels_sha256",
@@ -75,7 +77,9 @@ def _non_negative_number(block: dict[str, Any], field: str) -> float:
     return float(value)
 
 
-def _type_rows(report: dict[str, Any]) -> dict[str, dict[str, Any]]:
+def _type_rows(
+    report: dict[str, Any], expected_count: int
+) -> dict[str, dict[str, Any]]:
     rows = report.get("by_question_type")
     if not isinstance(rows, list):
         raise ValueError("完整 train 缺少问题类型聚合")
@@ -87,20 +91,24 @@ def _type_rows(report: dict[str, Any]) -> dict[str, dict[str, Any]]:
         if qtype in mapped:
             raise ValueError("问题类型聚合存在重复")
         mapped[str(qtype)] = row
-    if set(mapped) != set(_QUESTION_TYPE_COUNTS):
-        raise ValueError("完整 train 问题类型集合不符合冻结契约")
-    for qtype, expected_count in _QUESTION_TYPE_COUNTS.items():
-        row = mapped[qtype]
-        if row.get("n") != expected_count:
-            raise ValueError("完整 train 问题类型数量不符合 13 题契约")
+    if not mapped or not set(mapped).issubset(_POSITIVE_QUESTION_TYPES):
+        raise ValueError("完整 train 问题类型集合不符合正例 schema")
+    row_count = 0
+    for row in mapped.values():
+        count = row.get("n")
+        if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+            raise ValueError("完整 train 问题类型数量必须为正整数")
+        row_count += count
         for field in ("recall", "mrr", "ndcg", "span_coverage"):
             _unit_number(row, field)
+    if row_count != expected_count:
+        raise ValueError(f"完整 train 问题类型数量不符合 {expected_count} 题契约")
     return mapped
 
 
 def _validate_report(
     report: dict[str, Any], *, candidate: bool
-) -> tuple[dict[str, dict[str, Any]], set[str]]:
+) -> tuple[dict[str, dict[str, Any]], set[str], int]:
     label = "候选" if candidate else "基线"
     if not isinstance(report, dict) or report.get("report_schema") != "2.0":
         raise ValueError(f"{label}不是 eval.run report_schema=2.0 报告")
@@ -155,20 +163,26 @@ def _validate_report(
         raise ValueError(f"{label}存在运行时降级")
 
     overall = report.get("overall") or {}
-    if overall.get("n_positive") != 13 or overall.get("n_negative") != 0:
-        raise ValueError(f"{label}必须包含完整 13 题正例 train")
+    count = overall.get("n_positive")
+    if (
+        not isinstance(count, int)
+        or isinstance(count, bool)
+        or count <= 0
+        or overall.get("n_negative") != 0
+    ):
+        raise ValueError(f"{label}必须包含完整正例 train")
     for field in ("recall@5", "mrr", "ndcg@5", "span_coverage@5"):
         _unit_number(overall, field)
 
     latency = report.get("latency") or {}
-    if latency.get("count") != 13:
-        raise ValueError(f"{label}延迟样本必须为 13")
+    if latency.get("count") != count:
+        raise ValueError(f"{label}延迟样本必须为 {count}")
     _non_negative_number(latency, "p95")
-    rows = _type_rows(report)
+    rows = _type_rows(report, count)
 
     items = report.get("items")
-    if not isinstance(items, list) or len(items) != 13:
-        raise ValueError(f"{label}逐题集合必须为完整 13 题")
+    if not isinstance(items, list) or len(items) != count:
+        raise ValueError(f"{label}逐题集合必须为完整 {count} 题")
     qa_ids: set[str] = set()
     for item in items:
         if not isinstance(item, dict):
@@ -179,7 +193,7 @@ def _validate_report(
         qa_ids.add(qa_id)
         if item.get("degraded") is not False:
             raise ValueError(f"{label}逐题结果存在降级")
-    return rows, qa_ids
+    return rows, qa_ids, count
 
 
 def _check(
@@ -197,15 +211,26 @@ def evaluate_paper_first_train(
     baseline: dict[str, Any], candidate: dict[str, Any]
 ) -> dict[str, Any]:
     """验证同提交完整 train 报告，并返回去标识化晋级判定。"""
-    baseline_types, baseline_ids = _validate_report(baseline, candidate=False)
-    candidate_types, candidate_ids = _validate_report(candidate, candidate=True)
+    baseline_types, baseline_ids, count = _validate_report(
+        baseline, candidate=False
+    )
+    candidate_types, candidate_ids, candidate_count = _validate_report(
+        candidate, candidate=True
+    )
     if baseline["run"]["git_sha"] != candidate["run"]["git_sha"]:
         raise ValueError("基线与候选必须来自同一 Git 提交")
     for field in _SHARED_BENCHMARK_FIELDS:
         if baseline["benchmark"][field] != candidate["benchmark"][field]:
             raise ValueError(f"基线与候选冻结指纹不一致: {field}")
     if baseline_ids != candidate_ids:
-        raise ValueError("基线与候选 13 题逐题集合不一致")
+        raise ValueError("基线与候选逐题集合不一致")
+    if count != candidate_count:
+        raise ValueError("基线与候选完整 train 数量不一致")
+    if set(baseline_types) != set(candidate_types):
+        raise ValueError("基线与候选问题类型集合不一致")
+    for qtype in baseline_types:
+        if baseline_types[qtype]["n"] != candidate_types[qtype]["n"]:
+            raise ValueError("基线与候选问题类型数量不一致")
 
     baseline_overall = baseline["overall"]
     candidate_overall = candidate["overall"]
@@ -215,9 +240,9 @@ def evaluate_paper_first_train(
     ) - _unit_number(baseline_overall, "span_coverage@5")
     checks["span_coverage_gain"] = _check(
         coverage_gain,
-        1 / 13,
+        1 / count,
         ">=",
-        coverage_gain + _EPSILON >= 1 / 13,
+        coverage_gain + _EPSILON >= 1 / count,
     )
     for metric in ("recall@5", "mrr", "ndcg@5"):
         gain = _unit_number(candidate_overall, metric) - _unit_number(
@@ -226,7 +251,7 @@ def evaluate_paper_first_train(
         checks[f"{metric.replace('@5', '')}_non_regression"] = _check(
             gain, 0.0, ">=", gain >= -_EPSILON
         )
-    for qtype in sorted(_QUESTION_TYPE_COUNTS):
+    for qtype in sorted(baseline_types):
         for metric in ("recall", "span_coverage"):
             gain = _unit_number(candidate_types[qtype], metric) - _unit_number(
                 baseline_types[qtype], metric
@@ -257,7 +282,7 @@ def evaluate_paper_first_train(
             "paper_first_formula_sha256": contract["formula_sha256"],
             "split": "train",
             "top_k": 5,
-            "item_count": 13,
+            "item_count": count,
         },
         "policy": {
             "dev": "run-once-only-after-pass",

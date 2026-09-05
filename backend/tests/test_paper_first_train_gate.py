@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
-
 import pytest
 
 from eval.paper_first_train_gate import evaluate_paper_first_train
@@ -120,3 +118,36 @@ def test_gate_rejects_rank_type_or_latency_regression():
     assert gate["checks"]["mrr_non_regression"]["passed"] is False
     assert gate["checks"]["factoid_recall_non_regression"]["passed"] is False
     assert gate["checks"]["candidate_p95_ms"]["passed"] is False
+
+
+def test_gate_supports_a_larger_frozen_train_with_comparison_questions():
+    baseline = _report("hybrid", coverage=0.45)
+    candidate = _report(
+        "paper-first-evidence-rerank-v1",
+        coverage=0.45 + 1 / 96,
+    )
+    for report in (baseline, candidate):
+        report["overall"]["n_positive"] = 96
+        report["latency"]["count"] = 96
+        report["items"].extend(
+            {"qa_id": f"private-extra-{index}", "degraded": False}
+            for index in range(83)
+        )
+        report["by_question_type"].append(
+            {
+                "question_type": "comparison",
+                "n": 83,
+                "recall": 0.4,
+                "mrr": 0.3,
+                "ndcg": 0.3,
+                "span_coverage": 0.45,
+            }
+        )
+
+    gate = evaluate_paper_first_train(baseline, candidate)
+
+    assert gate["binding"]["item_count"] == 96
+    assert gate["checks"]["span_coverage_gain"]["threshold"] == pytest.approx(
+        1 / 96
+    )
+    assert "comparison_recall_non_regression" in gate["checks"]
