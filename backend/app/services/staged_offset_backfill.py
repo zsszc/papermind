@@ -88,6 +88,8 @@ def build_staged_offset_database(
         Session = sessionmaker(autocommit=False, autoflush=False, bind=engine)
         parser = parser or PDFParser()
         body_count = 0
+        backfilled_body_count = 0
+        preserved_body_count = 0
         page_count = 0
         with Session.begin() as db:
             papers = (
@@ -123,6 +125,16 @@ def build_staged_offset_database(
                     if not content:
                         raise ValueError("旧正文 chunk 为空")
                     page_text = pages_by_number[row.page_number]
+                    if row.page_start is not None or row.page_end is not None:
+                        if (
+                            not isinstance(row.page_start, int)
+                            or not isinstance(row.page_end, int)
+                            or not 0 <= row.page_start < row.page_end <= len(page_text)
+                        ):
+                            raise ValueError("既有正文 chunk 坐标无效")
+                        body_count += 1
+                        preserved_body_count += 1
+                        continue
                     starts = _all_occurrences(page_text, content)
                     if not starts:
                         raise ValueError(
@@ -135,6 +147,7 @@ def build_staged_offset_database(
                     row.page_start = starts[0]
                     row.page_end = starts[0] + len(content)
                     body_count += 1
+                    backfilled_body_count += 1
             db.flush()
 
         engine.dispose()
@@ -155,6 +168,8 @@ def build_staged_offset_database(
         return {
             "candidate": str(candidate),
             "body_chunks": body_count,
+            "backfilled_body_chunks": backfilled_body_count,
+            "preserved_body_chunks": preserved_body_count,
             "parsed_pages": page_count,
             "chunk_identity_sha256": identity_before,
             "repaired_orphan_paper_tags": repair[

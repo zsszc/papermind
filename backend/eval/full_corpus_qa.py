@@ -1,7 +1,7 @@
 """全语料 QA v3 的覆盖规划与隐私安全校验。
 
-本模块只处理本地私有评测资产；控制台输出严格限制为聚合计数。问题、答案、
-证据、论文身份和路径不得进入可提交报告。
+本模块只处理本地私有评测资产；控制台输出严格限制为聚合计数。
+问题、答案、证据、论文身份和路径不得进入可提交报告。
 """
 
 from __future__ import annotations
@@ -9,18 +9,25 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import tempfile
 import unicodedata
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from eval.dataset import load_dataset, resolve_relevant_chunks, validate_dataset
+from eval.dataset import (
+    _default_page_loader,
+    load_dataset,
+    resolve_relevant_spans_v2,
+    validate_dataset,
+)
 from eval.generate_qa_v2 import load_frozen_splits
 
 
 PRIVATE_ROOT = Path(__file__).resolve().parent / "private"
 _SPLITS = ("train", "dev", "holdout")
+_V3_SPLIT_SCHEMA = "full-corpus-qa-v3-paper-splits-v1"
 
 
 def _validate_assignments(assignments: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -51,6 +58,20 @@ def _validate_assignments(assignments: list[dict[str, Any]]) -> dict[str, dict[s
     return by_uid
 
 
+def _load_assignments_artifact(path: str | Path) -> list[dict[str, Any]]:
+    """读取既有 v2 或本模块生成的 v3 冻结论文分配。"""
+    artifact = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(artifact, dict):
+        raise ValueError("split 冻结制品顶层必须为对象")
+    if artifact.get("split_schema") == "private-benchmark-v2-paper-splits-v1":
+        return load_frozen_splits(path)
+    if artifact.get("split_schema") != _V3_SPLIT_SCHEMA:
+        raise ValueError("不是受支持的 v2/v3 split 冻结制品")
+    assignments = artifact.get("assignments")
+    by_uid = _validate_assignments(assignments)
+    return list(by_uid.values())
+
+
 def _item_paper_uid(item: dict[str, Any]) -> str | None:
     if item.get("has_answer") is not True:
         return None
@@ -77,7 +98,10 @@ def build_gap_plan(
     *,
     minimum_per_paper: int = 2,
 ) -> list[dict[str, Any]]:
-    """返回低于最小 QA 覆盖的冻结论文；结果含身份，只能写入私有目录。"""
+    """返回低于最小 QA 覆盖的冻结论文。
+
+    结果含身份，只能写入私有目录。
+    """
     if minimum_per_paper <= 0:
         raise ValueError("minimum_per_paper 必须为正整数")
     by_uid = _validate_assignments(assignments)
@@ -383,20 +407,94 @@ def _attach_local_sources(plan: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return rows
 
 
-def _resolve_all_evidence(items: list[dict[str, Any]]) -> int:
-    from app.core.config import config
-    from app.database import SessionLocal
+def _evidence_error_code(exc: Exception) -> str:
+    message = str(exc)
+    patterns = (
+        ("跨页", "cross_page"),
+        ("原文未命中", "source_quote_missing"),
+        ("原文多处命中", "source_quote_ambiguous"),
+        ("目标页没有正文", "page_chunks_missing"),
+        ("坐标缺失", "chunk_offset_missing"),
+        ("坐标越界", "chunk_offset_out_of_bounds"),
+        ("覆盖存在空洞", "chunk_span_gap"),
+        ("未被 chunk", "chunk_span_incomplete"),
+        ("未映射到正文", "chunk_span_unmapped"),
+        ("paper_uid", "paper_identity_invalid"),
+    )
+    for marker, code in patterns:
+        if marker in message:
+            return code
+    return "unknown_validation_error"
 
-    resolved = 0
-    with SessionLocal() as db:
-        for item in items:
-            if item.get("has_answer") is not True:
-                continue
-            chunk_ids = resolve_relevant_chunks(db, item, runtime_root=config.runtime_root)
-            if not chunk_ids:
-                raise ValueError("正例证据未解析到 chunk")
-            resolved += 1
-    return resolved
+
+def _audit_all_evidence(
+    items: list[dict[str, Any]],
+    *,
+    database: Path | None = None,
+    corpus_root: Path | None = None,
+) -> dict[str, Any]:
+    from app.core.config import config
+
+    root = (corpus_root or config.runtime_root).resolve()
+    base_loader = _default_page_loader(root)
+    page_cache: dict[int, list[dict[str, Any]]] = {}
+
+    def load_pages(paper: Any) -> list[dict[str, Any]]:
+        if paper.id not in page_cache:
+            page_cache[paper.id] = base_loader(paper)
+        return page_cache[paper.id]
+
+    by_split: dict[str, Counter[str]] = {
+        split: Counter(total=0, resolved=0, failed=0) for split in _SPLITS
+    }
+    engine = None
+    if database is not None:
+        from app.services.data_integrity import open_readonly_sqlalchemy_database
+
+        engine, session_factory = open_readonly_sqlalchemy_database(database)
+    else:
+        from app.database import SessionLocal
+
+        session_factory = SessionLocal
+    try:
+        db = session_factory()
+        try:
+            for item in items:
+                if item.get("has_answer") is not True:
+                    continue
+                split = item.get("split")
+                if split not in by_split:
+                    raise ValueError("正例 split 非法")
+                by_split[split]["total"] += 1
+                try:
+                    groups = resolve_relevant_spans_v2(
+                        db,
+                        item,
+                        runtime_root=root,
+                        page_loader=load_pages,
+                    )
+                    if not groups:
+                        raise ValueError("正例证据未解析到原文 span")
+                except Exception as exc:
+                    by_split[split]["failed"] += 1
+                    by_split[split][_evidence_error_code(exc)] += 1
+                else:
+                    by_split[split]["resolved"] += 1
+        finally:
+            db.close()
+    finally:
+        if engine is not None:
+            engine.dispose()
+    return {
+        "total": sum(counter["total"] for counter in by_split.values()),
+        "resolved": sum(counter["resolved"] for counter in by_split.values()),
+        "failed": sum(counter["failed"] for counter in by_split.values()),
+        "by_split": {
+            split: dict(sorted(counter.items()))
+            for split, counter in by_split.items()
+            if counter["total"]
+        },
+    }
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -414,6 +512,8 @@ def build_parser() -> argparse.ArgumentParser:
     validate_parser.add_argument("--dataset", required=True)
     validate_parser.add_argument("--minimum-per-paper", type=int, default=2)
     validate_parser.add_argument("--resolve-evidence", action="store_true")
+    validate_parser.add_argument("--database")
+    validate_parser.add_argument("--corpus-root")
 
     assemble_parser = subparsers.add_parser("assemble", help="合并补题并生成全语料 v3")
     assemble_parser.add_argument("--legacy-manifest", required=True)
@@ -433,7 +533,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "plan":
         splits_path = _private_path(args.splits, must_exist=True)
         dataset_path = _private_path(args.dataset, must_exist=True)
-        assignments = load_frozen_splits(splits_path)
+        assignments = _load_assignments_artifact(splits_path)
         items = load_dataset(dataset_path)
         output_path = _private_path(args.output, must_exist=False)
         plan = build_gap_plan(
@@ -455,7 +555,7 @@ def main(argv: list[str] | None = None) -> int:
         legacy_manifest_path = _private_path(args.legacy_manifest, must_exist=True)
         output_path = _private_path(args.output, must_exist=False)
         assignments_output = _private_path(args.assignments_output, must_exist=False)
-        assignments = load_frozen_splits(splits_path)
+        assignments = _load_assignments_artifact(splits_path)
         existing = load_dataset(dataset_path)
         supplements: list[dict[str, Any]] = []
         for value in args.supplement:
@@ -484,22 +584,50 @@ def main(argv: list[str] | None = None) -> int:
         )
         summary["supplement_items"] = len(supplements)
         _write_private_jsonl(output_path, combined)
-        _write_private_json(assignments_output, combined_assignments)
+        _write_private_json(assignments_output, {
+            "split_schema": _V3_SPLIT_SCHEMA,
+            "assignments": combined_assignments,
+        })
         print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
         return 0
 
     splits_path = _private_path(args.splits, must_exist=True)
     dataset_path = _private_path(args.dataset, must_exist=True)
-    assignments = load_frozen_splits(splits_path)
+    assignments = _load_assignments_artifact(splits_path)
     items = load_dataset(dataset_path)
     summary = validate_full_coverage(
         items, assignments, minimum_per_paper=args.minimum_per_paper
     )
     if args.resolve_evidence:
-        summary["uniquely_resolved_positive_qa"] = _resolve_all_evidence(items)
+        if bool(args.database) != bool(args.corpus_root):
+            raise ValueError("显式数据库必须同时提供 corpus-root")
+        database = (
+            _private_path(args.database, must_exist=True) if args.database else None
+        )
+        root = Path(args.corpus_root) if args.corpus_root else None
+        evidence_audit = _audit_all_evidence(
+            items,
+            database=database,
+            corpus_root=root,
+        )
+        summary["evidence_audit"] = evidence_audit
     print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
+    if args.resolve_evidence and evidence_audit["failed"]:
+        return 1
     return 0
 
 
+def cli(argv: list[str] | None = None) -> int:
+    """运行私有 CLI；失败只输出稳定错误码，避免正文或身份随异常泄漏。"""
+    try:
+        return main(argv)
+    except Exception:
+        print(
+            json.dumps({"status": "FAIL", "error_code": "private_validation_failed"}),
+            file=sys.stderr,
+        )
+        return 2
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(cli())

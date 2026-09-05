@@ -1,6 +1,5 @@
 """Batch 22D：旧粗分块候选库的只读复制与坐标回填 RED。"""
 
-from pathlib import Path
 import sqlite3
 
 import pytest
@@ -91,6 +90,44 @@ def test_duplicate_chunk_text_fails_closed_and_removes_candidate(tmp_path):
 
     assert not candidate.exists()
     assert _row(source)[-2:] == (None, None)
+
+
+def test_existing_valid_offsets_disambiguate_duplicate_chunk_text(tmp_path):
+    content = "duplicate but already located"
+    page = f"{content} gap {content}"
+    source, corpus = _seed(tmp_path, content)
+    with sqlite3.connect(source) as conn:
+        conn.execute(
+            "UPDATE chunks SET page_start = 0, page_end = ?",
+            (len(content),),
+        )
+    candidate = tmp_path / "candidate.db"
+
+    result = build_staged_offset_database(
+        source, candidate, corpus_root=corpus, parser=_FakeParser(page)
+    )
+
+    assert _row(candidate)[-2:] == (0, len(content))
+    assert result["preserved_body_chunks"] == 1
+    assert result["backfilled_body_chunks"] == 0
+
+
+def test_existing_invalid_offsets_fail_closed(tmp_path):
+    content = "legacy chunk with invalid offsets"
+    source, corpus = _seed(tmp_path, content)
+    with sqlite3.connect(source) as conn:
+        conn.execute("UPDATE chunks SET page_start = 0, page_end = 9999")
+    candidate = tmp_path / "candidate.db"
+
+    with pytest.raises(ValueError, match="既有正文 chunk 坐标无效"):
+        build_staged_offset_database(
+            source,
+            candidate,
+            corpus_root=corpus,
+            parser=_FakeParser(content),
+        )
+
+    assert not candidate.exists()
 
 
 def test_wal_source_snapshot_does_not_require_journal_mode_switch(tmp_path):

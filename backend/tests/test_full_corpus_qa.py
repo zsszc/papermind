@@ -1,9 +1,13 @@
 """Batch 34：全语料 QA v3 覆盖与隔离契约。"""
 
+import json
+
 import pytest
 
 from eval.full_corpus_qa import (
+    _load_assignments_artifact,
     assemble_full_corpus_dataset,
+    build_parser,
     build_gap_plan,
     merge_supplements,
     public_gap_summary,
@@ -20,7 +24,12 @@ def _item(qa_id: str, uid: str, split: str, question: str) -> dict:
         "qa_id": qa_id,
         "question": question,
         "ground_truth": "参考答案",
-        "relevant_evidence": [{"paper_uid": uid, "quote": "唯一证据文本长度必须至少达到二十个字符。"}],
+        "relevant_evidence": [
+            {
+                "paper_uid": uid,
+                "quote": "唯一证据文本长度必须至少达到二十个字符。",
+            }
+        ],
         "question_type": "method_detail",
         "source": "imported_paper",
         "has_answer": True,
@@ -87,7 +96,12 @@ def test_full_coverage_accepts_two_unique_questions_per_frozen_paper():
     ("mutate", "message"),
     [
         (lambda items: items.__setitem__(1, {**items[1], "split": "dev"}), "split"),
-        (lambda items: items.__setitem__(1, {**items[1], "question": " 训练问题一？ "}), "问题文本重复"),
+        (
+            lambda items: items.__setitem__(
+                1, {**items[1], "question": " 训练问题一？ "}
+            ),
+            "问题文本重复",
+        ),
         (lambda items: items.pop(), "覆盖不足"),
     ],
 )
@@ -166,3 +180,39 @@ def test_assemble_full_corpus_dataset_moves_consumed_legacy_items_to_train():
         "train"
     }
     assert validate_full_coverage(combined, assignments)["papers"] == 2
+
+
+def test_v3_assignment_artifact_round_trip(tmp_path):
+    uid = "sha256:" + "e" * 64
+    path = tmp_path / "assignments.json"
+    path.write_text(
+        json.dumps(
+            {
+                "split_schema": "full-corpus-qa-v3-paper-splits-v1",
+                "assignments": [_assignment(uid, "train")],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert _load_assignments_artifact(path) == [_assignment(uid, "train")]
+
+
+def test_validate_cli_supports_explicit_readonly_candidate_database():
+    args = build_parser().parse_args(
+        [
+            "validate",
+            "--splits",
+            "eval/private/assignments.json",
+            "--dataset",
+            "eval/private/qa.jsonl",
+            "--resolve-evidence",
+            "--database",
+            "eval/private/candidate.db",
+            "--corpus-root",
+            "..",
+        ]
+    )
+
+    assert args.database.endswith("candidate.db")
+    assert args.corpus_root == ".."
